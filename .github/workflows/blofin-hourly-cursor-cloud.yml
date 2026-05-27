@@ -1,0 +1,44 @@
+# Hourly Cursor cloud agent on this repo (API substitute for dashboard Automations).
+# Add repo secret: CURSOR_API_KEY (cursor.com/dashboard → Integrations → User API Key)
+name: Blofin hourly cloud agent
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  hourly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Launch Cursor cloud agent
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CURSOR_API_KEY:-}" ]; then
+            echo "CURSOR_API_KEY secret not set — skip (add at github.com repo Settings → Secrets)"
+            exit 0
+          fi
+          PROMPT=$(sed '1,2d' .cursor/automations/blofin-hourly.prompt.md)
+          BODY=$(python3 -c 'import json,os,sys; print(json.dumps({"prompt":{"text":sys.stdin.read()},"model":"composer-2.5","source":{"repository":"https://github.com/1bananaonthewall-ux/blofin-auto-trader","ref":"main"}}))' <<<"$PROMPT")
+          # Fallback schema for older API shape
+          HTTP=$(curl -sS -o /tmp/cursor-agent.json -w "%{http_code}" \
+            -X POST "https://api.cursor.com/v0/agents" \
+            -H "Authorization: Bearer ${CURSOR_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "${BODY}")
+          if [ "$HTTP" = "404" ] || [ "$HTTP" = "400" ]; then
+            BODY=$(python3 -c 'import json,os,sys; print(json.dumps({"prompt":sys.stdin.read(),"model":"composer-2.5","repos":[{"url":"https://github.com/1bananaonthewall-ux/blofin-auto-trader","starting_ref":"main"}]}) )' <<<"$PROMPT")
+            HTTP=$(curl -sS -o /tmp/cursor-agent.json -w "%{http_code}" \
+              -X POST "https://api.cursor.com/v0/agents" \
+              -H "Authorization: Bearer ${CURSOR_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "${BODY}")
+          fi
+          echo "HTTP $HTTP"
+          cat /tmp/cursor-agent.json
+          test "$HTTP" -ge 200 -a "$HTTP" -lt 300

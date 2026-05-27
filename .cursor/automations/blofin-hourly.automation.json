@@ -1,0 +1,13 @@
+{
+  "name": "Blofin hourly optimize",
+  "trigger": { "type": "schedule", "cron": "0 * * * *", "label": "Every hour" },
+  "repository": {
+    "owner": "1bananaonthewall-ux",
+    "name": "blofin-auto-trader",
+    "branch": "main",
+    "url": "https://github.com/1bananaonthewall-ux/blofin-auto-trader"
+  },
+  "tools": ["open_pull_request", "memories"],
+  "promptFile": ".cursor/automations/blofin-hourly.prompt.md",
+  "notes": "Import manually at cursor.com/automations — JSON is a checklist, not auto-imported by Cursor yet."
+}
