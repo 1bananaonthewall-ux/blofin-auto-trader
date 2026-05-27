@@ -33,6 +33,22 @@ def _log_line(state_dir: Path, record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
+def _is_compliant(ex: BlofinExchange, sym: str, pos: dict, *, mission: int = MISSION_LEV) -> tuple[bool, str]:
+    cap = ex.symbol_leverage_cap(sym)
+    exch_max = ex.leverage_intel.exchange_max(sym) or cap
+    target = min(mission, cap)
+    inst = int(pos.get("leverage") or 0)
+    eff = int(pos.get("effective_leverage") or inst)
+    needs, reason = leverage_needs_reentry(
+        pos, target_lev=mission, exchange_max=exch_max
+    )
+    if needs:
+        return False, reason
+    if inst < target - 1 or eff < target - 1:
+        return False, f"inst={inst}x eff={eff}x need >={target}x"
+    return True, ""
+
+
 def close_non_compliant(
     ex: BlofinExchange,
     settings,
@@ -43,16 +59,8 @@ def close_non_compliant(
     closed: list[str] = []
     positions = ex.fetch_all_positions()
     for sym, pos in list(positions.items()):
-        cap = ex.symbol_leverage_cap(sym)
-        exch_max = ex.leverage_intel.exchange_max(sym) or cap
-        inst = int(pos.get("leverage") or 0)
-        eff = int(pos.get("effective_leverage") or inst)
-        needs, reason = leverage_needs_reentry(
-            pos, target_lev=MISSION_LEV, exchange_max=exch_max
-        )
-        if not needs and inst >= cap - 1 and eff >= cap - 1:
-            continue
-        if not needs:
+        ok, reason = _is_compliant(ex, sym, pos)
+        if ok:
             continue
         if dry_run:
             closed.append(f"DRY {sym.split('/')[0]} ({reason})")
@@ -94,6 +102,26 @@ def main() -> int:
     if not args.no_close:
         closed = close_non_compliant(ex, settings, registry, dry_run=settings.dry_run)
 
+    book_note = "skip"
+    try:
+        from autonomous_engine import create_engine
+        eng = create_engine(state_dir)
+        eng.bind_settings(settings)
+        eng.evaluate_core(
+            settings,
+            equity=ex.fetch_equity_usdt(),
+            free_margin=ex.fetch_free_equity_usdt(),
+            opens_last_hour=int((report.get("tuning") or {}).get("trades_last_hour", 0)),
+            open_count=report.get("open_count", 0),
+            low_leverage_positions=sum(
+                1 for p in (report.get("positions") or []) if not p.get("ok")
+            ),
+        )
+        br = eng.core.reconcile_book(ex, settings, registry, max_closes=2)
+        book_note = f"sltp={br.sltp_repaired} lev={br.leverage_set} upgraded={br.upgraded_closed}"
+    except Exception as exc:
+        book_note = f"book err: {exc}"
+
     opt_note = "skip"
     if settings.optimizer_enabled:
         opt = ScalpOptimizer(state_dir, settings)
@@ -106,6 +134,7 @@ def main() -> int:
         "open": report.get("open_count"),
         "closed": closed,
         "optimizer": opt_note,
+        "core_book": book_note,
         "dry_run": settings.dry_run,
     }
     _log_line(state_dir, record)
@@ -122,6 +151,7 @@ def main() -> int:
         print("closed:", ", ".join(closed))
     else:
         print("closed: (none)")
+    print("core book:", book_note)
     print("optimizer:", opt_note)
     return 0
 
