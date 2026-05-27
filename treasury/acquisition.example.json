@@ -1,0 +1,42 @@
+{
+  "channels": [
+    {
+      "id": "blofin-rewards",
+      "type": "exchange_rewards",
+      "name": "Blofin Task Center",
+      "url": "https://blofin.com/en/task-center",
+      "priority": 1,
+      "estimated_usd": 50,
+      "effort_minutes": 15,
+      "enabled": true,
+      "recur_days": 7,
+      "notes": "Claim all free tasks; deposit/trade tasks only if you accept the risk"
+    },
+    {
+      "id": "blofin-referral",
+      "type": "referral",
+      "name": "Blofin affiliate / invite",
+      "url": "https://blofin.com/account/affiliate",
+      "priority": 2,
+      "estimated_usd": 0,
+      "effort_minutes": 10,
+      "enabled": true,
+      "recur_days": 30,
+      "notes": "Share link organically; commission is passive"
+    },
+    {
+      "id": "airdrop-base-activity",
+      "type": "airdrop",
+      "name": "Base / L2 activity wallet",
+      "url": "",
+      "priority": 3,
+      "estimated_usd": 0,
+      "effort_minutes": 20,
+      "enabled": false,
+      "recur_days": 14,
+      "notes": "Optional: low-cost txs on L2 for potential future airdrops; not guaranteed"
+    }
+  ],
+  "daily_time_budget_minutes": 45,
+  "target_batch_usd": 100
+}

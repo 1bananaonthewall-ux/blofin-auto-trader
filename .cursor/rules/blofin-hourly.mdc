@@ -1,0 +1,14 @@
+---
+description: When hourly Blofin maintenance is due, run the blofin-hourly skill first.
+globs:
+alwaysApply: true
+---
+
+# Blofin hourly reminder
+
+If the file `.cursor/HOURLY_DUE` exists in this project, your **first priority** in this session is:
+
+1. Read `.cursor/skills/blofin-hourly/SKILL.md` and execute the full checklist.
+2. Delete `.cursor/HOURLY_DUE` when finished and mark `state/last_cursor_hourly.txt`.
+
+Do not skip this for generic chat unless the user explicitly says to skip hourly maintenance for this session.

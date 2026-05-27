@@ -1,0 +1,28 @@
+{
+  "faucets": [
+    {
+      "id": "example-hourly-btc",
+      "name": "Example BTC Faucet",
+      "url": "https://example.com",
+      "asset": "BTC",
+      "claim_interval_hours": 1,
+      "min_withdraw_usd": 10,
+      "estimated_claim_usd": 0.02,
+      "payout_wallet_id": "btc-main",
+      "enabled": false,
+      "notes": "Set enabled true after you verify the site is legit"
+    },
+    {
+      "id": "example-daily-usdt-tron",
+      "name": "Example USDT Faucet",
+      "url": "https://example.com",
+      "asset": "USDT",
+      "claim_interval_hours": 24,
+      "min_withdraw_usd": 5,
+      "estimated_claim_usd": 0.05,
+      "payout_wallet_id": "tron-main",
+      "enabled": false,
+      "notes": "Prefer TRC20 payouts — low fees to Blofin"
+    }
+  ]
+}

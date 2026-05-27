@@ -1,0 +1,41 @@
+{
+  "wallets": [
+    {
+      "id": "evm-main",
+      "type": "evm",
+      "chain": "ethereum",
+      "address": "0xYourAddressHere",
+      "rpc_url": "https://eth.llamarpc.com",
+      "tokens": ["USDT", "USDC", "ETH"]
+    },
+    {
+      "id": "evm-polygon",
+      "type": "evm",
+      "chain": "polygon",
+      "address": "0xYourAddressHere",
+      "rpc_url": "https://polygon-rpc.com",
+      "tokens": ["USDT", "USDC", "MATIC"]
+    },
+    {
+      "id": "tron-main",
+      "type": "tron",
+      "address": "TYourTronAddressHere",
+      "tokens": ["USDT", "TRX"]
+    },
+    {
+      "id": "btc-main",
+      "type": "bitcoin",
+      "address": "bc1YourBtcAddressHere"
+    },
+    {
+      "id": "sol-main",
+      "type": "solana",
+      "address": "YourSolanaAddressHere"
+    }
+  ],
+  "swap_targets": {
+    "USDT": 1.0,
+    "USDC": 1.0,
+    "USD": 1.0
+  }
+}

@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+.cursor/HOURLY_DUE
+__pycache__/
+*.pyc
+logs/
+state/
+treasury/wallets.json
+treasury/faucets.json
+treasury/acquisition.json
+treasury/state/
+*.log
