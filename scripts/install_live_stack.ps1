@@ -11,6 +11,7 @@ $BotPy = Join-Path $Root "bot.py"
 $LogDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
+$skipStart = $false
 Write-Host "Blofin live stack installer"
 Write-Host "  Root: $Root"
 Write-Host "  Python: $Py"
@@ -32,20 +33,30 @@ $BotAction = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hid
 $r = schtasks /Create /TN $BotTask /TR $BotAction /SC ONLOGON /RU $env:USERNAME /F /RL LIMITED 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Warning "Bot logon task: $r" } else { Write-Host "Scheduled: $BotTask (at logon)" }
 
-# --- Stop duplicate bot.py from THIS repo only ---
-Get-CimInstance Win32_Process -Filter "Name='python.exe'" | ForEach-Object {
-    $cmd = $_.CommandLine
-    if ($cmd -match 'bot\.py' -and $cmd -notmatch 'hourly_maintain') {
-        $cwd = $_.ExecutablePath
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        Write-Host "Stopped old bot pid $($_.ProcessId)"
+# --- Single bot.py from this repo (.venv preferred) ---
+$bots = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
+    $_.CommandLine -like "*$Root*bot.py*" -and $_.CommandLine -notmatch "hourly_maintain"
+})
+if ($bots.Count -gt 1) {
+    $keep = ($bots | Where-Object { $_.CommandLine -like "*.venv*" } | Select-Object -First 1)
+    if (-not $keep) { $keep = $bots[0] }
+    foreach ($b in $bots) {
+        if ($b.ProcessId -ne $keep.ProcessId) {
+            Stop-Process -Id $b.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped duplicate bot pid $($b.ProcessId)"
+        }
     }
+} elseif ($bots.Count -eq 1) {
+    Write-Host "Bot already running pid $($bots[0].ProcessId)"
+    $skipStart = $true
 }
 
-Start-Sleep -Seconds 2
-$env:PYTHONUNBUFFERED = "1"
-Start-Process -FilePath $Py -ArgumentList $BotPy -WorkingDirectory $Root -WindowStyle Hidden
-Write-Host "Started live bot.py (hidden window)"
+if (-not $skipStart) {
+    Start-Sleep -Seconds 2
+    $env:PYTHONUNBUFFERED = "1"
+    Start-Process -FilePath $Py -ArgumentList $BotPy -WorkingDirectory $Root -WindowStyle Hidden
+    Write-Host "Started live bot.py (hidden window)"
+}
 
 # Run first hourly pass now
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HourlyPs1
