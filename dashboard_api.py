@@ -179,22 +179,44 @@ def _account_equity_anchor(*, live_equity: float | None = None) -> float:
 def _sanitize_equity_ticks(
     rows: list[dict[str, float]], *, live_equity: float | None = None
 ) -> list[dict[str, float]]:
-    """Drop zeros and API-glitch spikes; keep ticks near real account balance."""
+    """Drop zeros and sustained micro-glitch samples; keep ramp-up and real history."""
     clean = [r for r in rows if float(r.get("equity") or 0) > 0]
-    if len(clean) < 5:
+    if len(clean) < 3:
         return clean
 
     anchor = _account_equity_anchor(live_equity=live_equity)
-    if anchor >= 20:
-        lo = max(5.0, anchor * 0.30)
-        hi = max(anchor * 1.35, anchor + 75.0)
-        fluid = _read_json(STATE_DIR / "fluid_state.json", {}) or {}
-        peak = float(fluid.get("peak_equity") or 0)
-        if peak > anchor:
-            hi = max(hi, peak * 1.12)
-        banded = [r for r in clean if lo <= float(r["equity"]) <= hi]
-        if len(banded) >= max(5, len(clean) // 50):
-            return banded
+    global_hi = max(float(r["equity"]) for r in clean)
+    ref = anchor if anchor >= 20 else global_hi
+
+    first_real_ts: float | None = None
+    for r in clean:
+        if float(r["equity"]) >= max(80.0, ref * 0.45 if ref >= 80 else 80.0):
+            first_real_ts = float(r["ts"])
+            break
+    ramp_start = (first_real_ts - 6 * 3600) if first_real_ts else 0.0
+    ramp_end = (first_real_ts + 12 * 3600) if first_real_ts else 0.0
+
+    fluid = _read_json(STATE_DIR / "fluid_state.json", {}) or {}
+    peak = float(fluid.get("peak_equity") or 0)
+    hi_cap = max(global_hi * 1.15, (peak * 1.12) if peak > 0 else global_hi * 1.15, ref * 1.4 + 50.0)
+
+    kept: list[dict[str, float]] = []
+    for r in clean:
+        eq = float(r["equity"])
+        ts = float(r["ts"])
+        if eq > hi_cap:
+            continue
+        if first_real_ts and ramp_start <= ts <= ramp_end:
+            kept.append(r)
+            continue
+        if ref >= 120 and eq < max(25.0, ref * 0.12):
+            continue
+        if global_hi >= 200 and eq < 50:
+            continue
+        kept.append(r)
+
+    if len(kept) >= max(5, len(clean) // 80):
+        return kept
 
     substantial = sorted(float(r["equity"]) for r in clean if r["equity"] >= 15)
     if len(substantial) >= 5:
@@ -204,8 +226,6 @@ def _sanitize_equity_ticks(
         median = tail[len(tail) // 2]
     hi = max(median * 2.25, median + 1.5)
     lo = max(0.01, median * 0.4)
-    fluid = _read_json(STATE_DIR / "fluid_state.json", {}) or {}
-    peak = float(fluid.get("peak_equity") or 0)
     if peak > median:
         hi = min(hi, max(peak * 1.12, median * 1.85))
     return [r for r in clean if lo <= float(r["equity"]) <= hi]
@@ -267,7 +287,10 @@ def build_pnl_curve_payload(
     cap = min(max(int(limit), 50), 2000)
     from equity_ticks import resample_for_chart
 
+    now_ts = time.time()
     win_sec = _EQUITY_RANGE_SEC.get(eq_range) if eq_range in _EQUITY_RANGE_SEC else None
+    if eq_range == "ALL":
+        win_sec = _EQUITY_RANGE_SEC["6M"]
     equity = (
         resample_for_chart(
             all_ticks,
@@ -279,6 +302,12 @@ def build_pnl_curve_payload(
         if all_ticks
         else []
     )
+    chart_window: dict[str, float] | None = None
+    if win_sec and equity:
+        chart_window = {
+            "start_ts": now_ts - float(win_sec),
+            "end_ts": now_ts,
+        }
     if len(equity) == 1:
         p0 = equity[0]
         span_pad = 90.0 if eq_range in _EQUITY_RANGE_SEC and _EQUITY_RANGE_SEC[eq_range] <= 43200 else 60.0
@@ -327,6 +356,7 @@ def build_pnl_curve_payload(
 
     return {
         "equity": equity,
+        "chart_window": chart_window,
         "realized": realized,
         "baselines": {
             "day_equity": day_baseline,

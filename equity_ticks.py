@@ -13,6 +13,12 @@ _RANGE_WINDOW_SEC = {
     "H3": 3 * 3600,
     "H6": 6 * 3600,
     "H12": 12 * 3600,
+    "1D": 86400,
+    "3D": 3 * 86400,
+    "1W": 604800,
+    "1M": 2592000,
+    "3M": 7776000,
+    "6M": 15552000,
 }
 
 # Target spacing for chart series (seconds between points)
@@ -21,6 +27,13 @@ _CHART_INTERVAL_SEC = {
     "H3": 20,
     "H6": 30,
     "H12": 45,
+    "1D": 90,
+    "3D": 300,
+    "1W": 600,
+    "1M": 1800,
+    "3M": 3600,
+    "6M": 7200,
+    "ALL": 900,
 }
 
 _CHART_POINT_CAP = {
@@ -28,6 +41,13 @@ _CHART_POINT_CAP = {
     "H3": 540,
     "H6": 720,
     "H12": 960,
+    "1D": 400,
+    "3D": 480,
+    "1W": 560,
+    "1M": 640,
+    "3M": 800,
+    "6M": 1000,
+    "ALL": 1200,
 }
 
 _last_append_ts = 0.0
@@ -95,7 +115,7 @@ def resample_for_chart(
     live_equity: float | None = None,
     window_sec: float | None = None,
 ) -> list[dict[str, float]]:
-    """Uniform time grid with linear blend for sub-day; index downsample otherwise."""
+    """Uniform time grid with linear blend; sub-day and day+ ranges use wall-clock windows."""
     if not rows:
         return []
     work = list(rows)
@@ -106,23 +126,53 @@ def resample_for_chart(
         elif abs(work[-1]["equity"] - live_equity) >= 1e-6:
             work[-1] = {"ts": now, "equity": round(live_equity, 6)}
 
-    if eq_range not in _SUBDAY_RANGES:
-        return _downsample_index(work, limit)
+    win = window_sec
+    if win is None:
+        win = _RANGE_WINDOW_SEC.get(eq_range)
+    if win and win > 0:
+        return _time_window_grid(work, eq_range, limit, window_sec=float(win))
 
-    interval = _CHART_INTERVAL_SEC.get(eq_range, 30)
+    if eq_range in _SUBDAY_RANGES:
+        interval = _CHART_INTERVAL_SEC.get(eq_range, 30)
+        cap = min(limit, _CHART_POINT_CAP.get(eq_range, limit))
+        end_ts = work[-1]["ts"]
+        sub_win = window_sec or _RANGE_WINDOW_SEC.get(eq_range) or (end_ts - work[0]["ts"])
+        start_ts = end_ts - max(sub_win, interval)
+        src = [r for r in work if r["ts"] >= start_ts - 1.0]
+        if not src:
+            src = work
+        if src and src[0]["ts"] > start_ts + interval:
+            src = [{"ts": start_ts, "equity": src[0]["equity"]}, *src]
+        n_pts = min(cap, max(32, int(sub_win / interval) + 1))
+        if n_pts < 2:
+            n_pts = 2
+        return _linear_grid(src, start_ts, end_ts, n_pts)
+
+    return _downsample_index(work, limit)
+
+
+def _time_window_grid(
+    rows: list[dict[str, float]],
+    eq_range: str,
+    limit: int,
+    *,
+    window_sec: float,
+) -> list[dict[str, float]]:
+    end_ts = rows[-1]["ts"]
+    start_ts = end_ts - max(window_sec, 60.0)
+    interval = _CHART_INTERVAL_SEC.get(eq_range, 300)
     cap = min(limit, _CHART_POINT_CAP.get(eq_range, limit))
-    end_ts = work[-1]["ts"]
-    win = window_sec or _RANGE_WINDOW_SEC.get(eq_range) or (end_ts - work[0]["ts"])
-    start_ts = end_ts - max(win, interval)
-    src = [r for r in work if r["ts"] >= start_ts - 1.0]
-    if not src:
-        src = work
-    if src and src[0]["ts"] > start_ts + interval:
-        src = [{"ts": start_ts, "equity": src[0]["equity"]}, *src]
-    n_pts = min(cap, max(32, int(win / interval) + 1))
+    n_pts = min(cap, max(32, int(window_sec / interval) + 1))
     if n_pts < 2:
         n_pts = 2
-    return _linear_grid(src, start_ts, end_ts, n_pts)
+
+    src = [r for r in rows if r["ts"] >= start_ts - 1.0]
+    if not src:
+        return []
+    grid_start = start_ts
+    if src[0]["ts"] > start_ts + interval * 2:
+        grid_start = src[0]["ts"]
+    return _linear_grid(src, grid_start, end_ts, n_pts)
 
 
 def _downsample_index(rows: list[dict[str, float]], limit: int) -> list[dict[str, float]]:

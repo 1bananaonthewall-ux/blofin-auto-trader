@@ -178,8 +178,8 @@ export function PnlCurveChart({
     if (!data?.equity?.length) return null;
 
     const points = data.equity;
-    const minTs = points[0].ts;
-    const maxTs = points[points.length - 1].ts;
+    const minTs = data.chart_window?.start_ts ?? points[0].ts;
+    const maxTs = data.chart_window?.end_ts ?? points[points.length - 1].ts;
     const tsSpan = maxTs - minTs || 1;
 
     const eqVals = points.map((p) => p.equity);

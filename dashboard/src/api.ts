@@ -131,6 +131,7 @@ export interface RealizedPoint {
 
 export interface PnlCurveData {
   equity: PnlCurvePoint[];
+  chart_window?: { start_ts: number; end_ts: number } | null;
   range?: string;
   realized: RealizedPoint[];
   baselines: {
