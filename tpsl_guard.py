@@ -241,6 +241,7 @@ def adjust_triggers_for_market(
     Nudge triggers when price has moved through the intended level (error 102040).
     """
     if mark <= 0:
+        # Never zero triggers when exchange mark is unavailable (caller will retry mark).
         return sl_price, tp_price
     gap = max(gap_pct, 0.0005)
     side_l = side.lower()

@@ -94,3 +94,27 @@ def register_429(retry_after_sec: float | None, source: str = "") -> float:
             remaining,
         )
     return remaining
+
+
+def register_short_pause(sec: float, source: str = "") -> float:
+    """Brief global pause for transient exchange faults (e.g. TPSL price feed missing)."""
+    global _pause_until, _last_warn_at
+
+    sec = max(15.0, min(90.0, float(sec)))
+    until = time.time() + sec
+    should_warn = False
+    with _lock:
+        prev_until = _pause_until
+        _pause_until = max(_pause_until, until)
+        remaining = max(0.0, _pause_until - time.time())
+        if _pause_until > prev_until and time.time() - _last_warn_at >= _WARN_INTERVAL:
+            _last_warn_at = time.time()
+            should_warn = True
+    if should_warn:
+        log.warning(
+            "API short pause (%s) — backoff %.0fs (%.0fs remaining)",
+            source or "transient",
+            sec,
+            remaining,
+        )
+    return remaining

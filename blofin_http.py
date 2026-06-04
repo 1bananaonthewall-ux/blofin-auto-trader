@@ -249,6 +249,21 @@ class BlofinHttp:
             raise RuntimeError(f"No ticker for {inst_id}")
         return rows[0]
 
+    def get_mark_price(self, inst_id: str) -> dict[str, Any]:
+        rows = (
+            self.request(
+                "GET",
+                "/api/v1/market/mark-price",
+                params={"instId": inst_id},
+            )
+            or []
+        )
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        if isinstance(rows, dict):
+            return rows
+        return {}
+
     def get_margin_mode(self) -> dict[str, Any]:
         data = self.request("GET", "/api/v1/account/margin-mode")
         return data if isinstance(data, dict) else {}

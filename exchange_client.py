@@ -65,6 +65,7 @@ HEDGE_MODE_CACHE_FILE = "hedge_mode.json"
 MARGIN_MODE_CACHE_FILE = "margin_mode.json"
 MIN_TPSL_REPAIR_SEC = 15.0
 TPSL_VERIFIED_TTL_SEC = 600.0
+_TPSL_PRICE_FAULT_CODES = ("103005", "102132", "102134")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -863,19 +864,89 @@ class BlofinExchange:
             log.error("open failed %s: %s", symbol, e)
             return None
 
-    def _mark_for_symbol(self, symbol: str, pos: dict | None = None) -> float:
-        if self.stream:
-            px = self.stream.get_last_price(symbol)
-            if px and px > 0:
-                return float(px)
-        if pos:
-            mark = float(pos.get("mark_price") or 0)
-            if mark > 0:
-                return mark
-        inst_id = symbol_to_inst_id(symbol)
-        self._throttle()
-        ticker = self.http.get_ticker(inst_id)
-        return float(ticker.get("last") or ticker.get("lastPrice") or 0)
+    @staticmethod
+    def _is_tpsl_price_fault(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(
+            code in msg
+            for code in _TPSL_PRICE_FAULT_CODES
+        ) or "latest trading price not found" in msg or "mark price not found" in msg
+
+    def _prime_market_price(self, inst_id: str) -> None:
+        """Warm Blofin price caches before order-tpsl (reduces 103005/102132 rejections)."""
+        try:
+            self.http.get_mark_price(inst_id)
+        except Exception:
+            pass
+        try:
+            self.http.get_ticker(inst_id)
+        except Exception:
+            pass
+
+    def _mark_for_symbol(
+        self, symbol: str, pos: dict | None = None, *, retries: int = 3
+    ) -> float:
+        """Resolve last/mark for TPSL — Blofin rejects orders without a live price (103005)."""
+        base = self._canonical_symbol(symbol)
+        inst_id = symbol_to_inst_id(base)
+        entry = float((pos or {}).get("entry_price") or 0)
+        info = (pos or {}).get("info") or {}
+
+        for attempt in range(max(1, retries)):
+            if self.stream:
+                if attempt == 1:
+                    try:
+                        self.stream.refresh_all_tickers(force=True)
+                    except Exception:
+                        pass
+                px = self.stream.get_last_price(base)
+                if px and px > 0:
+                    return float(px)
+                row = self.stream.get_ticker(base)
+                if row:
+                    for key in ("last", "lastPrice", "markPrice", "markPx"):
+                        try:
+                            v = float(row.get(key) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if v > 0:
+                            return v
+            if pos:
+                mark = float(pos.get("mark_price") or 0)
+                if mark > 0:
+                    return mark
+                for key in ("markPx", "markPrice", "last", "lastPx"):
+                    try:
+                        v = float(info.get(key) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if v > 0:
+                        return v
+            self._throttle()
+            try:
+                ticker = self.http.get_ticker(inst_id)
+                for key in ("last", "lastPrice", "markPrice", "markPx"):
+                    try:
+                        v = float(ticker.get(key) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if v > 0:
+                        return v
+            except Exception as exc:
+                if "103005" not in str(exc) and attempt >= retries - 1:
+                    log.debug("ticker %s failed: %s", inst_id, exc)
+            try:
+                candles = self.http.get_candles(inst_id, bar="1m", limit=3)
+                if candles:
+                    close = float(candles[-1][4])
+                    if close > 0:
+                        return close
+            except Exception:
+                pass
+            if entry > 0 and attempt >= retries - 1:
+                return entry
+            time.sleep(0.35 * (attempt + 1))
+        return 0.0
 
     def _seed_tpsl_trust_from_registry(self, state_dir: Path) -> None:
         reg = _read_json(state_dir / "position_registry.json")
@@ -1211,20 +1282,25 @@ class BlofinExchange:
         if dry_run:
             return True
 
-        def _submit(sl: float, tp: float) -> bool:
+        def _submit(sl: float, tp: float, *, trigger_type: str = "last") -> bool:
+            self._prime_market_price(inst_id)
             leg_body = dict(body)
             if sl > 0:
                 leg_body["slTriggerPrice"] = self._format_price(sl)
                 leg_body["slOrderPrice"] = "-1"
+                leg_body["slTriggerPriceType"] = trigger_type
             else:
                 leg_body.pop("slTriggerPrice", None)
                 leg_body.pop("slOrderPrice", None)
+                leg_body.pop("slTriggerPriceType", None)
             if tp > 0:
                 leg_body["tpTriggerPrice"] = self._format_price(tp)
                 leg_body["tpOrderPrice"] = "-1"
+                leg_body["tpTriggerPriceType"] = trigger_type
             else:
                 leg_body.pop("tpTriggerPrice", None)
                 leg_body.pop("tpOrderPrice", None)
+                leg_body.pop("tpTriggerPriceType", None)
             if sl <= 0 and tp <= 0:
                 return False
             resp = self.http.place_order_tpsl(leg_body)
@@ -1244,33 +1320,75 @@ class BlofinExchange:
 
         side_l = (side or "").lower()
         sym = symbol or inst_id.replace("-USDT", "/USDT:USDT")
+
+        def _retry_with_mark(sl: float, tp: float, ref_mark: float, trigger_type: str) -> bool:
+            if side_l and ref_mark > 0:
+                adj_sl, adj_tp = adjust_triggers_for_market(side_l, sl, tp, ref_mark)
+                if sl > 0 and adj_sl <= 0:
+                    adj_sl = sl
+                if tp > 0 and adj_tp <= 0:
+                    adj_tp = tp
+                if adj_sl != sl or adj_tp != tp:
+                    log.info(
+                        "TPSL %s retry vs mark=%.6f sl=%.6f tp=%.6f type=%s",
+                        inst_id,
+                        ref_mark,
+                        adj_sl,
+                        adj_tp,
+                        trigger_type,
+                    )
+                    return _submit(adj_sl, adj_tp, trigger_type=trigger_type)
+            return False
+
         try:
-            return _submit(sl_price, tp_price)
+            ref = mark if mark > 0 else self._mark_for_symbol(sym, retries=4)
+            if ref > 0 and side_l:
+                sl_price, tp_price = adjust_triggers_for_market(
+                    side_l, sl_price, tp_price, ref
+                )
+            for trigger_type in ("last", "mark", "index"):
+                try:
+                    if _submit(sl_price, tp_price, trigger_type=trigger_type):
+                        return True
+                except Exception as inner:
+                    if not self._is_tpsl_price_fault(inner):
+                        raise
+                    log.debug(
+                        "TPSL %s price fault with trigger=%s — trying next",
+                        inst_id,
+                        trigger_type,
+                    )
+            return False
         except Exception as exc:
             msg = str(exc)
             msg_l = msg.lower()
             if "102114" in msg_l or "already set" in msg_l:
                 log.debug("TPSL %s may already exist — will verify on exchange", inst_id)
                 return True
+            if self._is_tpsl_price_fault(exc):
+                api_backoff.register_short_pause(
+                    45.0, source=f"TPSL price feed {inst_id}"
+                )
+                log.warning(
+                    "TPSL %s deferred — exchange price feed missing (103005/102132); "
+                    "steward backup + retry in ~45s",
+                    inst_id,
+                )
+                return False
             if side_l and ("102037" in msg or "102038" in msg or "102040" in msg):
-                fresh = mark if mark > 0 else self._mark_for_symbol(sym)
-                if fresh > 0:
-                    adj_sl, adj_tp = adjust_triggers_for_market(
-                        side_l, sl_price, tp_price, fresh
-                    )
-                    if adj_sl != sl_price or adj_tp != tp_price:
-                        try:
-                            log.info(
-                                "TPSL %s retry vs mark=%.6f sl=%.6f tp=%.6f",
-                                inst_id,
-                                fresh,
-                                adj_sl,
-                                adj_tp,
-                            )
-                            return _submit(adj_sl, adj_tp)
-                        except Exception as exc2:
-                            exc = exc2
-                            msg = str(exc)
+                for attempt in range(2):
+                    fresh = self._mark_for_symbol(sym, retries=4)
+                    if fresh <= 0:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    try:
+                        if _retry_with_mark(sl_price, tp_price, fresh, "mark"):
+                            return True
+                    except Exception as exc2:
+                        exc = exc2
+                        if self._is_tpsl_price_fault(exc2):
+                            break
+                    time.sleep(0.45 * (attempt + 1))
             log.warning("TPSL leg failed %s sl=%.6f tp=%.6f: %s", inst_id, sl_price, tp_price, exc)
             return False
 
@@ -1325,7 +1443,13 @@ class BlofinExchange:
         margin_mode = self._margin_mode_for_position(pos)
         close_side = "sell" if side == "long" else "buy"
         entry = float(pos.get("entry_price") or 0) if pos else 0.0
-        mark = self._mark_for_symbol(base_sym, pos)
+        mark = self._mark_for_symbol(base_sym, pos, retries=4)
+        if mark <= 0:
+            log.warning(
+                "TPSL %s skipped — no mark price (103005 risk); will retry next pass",
+                inst_id,
+            )
+            return False
         sl_price, tp_price = adjust_triggers_for_market(side, sl_price, tp_price, mark)
 
         _, pending0 = self._pending_tpsl(
@@ -1397,6 +1521,11 @@ class BlofinExchange:
             symbol=base_sym,
             mark=mark,
         )
+
+        def _refresh_mark() -> float:
+            m = self._mark_for_symbol(base_sym, pos, retries=4)
+            leg_kw["mark"] = m
+            return m
         if replace_all:
             ok = self._place_tpsl_leg(
                 inst_id,
@@ -1417,6 +1546,12 @@ class BlofinExchange:
                 if not _still_wide(pending):
                     self._record_tpsl_verified(base_sym, pending.sl_price, pending.tp_price)
                     return True
+            if api_backoff.is_paused() and not ok:
+                log.warning(
+                    "TPSL %s verify fail during API pause — skip leg spam",
+                    inst_id,
+                )
+                return False
             if pending.has_sl and not pending.has_tp:
                 log.warning("TPSL %s: SL live but TP missing — placing TP leg", inst_id)
             elif pending.has_tp and not pending.has_sl:
@@ -1425,8 +1560,10 @@ class BlofinExchange:
                 log.warning("TPSL %s: re-placing legs after verify fail", inst_id)
                 if pending.live_rows > 0 and not pending.has_sl and not pending.has_tp:
                     self._cancel_pending_tpsl(inst_id)
-            mark = self._mark_for_symbol(base_sym, pos)
-            leg_kw["mark"] = mark
+            mark = _refresh_mark()
+            if mark <= 0:
+                log.warning("TPSL %s leg retry aborted — mark still unavailable", inst_id)
+                return False
             if not pending.has_sl:
                 adj_sl, _ = adjust_triggers_for_market(side, sl_price, 0.0, mark)
                 ok = self._place_tpsl_leg(
