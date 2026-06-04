@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from markets import symbol_to_inst_id
 from position_registry import PositionRegistry
-from position_rotator import evaluate_harvest, evaluate_roe_harvest, execute_rotation
+from position_rotator import evaluate_harvest, execute_rotation
 from liquidation_guard import (
     is_sl_reached,
     is_sl_trigger_hit,
@@ -518,50 +518,11 @@ def harvest_all_mature(
         fee_mult = settings.scalp_harvest_fee_mult if settings.scalp_mode else 2.2
         prof = profile_for(settings)
         harvest_min_r = prof.harvest_min_r if prof else 0.0
-        action = None
-        if getattr(settings, "scalp_roe_harvest_enabled", False):
-            info = pos.get("raw") or pos.get("info") or {}
-            entry = float(pos.get("entry_price") or 0)
-            mark = float(
-                pos.get("mark_price")
-                or info.get("markPx")
-                or info.get("markPrice")
-                or entry
-            )
-            side = str(pos.get("side") or "long").lower()
-            lev = int(pos.get("leverage") or info.get("leverage") or settings.scalp_leverage)
-            margin = float(pos.get("margin_usdt") or 0)
-            contracts = float(pos.get("contracts") or 0)
-            mkt = ex.market_for(sym)
-            cs = mkt.contract_size if mkt else 1.0
-            roe_pct, pnl_usd, _, _ = ex.position_display_metrics(
-                side=side,
-                entry=entry,
-                mark=mark,
-                margin_usdt=margin,
-                leverage=lev,
-                unrealized_usd=float(pos.get("unrealized_pnl_usd"))
-                if pos.get("unrealized_pnl_usd") is not None
-                else None,
-                row=info if info else None,
-                contracts=contracts,
-                contract_size=cs,
-            )
-            pos["unrealized_pnl_usd"] = pnl_usd
-            action = evaluate_roe_harvest(
-                sym,
-                pos,
-                registry.get(sym),
-                roe_pct,
-                min_roe_pct=float(settings.scalp_roe_harvest_min_pct),
-                max_roe_pct=float(settings.scalp_roe_harvest_max_pct),
-                min_hold_seconds=min_hold,
-                target_rr=float(settings.scalp_3r_min_rr),
-            )
         skip_discretionary = getattr(settings, "stack_winners_mode", True) and not getattr(
             settings, "early_harvest_enabled", False
-        ) and not getattr(settings, "scalp_roe_harvest_enabled", False)
-        if action is None and not skip_discretionary:
+        )
+        action = None
+        if not skip_discretionary:
             action = evaluate_harvest(
                 sym,
                 pos,

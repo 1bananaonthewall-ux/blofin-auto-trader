@@ -469,7 +469,7 @@ def load_settings() -> Settings:
         scalp_fast_max_take_pct=float(os.getenv("SCALP_FAST_MAX_TAKE_PCT", "0.030")),
         scalp_momentum_max_stop_pct=float(os.getenv("SCALP_MOMENTUM_MAX_STOP_PCT", "0.014")),
         scalp_skip_liq_tpsl=_env_bool("SCALP_SKIP_LIQ_TPSL", True),
-        scalp_roe_harvest_enabled=_env_bool("SCALP_ROE_HARVEST_ENABLED", True),
+        scalp_roe_harvest_enabled=_env_bool("SCALP_ROE_HARVEST_ENABLED", False),
         scalp_roe_harvest_min_pct=float(os.getenv("SCALP_ROE_HARVEST_MIN_PCT", "50")),
         scalp_roe_harvest_max_pct=float(os.getenv("SCALP_ROE_HARVEST_MAX_PCT", "60")),
     )
