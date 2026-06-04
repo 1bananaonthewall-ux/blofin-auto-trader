@@ -204,6 +204,12 @@ def find_upgrade_victim(
     )
 
 
+def _position_already_closed(exc: BaseException) -> bool:
+    """Exchange close when flat (TPSL filled first) — not a rotation failure."""
+    msg = str(exc).lower()
+    return "102005" in msg or "had been closed" in msg or "position does not exist" in msg
+
+
 def execute_rotation(
     ex: BlofinExchange,
     action: RotationAction,
@@ -248,6 +254,14 @@ def execute_rotation(
                 reason=action.action,
             )
         return True
-    except Exception:
+    except Exception as exc:
+        if _position_already_closed(exc):
+            log.info(
+                "rotation close %s already flat (exchange/TPSL): %s",
+                action.symbol,
+                exc,
+            )
+            registry.remove(action.symbol)
+            return True
         log.exception("rotation close failed %s", action.symbol)
         return False
