@@ -41,6 +41,23 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _open_reject_is_expected(exc: BaseException) -> bool:
+    """Known exchange rejects — bot.py cooldowns handle these; not operator errors."""
+    msg = str(exc).lower()
+    return any(
+        code in msg
+        for code in ("102115", "102135", "102087")
+    ) or any(
+        phrase in msg
+        for phrase in (
+            "delisted",
+            "will be delisted",
+            "market is closed",
+            "maximum available position amount",
+        )
+    )
+
+
 def _quantize_order_size(contracts: float, lot_size: float) -> str:
     """Round to exchange lot step and emit a clean size string (avoids 152002 float noise)."""
     step = lot_size if lot_size > 0 else 0.01
@@ -861,7 +878,10 @@ class BlofinExchange:
             return result
         except Exception as e:
             self.last_open_error = str(e)
-            log.error("open failed %s: %s", symbol, e)
+            if _open_reject_is_expected(e):
+                log.warning("open rejected %s: %s", symbol, e)
+            else:
+                log.error("open failed %s: %s", symbol, e)
             return None
 
     @staticmethod
