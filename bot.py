@@ -1185,6 +1185,15 @@ def main() -> None:
             settings.scalp_leverage,
             settings.scalp_leverage_max,
         )
+    if getattr(settings, "scalp_roe_harvest_enabled", False):
+        log.warning(
+            "ROE HARVEST LOOP: bank at %.0f-%.0f%% ROE (exchange UI) | %.1f:1 R:R entries | "
+            "steward closes → free margin → next 3R (STACK_WINNERS=%s)",
+            settings.scalp_roe_harvest_min_pct,
+            settings.scalp_roe_harvest_max_pct,
+            settings.scalp_3r_min_rr,
+            getattr(settings, "stack_winners_mode", True),
+        )
     if settings.winner_only_mode:
         cap = effective_max_open(settings, eq0)
         cap_msg = "unlimited" if cap >= UNLIMITED_POSITIONS else str(cap)

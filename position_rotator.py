@@ -38,6 +38,46 @@ def _gross_pnl_pct(side: str, entry: float, price: float) -> float:
     return (entry - price) / entry
 
 
+def evaluate_roe_harvest(
+    symbol: str,
+    pos: dict,
+    meta: dict | None,
+    roe_pct: float,
+    *,
+    min_roe_pct: float = 50.0,
+    max_roe_pct: float = 60.0,
+    min_hold_seconds: float = MIN_HOLD_SECONDS,
+    target_rr: float = 3.0,
+) -> RotationAction | None:
+    """Bank winners at exchange ROE%% (Blofin UI) then reopen next 3:1 setup."""
+    if roe_pct < min_roe_pct:
+        return None
+    entry = float(pos.get("entry_price") or (meta or {}).get("entry_price") or 0)
+    contracts = float(pos.get("contracts") or 0)
+    if entry <= 0 or contracts <= 0:
+        return None
+    opened_at = float((meta or {}).get("opened_at") or 0)
+    if opened_at and (time.time() - opened_at) < min_hold_seconds:
+        return None
+    pnl_usd = float(pos.get("unrealized_pnl_usd") or 0)
+    zone = f"{min_roe_pct:.0f}-{max_roe_pct:.0f}%"
+    if roe_pct > max_roe_pct:
+        reason = (
+            f"roe harvest {roe_pct:.1f}% (>={min_roe_pct:.0f}%, past {max_roe_pct:.0f}% band) "
+            f"| 3R cycle rr={target_rr:.1f}:1"
+        )
+    else:
+        reason = (
+            f"roe harvest {roe_pct:.1f}% in {zone} band | 3R cycle rr={target_rr:.1f}:1"
+        )
+    return RotationAction(
+        symbol=symbol,
+        action="harvest",
+        reason=reason,
+        pnl_after_fees_usd=max(pnl_usd, 0.01),
+    )
+
+
 def evaluate_harvest(
     symbol: str,
     pos: dict,
