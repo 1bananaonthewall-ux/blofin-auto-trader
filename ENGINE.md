@@ -1,6 +1,6 @@
 # Fluid Autonomous Engine
 
-**Mission:** **$95,000,000** by **2027-09-01** (`mission_config.py`) — the engine has **one purpose only** (`mission_brain.py`). Every subsystem asks whether an action advances that compound path. Nothing else is optimized.
+**Mission:** **Maintain and exceed 10% account growth per day** (`mission_config.py`) — the engine has **one purpose only** (`mission_brain.py`). Every subsystem asks whether an action maintains or exceeds today's +10% path. Nothing else is optimized.
 
 There are no labeled modes ("recovery", "chill", etc.). Like a skilled trader, the bot **continuously** adjusts intensity — it does not announce a state change.
 
@@ -59,11 +59,11 @@ Every scan runs **15+ independent analyses** (EMA 1m/5m, RSI, MACD, Bollinger, V
 
 ### Mission brain (`mission_brain.py`)
 
-- **Sole objective:** $95M by 2027-09-01 — no secondary goals
+- **Sole objective:** Maintain and exceed 10% account growth per day — no secondary goals
 - Each tick: schedule pressure, mission focus score, risk multiplier, conviction floor
-- **Vetoes** entries that do not serve the path (behind schedule → elite setups only; declining curve → protect base)
-- **Amplifies** risk only when behind schedule *and* the PnL curve is climbing/vertical with strong conviction
-- Hourly log prints the internal directive (e.g. `BEHIND SCHEDULE — press only high-conviction compounders toward $95M`)
+- **Vetoes** entries that do not serve the path (below +10% → elite setups only; declining curve → protect base)
+- **Amplifies** risk when below +10% *and* the PnL curve is climbing/vertical with strong conviction
+- Hourly log prints the internal directive (e.g. `BELOW +10% — press high-conviction trades to maintain/exceed daily goal`)
 
 ### PnL curve (`pnl_curve.py`)
 

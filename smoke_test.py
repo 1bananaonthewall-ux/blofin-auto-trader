@@ -104,7 +104,7 @@ def test_mission_brain() -> None:
     from pnl_curve import PnlCurveEngine
 
     brain = MissionBrain()
-    assert "95" in SOLE_OBJECTIVE and "2027" in SOLE_OBJECTIVE
+    assert "10%" in SOLE_OBJECTIVE and "exceed" in SOLE_OBJECTIVE.lower()
     with tempfile.TemporaryDirectory() as td:
         pnl = PnlCurveEngine(Path(td))
         curve = pnl.update(40.0, 3.0)

@@ -74,7 +74,7 @@ def main() -> int:
 
     # --- Load real‑fill outcome feedback ---
     tracker = TradeOutcomeTracker(settings.state_dir, settings.ml_real_feedback_max_samples)
-    X_fb, y_fb = tracker.load_labelled_samples()
+    X_fb, y_fb = tracker.load_labelled_samples(margin_mode=settings.margin_mode)
     if len(y_fb) > 0:
         log.info("loaded %d real‑feedback samples for training", len(y_fb))
 

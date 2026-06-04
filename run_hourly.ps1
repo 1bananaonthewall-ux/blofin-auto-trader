@@ -6,4 +6,5 @@ $LogFile = Join-Path $LogDir "hourly_maintain.log"
 $py = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } else { "python" }
 $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 "=== $ts ===" | Out-File $LogFile -Append -Encoding utf8
-& $py scripts\hourly_maintain.py 2>&1 | Tee-Object -FilePath $LogFile -Append
+$hourlyCmd = "`"$py`" scripts\hourly_maintain.py 2>&1"
+cmd /c $hourlyCmd | Tee-Object -FilePath $LogFile -Append

@@ -1,78 +1,100 @@
-# Blofin Auto Trader
+# God Bot
 
-Standalone Python bot for Blofin USDT perpetuals. See [COMPARISON.md](COMPARISON.md) for an honest comparison vs **BloHunter Connect** + [blohunter.ai](https://blohunter.ai).
+Holistic **Blofin USDT perpetual scalper** for Windows: fast 3R cross-margin TP/SL (~1% stop / ~3% take), position steward, ML + fluid manifold, live dashboard, and **Cursor agent** skills so another machine can run the same stack with **its own** API keys.
 
-Automated trading with a **daily equity target** (default +10%) and optional daily loss limit.
+**Mission:** maintain and exceed **+10% account growth per day** (aggressive — read the risk section).
 
-## Important risk notice
+| Doc | Audience |
+|-----|----------|
+| [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) | Your friend — clone in Cursor, API keys, first run |
+| [AGENT_READ_ME_FIRST.md](AGENT_READ_ME_FIRST.md) | Cursor agent on any PC |
+| [ENGINE.md](ENGINE.md) | Architecture |
+| [docs/OWNER_GITHUB.md](docs/OWNER_GITHUB.md) | You — publish repo & invite collaborator |
 
-+10% **per day** is an extremely aggressive goal. Most professional funds target far less per **year**. This bot uses small per-trade risk (default 1% of equity), stop-loss / take-profit on each trade, and a daily loss circuit breaker — but **you can still lose your entire account**, especially with leverage.
+## Quick start (new machine)
 
-Start with `DRY_RUN=true`, then use Blofin **demo** mode (`BLOFIN_MODE=demo`) before live trading.
+**Requirements:** Windows 10/11, [Python 3.12+](https://www.python.org/downloads/), PowerShell 5+. Optional: [Node 20+](https://nodejs.org/) (rebuild dashboard), [Cursor](https://cursor.com).
 
-## Setup
+### 1. Get the repo (Cursor)
 
-1. Copy credentials into `.env` (already created from your `1B Blofin API` file in OneDrive Documents).
-2. Install and run:
-
-```powershell
-cd C:\Users\mknig\blofin-auto-trader
-.\run.ps1
-```
-
-Or manually:
+1. Install **Cursor** and sign in.
+2. **File → Clone repo** (or terminal):
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
-.\.venv\Scripts\python bot.py
+git clone https://github.com/YOUR_ORG/blofin-auto-trader.git
+cd blofin-auto-trader
 ```
 
-## Configuration (`.env`)
+Replace `YOUR_ORG` with the GitHub user/org that owns the repo (see [docs/OWNER_GITHUB.md](docs/OWNER_GITHUB.md) to publish and share access).
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `BLOFIN_MODE` | `live` | `live` or `demo` (sandbox API) |
-| `DRY_RUN` | `true` | Log orders without sending them |
-| `DAILY_TARGET_PCT` | `0.10` | Daily profit milestone (logged when reached) |
-| `STOP_ON_DAILY_TARGET` | `false` | If `true`, stop new trades after target is hit |
-| `MAX_DAILY_LOSS_PCT` | `0.05` | Stop trading after -5% daily equity |
-| `RISK_PER_TRADE_PCT` | `0.01` | Total portfolio risk budget per tick (split across slots) |
-| `LEVERAGE` | `5` | Isolated leverage |
-| `TRADE_UNIVERSE` | `all` | `all` = every affordable USDT perpetual; or set `SYMBOL` only |
-| `MAX_POSITIONS` | `10` | Hard cap on simultaneous positions |
-| `AUTO_MAX_POSITIONS` | `true` | Auto-lower slots when equity cannot support more margin |
-| `MARGIN_UTILIZATION_PCT` | `0.75` | Max fraction of equity used across open positions |
-| `SYMBOLS_PER_TICK` | `30` | How many markets to scan per loop (rate-limit friendly) |
-| `SYMBOL` | `BTC/USDT:USDT` | Used when `TRADE_UNIVERSE` is not `all` |
-| `POLL_SECONDS` | `60` | Seconds between strategy ticks |
+3. **File → Open Folder** → select the cloned folder.
 
-## Portfolio mode
+4. In Cursor chat, paste:
 
-With `TRADE_UNIVERSE=all`, the bot:
+> Read `docs/GETTING_STARTED.md` and `AGENT_READ_ME_FIRST.md`. Help me finish setup: create `.env` from `.env.example`, run `scripts\bootstrap_god_bot.ps1`, then start God Bot in **demo** with my Blofin API keys.
 
-1. Loads all live **USDT perpetual** markets from Blofin
-2. Keeps only symbols your balance can afford (min contract margin vs equity)
-3. Sets **max open positions** = min(cap, affordable count, margin budget) when `AUTO_MAX_POSITIONS=true`
-4. Splits `RISK_PER_TRADE_PCT` across those slots (e.g. 1% total / 5 slots = 0.2% risk each)
-5. Rotates through markets each tick (`SYMBOLS_PER_TICK`) while always managing open positions first
+### 2. One-shot bootstrap
 
-Small accounts may still only support **1–3** concurrent positions even with `MAX_POSITIONS=10`.
+```powershell
+cd blofin-auto-trader
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap_god_bot.ps1
+```
 
-## Strategy
+Creates `.venv`, installs Python deps, copies `.env.example` → `.env` if missing, builds dashboard when Node is installed.
 
-- 1-minute candles per symbol
-- Long when EMA(9) > EMA(21) and RSI < 68
-- Short when EMA(9) < EMA(21) and RSI > 32
-- Market entries with attached stop (~0.8%) and take profit (~1.6%)
+### 3. Your Blofin API (never commit)
 
-## Logs and state
+Edit `.env` — set **your** keys only:
 
-- `logs/bot.log` — runtime log
-- `state/daily.json` — UTC-day equity snapshot and target flags
+```ini
+BLOFIN_API_KEY=...
+BLOFIN_SECRET=...
+BLOFIN_PASSPHRASE=...
+BLOFIN_MODE=demo
+DRY_RUN=false
+```
 
-## API key security
+Create keys at [Blofin API management](https://blofin.com/account/apis) with **Trade** permission; restrict by IP if possible.
 
-- `.env` is gitignored; rotate keys if this folder is shared
-- Restrict API keys by IP on [Blofin API settings](https://blofin.com/account/apis)
-- Never commit API secrets to git
+Stay on **`BLOFIN_MODE=demo`** until you intentionally switch to `live`.
+
+### 4. Run God Bot
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\God Bot.ps1" -Action ensure
+```
+
+| Service | URL |
+|---------|-----|
+| Dashboard | http://127.0.0.1:5050 |
+| Status | `python scripts\stack_status.py` |
+| Logs | `logs\bot.log` |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stack_control.ps1 -Action restart-fresh
+powershell -ExecutionPolicy Bypass -File ".\God Bot.ps1" -Action stop
+```
+
+## What’s in the repo
+
+- **`God Bot.ps1`** — start / stop / ensure stack (bot + dashboard)
+- **`bot.py`** — main trading loop (single instance only)
+- **`position_steward.py`** — exchange TP/SL verify, harvest, adoption
+- **`scripts/`** — stack control, hourly health, bootstrap, audits
+- **`dashboard/`** — React UI (`dist/` prebuilt; `npm run build` to rebuild)
+- **`.cursor/`** — agent skills, hourly automation prompts, rules
+- **`playbooks/`**, **`ml/`** — models and tuning (runtime artifacts go to `state/`, gitignored)
+
+## Identical stack to the owner
+
+Default `.env.example` matches the owner’s **God Bot profile** (50x cap, fast 3R, cross margin, throughput brain, optimizer, etc.). Each trader uses **their own** `.env` and gets a fresh `state/` on first run — no shared positions or secrets.
+
+Optional local LLM (~3.6 GB): `scripts\setup_local_llm.ps1 -DownloadModel 7b` (not required for trading).
+
+## Risk
+
+Leveraged crypto futures can **wipe the account**. +10%/day is a mission target, not a promise. Use demo first, size small, and never share `.env`.
+
+## License
+
+Use at your own risk. No warranty. See [COMPARISON.md](COMPARISON.md) for context vs other tools.

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "source": "MIT Markov switching / Hamilton (1989) regime models",
+  "references": [
+    "https://x.com/de1lymoon/status/2059382168892145813",
+    "https://ocw.mit.edu/courses/14-384-time-series-analysis-fall-2013/",
+    "Hamilton (1989) Econometrica — Markov switching mean",
+    "Kim & Nelson (1999) MIT Press — State-Space Models with Regime Switching"
+  ],
+  "concepts": [
+    "Latent state S_t follows a first-order Markov chain with transition matrix P",
+    "Regime persistence: diagonal of P should be high (markets stay in a regime)",
+    "Emissions: mean/vol parameters differ per state; filter gives P(S_t | data)",
+    "Use P(stress) and transition risk to throttle entries, not to predict price"
+  ],
+  "bot_mapping": {
+    "calm": "normal 3R throughput",
+    "trend": "slightly favor momentum entries",
+    "stress": "raise conviction floor, widen stops, faster harvest"
+  }
+}

@@ -1,0 +1,4 @@
+# WhatsApp webhook + in-process GGUF (Option A, no Ollama)
+# llama-cpp-python: install via scripts/setup_local_llm.ps1 (pre-built wheel)
+flask>=3.0.0
+twilio>=9.0.0

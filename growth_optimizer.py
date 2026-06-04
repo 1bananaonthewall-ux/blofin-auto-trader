@@ -2,13 +2,13 @@
 COMPOUND GROWTH OPTIMIZER
 Maximum geometric growth calculator.
 Dynamically adjusts aggression based on recent performance,
-drawdown state, and path to $95M target.
+drawdown state, and path to mission target (mission_config).
 
 Key features:
 - Tracks running profit factor on short and long windows
 - Dynamically scales risk per trade up when winning, down when losing
 - Ensures drawdowns are recovered aggressively
-- Calculates required daily return to hit $95M by 2027-09-01
+- Tracks today's return vs maintain/exceed 10%/day mission (mission_config)
 - Provides psychological boost metrics for the bot
 """
 from __future__ import annotations
@@ -22,12 +22,26 @@ from typing import Optional
 
 from mission_config import (
     START_CAPITAL_REFERENCE as START_CAPITAL,
-    TARGET_CAPITAL_USD as TARGET_CAPITAL,
-    target_date_iso,
-    target_date_ts,
+    TARGET_DAILY_GROWTH_MULT,
+    TARGET_DAILY_GROWTH_PCT,
+    daily_growth_on_track,
+    sole_objective_label,
+    target_daily_growth_multiplier,
+    target_daily_growth_pct,
 )
 
-TARGET_DATE = target_date_iso()
+
+def _day_start_equity(history: list[dict], current_equity: float) -> float:
+    """First equity snapshot today (UTC), else best available baseline."""
+    today = time.strftime("%Y-%m-%d")
+    day_rows = [h for h in history if h.get("day") == today and float(h.get("equity") or 0) > 0]
+    if day_rows:
+        return float(day_rows[0]["equity"])
+    for h in reversed(history):
+        eq = float(h.get("equity") or 0)
+        if eq > 0:
+            return eq
+    return current_equity if current_equity > 0 else START_CAPITAL
 
 
 @dataclass
@@ -45,7 +59,7 @@ class GrowthMetrics:
 
 class CompoundGrowthOptimizer:
     """
-    Calculates and enforces the growth trajectory needed to hit $95M.
+    Calculates and enforces the growth trajectory needed to hit the mission target.
     
     The optimizer dynamically adjusts risk aggression based on:
     1. How far ahead/behind the growth schedule you are
@@ -54,17 +68,20 @@ class CompoundGrowthOptimizer:
     4. Account size tier (small accounts need more aggression)
     """
     
-    def __init__(self, state_dir: Path, target_capital: float = TARGET_CAPITAL,
-                 start_capital: float = START_CAPITAL):
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        target_daily_pct: float = TARGET_DAILY_GROWTH_PCT,
+        start_capital: float = START_CAPITAL,
+    ) -> None:
         self.state_dir = state_dir
-        self.target_capital = target_capital
+        self.target_daily_pct = target_daily_pct
         self.start_capital = start_capital
         self.path = state_dir / "growth_metrics.json"
         self.history: list[dict] = []
         self._load()
-        
-        days = max(1, int((target_date_ts() - time.time()) / 86400))
-        self.required_daily_return = (target_capital / max(start_capital, 1e-9)) ** (1.0 / days) - 1
+        self.required_daily_return = target_daily_growth_multiplier() - 1.0
 
     def _load(self):
         if self.path.exists():
@@ -83,6 +100,8 @@ class CompoundGrowthOptimizer:
     
     def record_equity_snapshot(self, equity: float):
         """Record a daily equity snapshot for growth tracking."""
+        if equity <= 0:
+            return
         entry = {
             "equity": round(equity, 4),
             "ts": time.time(),
@@ -93,54 +112,31 @@ class CompoundGrowthOptimizer:
     
     def get_growth_metrics(self, current_equity: float) -> GrowthMetrics:
         """
-        Calculate current growth status and required trajectory.
+        Today's growth vs maintain/exceed 10%/day mission.
         Returns GrowthMetrics with aggression_boost factor.
         """
-        target_ts = target_date_ts()
-        now = time.time()
-        seconds_remaining = target_ts - now
-        days_remaining = max(1, int(seconds_remaining / 86400))
-        
-        # Required daily return to hit target
-        if current_equity > 0 and days_remaining > 0:
-            required_multiplier = (self.target_capital / current_equity) ** (1.0 / days_remaining)
-            required_daily_pct = (required_multiplier - 1) * 100
+        required_daily_pct = self.target_daily_pct
+        required_multiplier = target_daily_growth_multiplier()
+        day_start = _day_start_equity(self.history, current_equity)
+
+        if day_start > 0 and current_equity > 0:
+            actual_daily_pct = (current_equity / day_start - 1.0) * 100.0
         else:
-            required_multiplier = 1.0
-            required_daily_pct = 0.0
-        
-        # Calculate recent growth rate from history
-        recent_equities = [h["equity"] for h in self.history[-30:]]
-        if len(recent_equities) >= 2:
-            oldest = recent_equities[0]
-            newest = recent_equities[-1]
-            days_span = max(1, len(recent_equities) - 1)
-            if oldest > 0:
-                actual_multiplier = (newest / oldest) ** (1.0 / days_span)
-                actual_daily_pct = (actual_multiplier - 1) * 100
-            else:
-                actual_multiplier = 1.0
-                actual_daily_pct = 0.0
-        else:
-            actual_multiplier = 1.0
             actual_daily_pct = 0.0
-        
-        # Projection at current rate
+
+        target_eod = day_start * required_multiplier if day_start > 0 else 0.0
+        gap_to_target = max(0.0, target_eod - current_equity) if target_eod > 0 else 0.0
+
         if actual_daily_pct > 0:
-            days_to_double = math.log(2) / math.log(1 + actual_daily_pct / 100)
-            projected = current_equity * ((1 + actual_daily_pct / 100) ** days_remaining)
+            days_to_double = math.log(2) / math.log(1 + actual_daily_pct / 100.0)
         else:
-            days_to_double = float('inf')
-            projected = current_equity
-        
-        # Determine aggression boost
-        # If behind schedule, increase aggression
+            days_to_double = float("inf")
+
         if required_daily_pct > 0 and actual_daily_pct > 0:
             performance_ratio = actual_daily_pct / required_daily_pct
         else:
-            performance_ratio = 0.5  # assume behind
-        
-        # Scale aggression modestly when behind — sizing still margin-gated
+            performance_ratio = 0.0 if actual_daily_pct <= 0 else 1.0
+
         if performance_ratio < 1.0:
             aggression_boost = min(1.8, 1.0 + (1.0 - performance_ratio) * 0.6)
         else:
@@ -152,18 +148,19 @@ class CompoundGrowthOptimizer:
             aggression_boost = min(1.9, aggression_boost * 1.08)
 
         aggression_boost = max(1.0, min(2.0, aggression_boost))
-        
-        on_track = performance_ratio >= 1.0
-        
+        on_track = daily_growth_on_track(actual_daily_pct)
+
         return GrowthMetrics(
             current_equity=current_equity,
-            days_remaining=days_remaining,
+            days_remaining=1,
             required_daily_return_pct=round(required_daily_pct, 4),
             required_daily_return_multiplier=round(required_multiplier, 6),
             on_track=on_track,
-            projected_capital_at_target=round(projected, 2),
+            projected_capital_at_target=round(target_eod, 4),
             aggression_boost=round(aggression_boost, 4),
-            days_to_double_at_current_rate=round(days_to_double, 1) if days_to_double != float('inf') else -1,
+            days_to_double_at_current_rate=round(days_to_double, 1)
+            if days_to_double != float("inf")
+            else -1,
         )
     
     def get_aggression_boost(self) -> float:
@@ -184,25 +181,29 @@ class CompoundGrowthOptimizer:
         """Generate a human-readable growth status report."""
         metrics = self.get_growth_metrics(current_equity)
         
+        day_start = _day_start_equity(self.history, current_equity)
+        today_pct = (
+            (current_equity / day_start - 1.0) * 100.0 if day_start > 0 and current_equity > 0 else 0.0
+        )
         lines = [
             "=" * 60,
-            "COMPOUND GROWTH REPORT",
+            "DAILY GROWTH REPORT",
             "=" * 60,
-            f"Current Equity:     ${metrics.current_equity:,.2f}",
-            f"Target:             ${self.target_capital:,.0f}",
-            f"Days Remaining:     {metrics.days_remaining}",
-            f"Required Daily:     {metrics.required_daily_return_pct:.4f}%",
-            f"Required Mult:      {metrics.required_daily_return_multiplier:.6f}x",
-            f"Days to Double:     {metrics.days_to_double_at_current_rate:.1f}" if metrics.days_to_double_at_current_rate > 0 else "Days to Double:     N/A",
+            f"Mission:            {sole_objective_label()}",
+            f"Current Equity:     ${metrics.current_equity:,.4f}",
+            f"Day start equity:   ${day_start:,.4f}",
+            f"Today so far:       {today_pct:+.2f}%",
+            f"Required today:     {metrics.required_daily_return_pct:.2f}%",
+            f"EOD target equity:  ${metrics.projected_capital_at_target:,.4f}",
             f"Aggression Boost:   {metrics.aggression_boost:.2f}x",
-            f"On Track:           {'YES' if metrics.on_track else 'NO'}" ,
-            f"Projected at target date: ${metrics.projected_capital_at_target:,.2f}",
+            f"On Track:           {'YES' if metrics.on_track else 'NO'}",
             "=" * 60,
         ]
-        
+
         if not metrics.on_track:
-            deficit_pct = (1 - (metrics.projected_capital_at_target / self.target_capital)) * 100
-            lines.append(f"⚠️  BEHIND SCHEDULE by {deficit_pct:.1f}% - increasing aggression!")
-            lines.append(f"    Need {metrics.required_daily_return_pct:.4f}% per day to catch up")
+            lines.append(
+                f"⚠️  BELOW +10% TODAY — need {metrics.required_daily_return_pct:.2f}% "
+                f"from day open (currently {today_pct:+.2f}%)"
+            )
         
         return "\n".join(lines)

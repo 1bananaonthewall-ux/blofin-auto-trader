@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from margin_mode import normalize_margin_mode
 from markets import symbol_to_inst_id
 
 log = logging.getLogger(__name__)
@@ -48,19 +49,16 @@ def leverage_needs_reentry(
     eff = int(pos.get("effective_leverage") or inst or 0)
     cap = max(1, min(target_lev, exchange_max))
 
-    if inst > 0 and inst < cap - 1:
-        return True, f"instrument {inst}x < symbol cap {cap}x"
-
-    # Leverage setting raised on exchange but isolated margin still sized for old lev.
-    if inst >= cap - 1 and eff > 0 and eff < min(inst, cap) - 2:
-        return True, f"stale margin eff={eff}x inst={inst}x cap={cap}x (re-enter)"
+    # Do not force re-entry to "mission 50x" when anti-liq cap is lower — only if dangerously over-levered.
+    if inst > 0 and eff > cap + 8:
+        return True, f"effective {eff}x >> safe cap {cap}x"
 
     notional = float(pos.get("notional_usdt") or 0)
     margin = float(pos.get("margin_usdt") or 0)
-    if notional > 0 and margin > 0 and inst >= cap - 1:
+    if notional > 0 and margin > 0:
         implied = int(round(notional / margin))
-        if implied < cap - 2:
-            return True, f"implied {implied}x < cap {cap}x (re-enter at max)"
+        if implied > cap + 10:
+            return True, f"implied {implied}x >> safe cap {cap}x"
 
     return False, ""
 
@@ -70,7 +68,10 @@ class LeverageIntel:
 
     def __init__(self, state_dir: Path | None = None) -> None:
         self._max_by_inst: dict[str, int] = {}
-        self._set_by_inst: dict[str, int] = {}
+        # instId -> {"lev": int, "margin_mode": "cross"|"isolated"}
+        self._set_by_inst: dict[str, dict[str, Any]] = {}
+        self._last_set_attempt: dict[str, float] = {}
+        self._min_set_interval_sec = 45.0
         self._cache_path = (state_dir / "leverage_caps.json") if state_dir else None
         if self._cache_path and self._cache_path.is_file():
             try:
@@ -114,7 +115,33 @@ class LeverageIntel:
         return max(1, min(desired, mx))
 
     def last_set(self, symbol: str) -> int | None:
-        return self._set_by_inst.get(symbol_to_inst_id(symbol))
+        entry = self._set_by_inst.get(symbol_to_inst_id(symbol))
+        if isinstance(entry, dict):
+            lev = int(entry.get("lev") or 0)
+            return lev if lev > 0 else None
+        if isinstance(entry, int) and entry > 0:
+            return entry
+        return None
+
+    def invalidate_leverage_cache(self, inst_id: str | None = None) -> None:
+        """Force set-leverage on next open (required after cross/isolated switch)."""
+        if inst_id:
+            self._set_by_inst.pop(inst_id, None)
+            self._last_set_attempt.pop(inst_id, None)
+        else:
+            self._set_by_inst.clear()
+            self._last_set_attempt.clear()
+
+    def _cached_set(self, inst_id: str) -> tuple[int, str] | None:
+        entry = self._set_by_inst.get(inst_id)
+        if isinstance(entry, dict):
+            lev = int(entry.get("lev") or 0)
+            mm = normalize_margin_mode(entry.get("margin_mode"))
+            if lev > 0:
+                return lev, mm
+        if isinstance(entry, int) and entry > 0:
+            return entry, "isolated"
+        return None
 
     def ensure(
         self,
@@ -123,6 +150,7 @@ class LeverageIntel:
         *,
         desired: int,
         position_side: str = "net",
+        margin_mode: str = "isolated",
         cancel_tpsl_fn: Any | None = None,
     ) -> int:
         """
@@ -132,6 +160,16 @@ class LeverageIntel:
         inst_id = symbol_to_inst_id(symbol)
         cap = self.exchange_max(symbol)
         target = self.resolve_target(symbol, desired)
+        want_mm = normalize_margin_mode(margin_mode)
+        now = time.time()
+        cached = self._cached_set(inst_id)
+        if (
+            cached
+            and cached[0] == target
+            and cached[1] == want_mm
+            and (now - self._last_set_attempt.get(inst_id, 0)) < self._min_set_interval_sec
+        ):
+            return target
 
         if cancel_tpsl_fn:
             try:
@@ -149,8 +187,15 @@ class LeverageIntel:
         last_err: Exception | None = None
         for lev in tries:
             try:
-                http.set_leverage(inst_id, lev, position_side=position_side)
-                self._set_by_inst[inst_id] = lev
+                self._last_set_attempt[inst_id] = time.time()
+                http.set_leverage(
+                    inst_id,
+                    lev,
+                    position_side=position_side,
+                    margin_mode=want_mm,
+                )
+                self._set_by_inst[inst_id] = {"lev": lev, "margin_mode": want_mm}
+                time.sleep(0.35)
                 if cap and lev < desired:
                     log.warning(
                         "%s exchange cap %dx — set %dx (mission %dx)",
@@ -165,6 +210,18 @@ class LeverageIntel:
             except Exception as exc:
                 last_err = exc
                 msg = str(exc)
+                if "110012" in msg or "too frequent" in msg.lower():
+                    hit = self._cached_set(inst_id)
+                    if hit and hit[1] == want_mm:
+                        log.debug(
+                            "set_leverage %s rate-limited — using cached %dx %s",
+                            symbol.split("/")[0],
+                            hit[0],
+                            want_mm,
+                        )
+                        return hit[0]
+                    time.sleep(1.2)
+                    continue
                 if "152002" in msg or "Parameter leverage" in msg:
                     continue
                 log.warning("set_leverage %s %dx: %s", symbol.split("/")[0], lev, exc)

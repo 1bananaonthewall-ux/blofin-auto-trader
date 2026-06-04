@@ -89,7 +89,7 @@ class ContinuousMlTrainer:
         return len(self._markets)
 
     def _maybe_rotate_stale_shards(self) -> None:
-        """Drop 30-dim (or other) legacy shards before training starts."""
+        """Drop legacy shards whose feature dimension no longer matches code."""
         if not self._shard_dir.exists():
             return
         feat_dim = len(FEATURE_NAMES)
@@ -101,6 +101,19 @@ class ContinuousMlTrainer:
                         return
             except Exception:
                 continue
+
+    def rotate_stale_shards(self, *, reason: str = "manual") -> None:
+        """Public entry: archive shards when feature schema changes."""
+        self._maybe_rotate_stale_shards()
+        if self._shard_dir.exists():
+            for path in self._shard_dir.glob("*.npz"):
+                try:
+                    with np.load(path) as data:
+                        if int(data["X"].shape[1]) != len(FEATURE_NAMES):
+                            self._rotate_shard_store(reason=reason)
+                            return
+                except Exception:
+                    continue
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -124,13 +137,32 @@ class ContinuousMlTrainer:
         return len(list(self._shard_dir.glob("*.npz")))
 
     def maybe_refit_from_outcomes(self, tracker: TradeOutcomeTracker) -> None:
-        """Refit when enough new live trade labels accumulated."""
-        _, y = tracker.load_labelled_samples()
+        """Refit when enough new live trade labels accumulated (forward feedback)."""
+        _, y = tracker.load_labelled_samples(margin_mode=self.settings.margin_mode)
         n = len(y)
-        if n - self._last_outcome_labels >= self.settings.ml_outcome_refit_min_new:
+        min_new = int(self.settings.ml_outcome_refit_min_new)
+        if n < 30:
+            min_new = max(1, min(min_new, 2))
+        delta = n - self._last_outcome_labels
+        if delta >= min_new and n > 0:
             self._last_outcome_labels = n
-            log.info("ML outcome feedback: %d labelled fills — scheduling refit", n)
+            log.info(
+                "ML outcome feedback: +%d new labels (%d total) — scheduling forward refit",
+                delta,
+                n,
+            )
             self.request_full_refit()
+            try:
+                from stack_learning import schedule_cortex_train
+
+                schedule_cortex_train(
+                    self.settings.state_dir,
+                    self.settings,
+                    force=False,
+                    reason="new_trade_labels",
+                )
+            except Exception:
+                log.debug("cortex schedule after ML labels failed", exc_info=True)
 
     def stop(self) -> None:
         self._stop.set()
@@ -265,11 +297,45 @@ class ContinuousMlTrainer:
     def _aggregate_and_train(self, *, reason: str) -> None:
         with self._lock:
             shards = sorted(self._shard_dir.glob("*.npz")) if self._shard_dir.exists() else []
+            tracker = TradeOutcomeTracker(
+                self.settings.state_dir, self.settings.ml_real_feedback_max_samples
+            )
+            X_fb, y_fb = tracker.load_labelled_samples(
+                margin_mode=self.settings.margin_mode
+            )
             if not shards:
+                min_fb = max(80, min(200, self.settings.ml_min_deploy_samples // 2))
+                if len(y_fb) >= min_fb:
+                    log.info(
+                        "ML refit (%s): no shards — training from %d outcome feedback samples",
+                        reason,
+                        len(y_fb),
+                    )
+                    model = SignalModel()
+                    metrics = model.fit(
+                        X_fb,
+                        y_fb,
+                        symbols=1,
+                        walk_forward_splits=max(3, self.settings.ml_walk_forward_splits // 2),
+                        min_train_samples=min(120, self.settings.ml_walk_forward_min_train),
+                    )
+                    model.save(
+                        self.settings.state_dir / "signal_model.joblib",
+                        self.settings.state_dir / "signal_model_meta.json",
+                    )
+                    self._last_refit_ts = time.time()
+                    if self.on_model_updated:
+                        self.on_model_updated()
+                    return
                 now = time.time()
                 if now - self._last_refit_skip_log > 60.0:
                     self._last_refit_skip_log = now
-                    log.warning("ML refit skipped (%s): no shards yet — trainer still seeding", reason)
+                    log.warning(
+                        "ML refit skipped (%s): no shards yet (%d feedback samples, need %d)",
+                        reason,
+                        len(y_fb),
+                        min_fb,
+                    )
                 return
             xs, ys = [], []
             for path in shards:
@@ -287,10 +353,6 @@ class ContinuousMlTrainer:
                 return
             X = np.vstack(xs)
             y = np.concatenate(ys)
-            tracker = TradeOutcomeTracker(
-                self.settings.state_dir, self.settings.ml_real_feedback_max_samples
-            )
-            X_fb, y_fb = tracker.load_labelled_samples()
             model = SignalModel()
             metrics = model.fit(
                 X,

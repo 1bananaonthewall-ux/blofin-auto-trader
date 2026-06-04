@@ -2,7 +2,7 @@
 Fluid control manifold — no discrete "modes".
 
 Dozens of continuous signals (0–1) blend every tick into:
-  - path_reliability: how safe it is to act toward $95M right now
+  - path_reliability: how safe it is to act toward maintain/exceed +10%/day right now
   - action_intensity: how hard to press (scan, risk, leverage)
   - edge: signal quality / recent trading edge
 
@@ -22,10 +22,6 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
-
-from mission_config import TARGET_CAPITAL_USD as TARGET_CAPITAL, target_date_ts
-
-TARGET_DATE_TS = target_date_ts()
 
 # Every factor feeds the objective; weights adapt from live outcomes.
 MANIFOLD_FACTOR_NAMES: tuple[str, ...] = (
@@ -118,7 +114,7 @@ class ManifoldContext:
 
 
 class FluidManifold:
-    """Continuous control field toward $95M by Sept 1, 2027."""
+    """Continuous control field toward maintain/exceed 10% daily account growth."""
 
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -208,7 +204,13 @@ class FluidManifold:
             den += w
         return num / den if den > 0 else 0.5
 
-    def tick(self, ctx: ManifoldContext, *, unrestricted: bool = False) -> FluidSnapshot:
+    def tick(
+        self,
+        ctx: ManifoldContext,
+        *,
+        unrestricted: bool = False,
+        account_curve_maximize: bool = False,
+    ) -> FluidSnapshot:
         now = time.time()
         eq = ctx.equity
         self._samples.append((now, eq))
@@ -340,7 +342,10 @@ class FluidManifold:
                 damp = _sigmoid(1.0 - drawdown_pct / 18.0, k=3.0)
                 raw_intensity *= damp
             if f["pnl_verticality"] < 0.35:
-                raw_intensity *= _clamp01(0.5 + f["pnl_verticality"])
+                if account_curve_maximize:
+                    raw_intensity *= _clamp01(0.68 + f["pnl_verticality"] * 0.9)
+                else:
+                    raw_intensity *= _clamp01(0.5 + f["pnl_verticality"])
         action_intensity = _clamp01(max(0.42, raw_intensity) if unrestricted else raw_intensity)
 
         f["survival"] = survival

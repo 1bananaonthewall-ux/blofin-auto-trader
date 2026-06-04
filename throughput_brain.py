@@ -47,16 +47,41 @@ class ThroughputBrain:
         free_margin: float,
         low_leverage_positions: int = 0,
     ) -> ThroughputState:
+        from hourly_3r import (
+            hourly_3r_active,
+            target_min_opens_per_hour,
+            target_wins_per_hour,
+        )
+        from scalp_optimizer import get_active_tuning
+
+        from account_guard import effective_hourly_tph_cap, universe_fill_active
+
+        fill_mode = universe_fill_active(settings)
         tmin = settings.optimizer_target_min_tph
-        tmax = settings.optimizer_target_max_tph
-        starved = opens_last_hour < tmin
-        overheating = opens_last_hour > tmax
+        tmax = effective_hourly_tph_cap(settings)
+        if fill_mode:
+            starved = free_margin > settings.margin_reserve_usdt * 2
+            overheating = False
+        elif hourly_3r_active(settings):
+            t = get_active_tuning()
+            w_need = target_wins_per_hour(settings)
+            o_need = target_min_opens_per_hour(settings)
+            starved = t.wins_last_hour < w_need or opens_last_hour < o_need
+            overheating = False
+        else:
+            starved = opens_last_hour < tmin
+            overheating = opens_last_hour > tmax
+
+        from tpsl_pacing import use_tpsl_only_pacing
 
         gap = float(settings.scalp_entry_gap_seconds)
-        if starved:
-            gap = max(8.0, gap - 6.0)
-        elif overheating:
-            gap = min(45.0, gap + 8.0)
+        if not use_tpsl_only_pacing(settings):
+            if starved:
+                gap = max(8.0, gap - 6.0)
+            elif overheating:
+                gap = min(45.0, gap + 8.0)
+        elif use_tpsl_only_pacing(settings):
+            gap = float(getattr(settings, "tpsl_pace_base_gap_seconds", 2.0))
 
         target_lev = int(settings.scalp_leverage_max)
 
@@ -72,10 +97,19 @@ class ThroughputBrain:
             rotate = True
 
         if starved:
-            directive = (
-                f"THROUGHPUT STARVED {opens_last_hour}/{tmin} tph — "
-                f"gap={gap:.0f}s target_lev={target_lev}x 3R"
-            )
+            if hourly_3r_active(settings):
+                t = get_active_tuning()
+                w_need = target_wins_per_hour(settings)
+                o_need = target_min_opens_per_hour(settings)
+                directive = (
+                    f"3R HOURLY STARVED wins={t.wins_last_hour}/{w_need} opens={opens_last_hour}/{o_need} — "
+                    f"gap={gap:.0f}s target_lev={target_lev}x"
+                )
+            else:
+                directive = (
+                    f"THROUGHPUT STARVED {opens_last_hour}/{tmin} tph — "
+                    f"gap={gap:.0f}s target_lev={target_lev}x 3R"
+                )
         elif overheating:
             directive = f"THROUGHPUT HOT {opens_last_hour}>{tmax}/hr — widen gap"
         else:

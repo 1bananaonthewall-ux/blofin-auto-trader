@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Blofin Autonomous Growth Engine
-Target: $95M by 2027-09-01 — doctrine in autonomous_engine.py / mission_config.py
+Target: mission_config sole objective — doctrine in autonomous_engine.py
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from conviction import (
 from cooldowns import SymbolCooldowns
 from symbol_side_guard import SymbolSideGuard
 from entry_pacer import EntryPacer
+from tpsl_pacing import TpslPacer, use_tpsl_only_pacing
 from exchange_client import BlofinExchange
 from journal import TradeJournal
 from margin_engine import MarginAwareSizer
@@ -36,12 +37,15 @@ from signals import analyze_symbol
 from strategy import Signal
 from market_stream import BlofinMarketStream
 from markets import symbol_to_inst_id
+from dashboard_publish import publish_account_snapshot
 from position_registry import PositionRegistry
 from position_steward import PositionSteward
 from scalp_optimizer import ScalpOptimizer, effective_cooldown_minutes, effective_entry_gap
 from scan_orchestrator import ScanOrchestrator
 from self_heal import SelfHealer
+from symbol_quality import SymbolQualityStore
 from universe import load_tradeable_markets
+import api_backoff
 from live_update import RuntimeCtx, create_reloader
 from leverage_rotation import count_below_target_leverage
 from position_brain import reconcile_open_book
@@ -62,6 +66,14 @@ def setup_logging(log_dir: Path) -> None:
 
 
 def _load_performance_stats(state_dir: Path) -> tuple[float, float, int]:
+    try:
+        from roe_learning import get_roe_store
+
+        wr, pf, streak, _avg = get_roe_store(state_dir).recent_performance(3600.0, limit=30)
+        if (get_roe_store(state_dir)._data.get("global", {}).get("recent") or []):
+            return wr, min(5.0, pf), streak
+    except Exception:
+        pass
     path = state_dir / "profitability.json"
     if not path.exists():
         return 0.5, 1.0, 0
@@ -70,6 +82,20 @@ def _load_performance_stats(state_dir: Path) -> tuple[float, float, int]:
         trades = raw.get("trades", [])[-30:]
         if not trades:
             return 0.5, 1.0, 0
+        roes = [float(t["roe_pct"]) for t in trades if t.get("roe_pct") is not None]
+        if roes:
+            wins = sum(1 for r in roes if r > 0)
+            wr = wins / len(roes)
+            pos = sum(r for r in roes if r > 0)
+            neg = abs(sum(r for r in roes if r < 0))
+            pf = (pos / neg) if neg > 0 else (2.0 if pos > 0 else 1.0)
+            streak = 0
+            for r in reversed(roes):
+                if r < 0:
+                    streak += 1
+                else:
+                    break
+            return wr, min(5.0, pf), streak
         wins = sum(1 for t in trades if t.get("net_pnl", 0) > 0)
         wr = wins / len(trades)
         gp = sum(t["net_pnl"] for t in trades if t["net_pnl"] > 0)
@@ -96,19 +122,62 @@ def _sync_ml_metrics(engine: AutonomousGrowthEngine, ml: MLPredictor, tracker: T
         short_p = m.val_short_precision
         fb = m.feedback_samples
     if tracker:
-        X, y = tracker.load_labelled_samples(max_samples=500)
+        mm = getattr(getattr(engine, "settings", None), "margin_mode", None)
+        X, y = tracker.load_labelled_samples(max_samples=500, margin_mode=mm)
         if len(y) > 0:
             fb = max(fb, len(y))
     engine.set_ml_metrics(val_acc, long_p, short_p, fb)
 
 
-def _snapshot_equity(state_dir: Path, equity: float) -> None:
-    path = state_dir / "equity_ticks.jsonl"
-    try:
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"ts": time.time(), "equity": round(equity, 6)}) + "\n")
-    except Exception:
-        pass
+def _snapshot_equity(state_dir: Path, equity: float, *, api_ok: bool = True) -> None:
+    from equity_ticks import append_equity_tick
+
+    append_equity_tick(state_dir, equity, api_ok=api_ok)
+
+
+def _last_known_equity(state_dir: Path) -> tuple[float, float]:
+    """Last non-zero equity/free from fluid_state or account_snapshot."""
+    snap_path = state_dir / "account_snapshot.json"
+    if snap_path.is_file():
+        try:
+            snap = json.loads(snap_path.read_text(encoding="utf-8"))
+            eq = float(snap.get("equity") or 0)
+            free = float(snap.get("free_margin") or 0)
+            if eq > 0:
+                return eq, free if free > 0 else eq
+        except Exception:
+            pass
+    fluid_path = state_dir / "fluid_state.json"
+    if fluid_path.is_file():
+        try:
+            fluid = json.loads(fluid_path.read_text(encoding="utf-8"))
+            samples = fluid.get("samples") or []
+            for item in reversed(samples):
+                try:
+                    val = float(item[1] if isinstance(item, (list, tuple)) else item)
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if val > 0:
+                    return val, val * 0.85
+            peak = float(fluid.get("peak_equity") or 0)
+            if peak > 0:
+                return peak, peak * 0.85
+        except Exception:
+            pass
+    ticks_path = state_dir / "equity_ticks.jsonl"
+    if ticks_path.is_file():
+        try:
+            lines = ticks_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in reversed(lines[-400:]):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                val = float(row.get("equity") or 0)
+                if val > 0:
+                    return val, val * 0.85
+        except Exception:
+            pass
+    return 0.0, 0.0
 
 
 def try_open(
@@ -123,6 +192,7 @@ def try_open(
     journal: TradeJournal,
     cooldowns: SymbolCooldowns,
     tracker: TradeOutcomeTracker | None,
+    quality_store: SymbolQualityStore | None,
     registry: PositionRegistry,
     side_guard: SymbolSideGuard | None = None,
     *,
@@ -142,11 +212,12 @@ def try_open(
         return False
 
     open_positions = ex.fetch_all_positions()
+    if symbol in open_positions:
+        log.info("skip %s: position already open", symbol.split("/")[0])
+        return False
     max_side = settings.max_same_side_positions
-    if equity < settings.small_account_threshold:
-        max_side = min(max_side, 2)
     ok_side, side_reason = same_side_exposure_ok(
-        open_positions, decision.signal.value, max_same_side=max_side
+        open_positions, decision.signal.value
     )
     if not ok_side:
         log.info("exposure gate %s: %s", symbol, side_reason)
@@ -164,16 +235,18 @@ def try_open(
 
     conf = getattr(decision, "model_confidence", 0.0) or (decision.score / 100.0)
     sp = engine.scalp
+    from tpsl_policy import fast_lethal_cross_mode, skip_liq_guards_on_entry
+
+    skip_liq_room = skip_liq_guards_on_entry(settings, decision=decision)
     sizer = MarginAwareSizer(
         free_margin=free_margin,
         fee_taker=d.fee_taker,
         fee_maker=d.fee_maker,
         min_take_profit_pct=sp.min_take_profit_pct if sp else d.min_take_profit_pct,
         base_leverage=sp.base_leverage if sp else d.base_leverage,
-        max_leverage=(
-            ex.symbol_leverage_cap(symbol)
-            if settings.scalp_3r_mode
-            else knobs.max_leverage
+        max_leverage=min(
+            ex.symbol_leverage_cap(symbol),
+            (sp.max_leverage_cap if sp else knobs.max_leverage),
         ),
         margin_reserve_usdt=d.margin_reserve_usdt,
         risk_fraction=knobs.risk_per_trade_pct,
@@ -183,9 +256,16 @@ def try_open(
         max_stop_pct=sp.max_stop_pct if sp else 0.08,
         max_take_pct=sp.max_take_pct if sp else 0.15,
         fee_coverage_multiple=sp.fee_coverage_multiple if sp else 2.0,
-        margin_use_fraction=sp.margin_use_fraction if sp else 0.88,
+        margin_use_fraction=sp.margin_use_fraction if sp else settings.margin_use_fraction,
         min_margin_rate=settings.min_margin_rate,
+        target_margin_rate=settings.target_margin_rate,
+        max_effective_leverage=settings.max_effective_leverage,
+        max_stop_liq_fraction=settings.max_stop_liq_fraction,
         min_rr=sp.min_rr if sp else 1.35,
+        micro_equity_threshold=settings.micro_equity_threshold,
+        small_account_threshold=settings.small_account_threshold,
+        margin_top_up_enabled=settings.margin_top_up_enabled,
+        skip_liq_room_check=skip_liq_room,
     )
     plan = sizer.plan_trade(
         decision.close,
@@ -194,8 +274,96 @@ def try_open(
         market.contract_size,
         market.min_size,
         margin_fraction=margin_fraction,
+        equity=equity,
     )
     if plan is None:
+        return False
+
+    from dataclasses import replace
+
+    from tpsl_policy import align_stop_take
+
+    plan_stop, plan_take, tpsl_pol = align_stop_take(
+        settings,
+        plan.stop_pct,
+        plan.take_pct,
+        plan.leverage,
+        decision=decision,
+    )
+    plan = replace(plan, stop_pct=plan_stop, take_pct=plan_take)
+
+    from account_guard import universe_fill_active
+    from hourly_3r import (
+        hourly_3r_active,
+        get_active_tuning_safe,
+        is_opens_starved,
+        is_wins_starved,
+    )
+    from liquidation_guard import achievable_margin_rates, liquidation_distance_pct, open_stop_within_liq_room
+
+    tp_tune = get_active_tuning_safe()
+    relax_stress_gates = hourly_3r_active(settings) and (
+        is_wins_starved(settings, tp_tune) or is_opens_starved(settings, tp_tune)
+    )
+
+    min_mrate_open, _ = achievable_margin_rates(settings, equity)
+    if plan.margin_rate < min_mrate_open - 0.01:
+        log.info(
+            "skip %s: margin rate %.0f%% < min %.0f%% for $%.2f equity",
+            symbol.split("/")[0],
+            plan.margin_rate * 100,
+            min_mrate_open * 100,
+            equity,
+        )
+        return False
+    if not skip_liq_guards_on_entry(settings, decision=decision):
+        liq_stop_frac = float(settings.max_stop_liq_fraction)
+        if equity > 0 and equity < settings.micro_equity_threshold:
+            liq_stop_frac = max(liq_stop_frac, 0.44)
+        elif relax_stress_gates or universe_fill_active(settings):
+            liq_stop_frac = max(liq_stop_frac, 0.40)
+        if not open_stop_within_liq_room(
+            plan.stop_pct,
+            plan.leverage,
+            max_fraction_of_liq_dist=liq_stop_frac,
+        ):
+            log.info(
+                "skip %s: stop %.2f%% vs liq cap %.2f%% at %dx (frac=%.0f%%)",
+                symbol.split("/")[0],
+                plan.stop_pct * 100,
+                liquidation_distance_pct(plan.leverage) * liq_stop_frac * 100,
+                plan.leverage,
+                liq_stop_frac * 100,
+            )
+            return False
+    mk_stress = float(getattr(decision, "markov_stress_p", 0.0) or 0.0)
+    tier = getattr(decision, "winner_tier", "") or ""
+    micro_acct = equity > 0 and equity < settings.micro_equity_threshold
+    entry_relax = relax_stress_gates or universe_fill_active(settings) or micro_acct
+    if micro_acct:
+        stress_conv_min = 0.48
+    elif relax_stress_gates:
+        stress_conv_min = 0.58
+    elif entry_relax:
+        stress_conv_min = 0.52
+    else:
+        stress_conv_min = 0.74
+    if mk_stress >= 0.36 and conviction < stress_conv_min:
+        log.info(
+            "skip %s: markov stress %.0f%% needs conv>=%.2f (have %.3f)",
+            symbol.split("/")[0],
+            mk_stress * 100,
+            stress_conv_min,
+            conviction,
+        )
+        return False
+    stress_conf_min = 0.76 if relax_stress_gates else 0.82
+    if mk_stress >= 0.36 and tier == "good" and conf < stress_conf_min and not entry_relax:
+        log.info(
+            "skip %s: good-tier in stress needs conf>=0.82 (have %.2f)",
+            symbol.split("/")[0],
+            conf,
+        )
         return False
     if plan.margin_usd > free_margin - d.min_free_margin_usdt:
         return False
@@ -211,10 +379,42 @@ def try_open(
     )
     if result is None and not settings.dry_run:
         err = getattr(ex, "last_open_error", "") or ""
-        if "102135" in err or "market is closed" in err.lower():
+        err_l = err.lower()
+        if "102135" in err or "market is closed" in err_l:
             cooldowns.block(symbol, seconds=6 * 3600)
             log.warning("market closed %s — blocked 6h", symbol)
+        elif "102115" in err or "delisted" in err_l or "will be delisted" in err_l:
+            cooldowns.block(symbol, seconds=7 * 24 * 3600)
+            log.warning("delisted %s — blocked 7d", symbol)
+        elif "102087" in err or "maximum available position amount" in err_l:
+            cooldowns.block(symbol, seconds=2 * 3600)
+            log.warning(
+                "exchange position cap %s — blocked 2h (size over coin limit)",
+                symbol.split("/")[0],
+            )
         return False
+    if not settings.dry_run and result is not None:
+        ex.ensure_leverage(symbol, decision.signal.value, leverage=plan.leverage)
+        ex.ensure_margin_cushion(
+            symbol,
+            decision.signal.value,
+            target_margin_rate=settings.target_margin_rate,
+            dry_run=False,
+        )
+        pos_chk = ex._lookup_open_position(symbol, decision.signal.value)
+        if pos_chk:
+            live_mrate = float(pos_chk.get("margin_rate") or 0)
+            min_mrate_live, _ = achievable_margin_rates(settings, equity)
+            if live_mrate > 0 and live_mrate < min_mrate_live - 0.03:
+                log.warning(
+                    "abort %s: live margin rate %.0f%% < %.0f%% — closing (under-collateralized)",
+                    symbol.split("/")[0],
+                    live_mrate * 100,
+                    min_mrate_live * 100,
+                )
+                ex.close_position(symbol, pos_chk, dry_run=False)
+                registry.remove(symbol)
+                return False
     if settings.dry_run:
         log.info("DRY_RUN open %s %s (no exchange order)", symbol, decision.signal.value)
 
@@ -223,19 +423,49 @@ def try_open(
         live = ex.stream.get_last_price(symbol)
         if live and live > 0:
             entry_px = live
+    actual_entry = ex.fetch_position_entry_price(symbol) or entry_px
+    if (
+        quality_store is not None
+        and settings.exec_slippage_penalty_enabled
+        and not settings.dry_run
+    ):
+        bps = quality_store.note_slippage(symbol, expected_entry=entry_px, actual_entry=actual_entry)
+        if bps is not None:
+            quality_store.save()
+            if bps >= settings.exec_slippage_warn_bps:
+                log.warning(
+                    "execution slippage %s %.1fbps (expected %.6f actual %.6f)",
+                    symbol.split("/")[0],
+                    bps,
+                    entry_px,
+                    actual_entry,
+                )
     registry.record_open(
         symbol,
         side=decision.signal.value,
-        entry_price=entry_px,
+        entry_price=actual_entry,
         leverage=plan.leverage,
         stop_pct=plan.stop_pct,
         take_pct=plan.take_pct,
         conviction=conviction,
+        margin_usdt=plan.margin_usd,
+        contracts=plan.contracts,
+        trade_style=tpsl_pol.style,
     )
     repaired = getattr(ex, "last_repaired_tpsl", None)
     if repaired:
         rep_stop, rep_take = repaired
-        registry.update_tpsl(symbol, stop_pct=rep_stop, take_pct=rep_take)
+        sl_px, tp_px = 0.0, 0.0
+        prices = getattr(ex, "last_repaired_tpsl_prices", None)
+        if prices and len(prices) >= 2:
+            sl_px, tp_px = float(prices[0]), float(prices[1])
+        registry.update_tpsl(
+            symbol,
+            stop_pct=rep_stop,
+            take_pct=rep_take,
+            sl_price=sl_px,
+            tp_price=tp_px,
+        )
         rr = rep_take / max(rep_stop, 1e-9)
         log.info(
             "3R TPSL live %s stop=%.2f%% take=%.2f%% rr=%.2f:1 (exchange liq)",
@@ -244,6 +474,48 @@ def try_open(
             rep_take * 100,
             rr,
         )
+    elif not settings.dry_run:
+        log.warning(
+            "OPEN %s: exchange TP/SL not confirmed on Blofin — immediate repair gate",
+            symbol.split("/")[0],
+        )
+    if not settings.dry_run:
+        live = ex.live_exchange_tpsl(symbol, decision.signal.value, actual_entry)
+        if live is None:
+            pos_now = ex._lookup_open_position(symbol, decision.signal.value)
+            contracts_now = float((pos_now or {}).get("contracts") or plan.contracts)
+            ok_rep, rep_stop, rep_take = ex.repair_position_tpsl(
+                symbol,
+                decision.signal.value,
+                contracts_now,
+                take_pct=plan.take_pct,
+                configured_leverage=plan.leverage,
+                dry_run=False,
+                cancel_existing=False,
+                registry_meta=registry.get(symbol) or {},
+            )
+            live2 = ex.live_exchange_tpsl(symbol, decision.signal.value, actual_entry)
+            if ok_rep and live2 is not None:
+                registry.update_tpsl(
+                    symbol,
+                    stop_pct=rep_stop,
+                    take_pct=rep_take,
+                    sl_price=live2.sl_price,
+                    tp_price=live2.tp_price,
+                )
+            else:
+                if pos_now is not None:
+                    try:
+                        ex.close_position(symbol, pos_now, dry_run=False)
+                    except Exception:
+                        log.exception("failed emergency close for unprotected position %s", symbol)
+                registry.remove(symbol)
+                cooldowns.block(symbol, seconds=120)
+                log.error(
+                    "OPEN ABORTED %s: unable to confirm exchange TP/SL after retries — closed to avoid naked risk",
+                    symbol.split("/")[0],
+                )
+                return False
     if ex.stream:
         ex.stream.set_priority(
             [symbol_to_inst_id(s) for s in list(ex.fetch_all_positions().keys()) + [symbol]]
@@ -258,7 +530,25 @@ def try_open(
                 ep = decision.close
                 sp = ep * (1 - plan.stop_pct) if decision.signal.value == "long" else ep * (1 + plan.stop_pct)
                 tp = ep * (1 + plan.take_pct) if decision.signal.value == "long" else ep * (1 - plan.take_pct)
-                tracker.record_entry(symbol, decision.signal.value, ep, sp, tp, feats.tolist(), decision.score)
+                curve = engine.curve_state
+                tracker.record_entry(
+                    symbol,
+                    decision.signal.value,
+                    ep,
+                    sp,
+                    tp,
+                    feats.tolist(),
+                    decision.score,
+                    markov_state=str(getattr(decision, "markov_state", "")),
+                    markov_stress_p=float(getattr(decision, "markov_stress_p", 0.0) or 0.0),
+                    run_score=float(getattr(decision, "run_score", 0.0) or 0.0),
+                    path_efficiency=float(getattr(decision, "path_efficiency", 0.0) or 0.0),
+                    chop_index=float(getattr(decision, "chop_index", 0.0) or 0.0),
+                    run_label=str(getattr(decision, "run_label", "") or ""),
+                    pick_score=float(getattr(decision, "pick_score", 0.0) or 0.0),
+                    curve_phase=curve.curve_phase if curve else "",
+                    margin_mode=settings.margin_mode,
+                )
         except Exception:
             pass
 
@@ -349,6 +639,21 @@ def _scan_symbols_ws(
     return scan
 
 
+def _count_unprotected_positions(ex: BlofinExchange, positions: dict) -> tuple[int, list[str]]:
+    missing: list[str] = []
+    for key, pos in positions.items():
+        symbol = str(pos.get("symbol") or key).split("#", 1)[0]
+        side = str(pos.get("side") or "")
+        entry = float(pos.get("entry_price") or 0)
+        if not side or entry <= 0:
+            continue
+        if ex._lookup_open_position(symbol, side) is None:
+            continue
+        if ex.live_exchange_tpsl(symbol, side, entry, pos=pos) is None:
+            missing.append(symbol)
+    return len(missing), missing
+
+
 def run_once(
     ex: BlofinExchange,
     settings: Settings,
@@ -357,16 +662,29 @@ def run_once(
     cooldowns: SymbolCooldowns,
     ml: MLPredictor,
     tracker: TradeOutcomeTracker | None,
+    quality_store: SymbolQualityStore | None,
     pacer: EntryPacer,
     registry: PositionRegistry,
     side_guard: SymbolSideGuard,
     steward: PositionSteward | None = None,
     optimizer: ScalpOptimizer | None = None,
+    tpsl_pacer: TpslPacer | None = None,
 ) -> int:
     equity = ex.fetch_equity_usdt()
     free_margin = ex.fetch_free_equity_usdt()
+    if not ex.equity_fetch_ok:
+        lk_eq, lk_free = _last_known_equity(settings.state_dir)
+        if lk_eq > 0:
+            equity = lk_eq
+            free_margin = lk_free if lk_free > 0 else lk_eq
     engine.snapshot_equity(equity)
-    _snapshot_equity(settings.state_dir, equity)
+    try:
+        from account_scale import maybe_capital_infusion
+
+        maybe_capital_infusion(engine, settings, equity)
+    except Exception:
+        log.debug("capital infusion check failed", exc_info=True)
+    _snapshot_equity(settings.state_dir, equity, api_ok=ex.equity_fetch_ok)
 
     wr, pf, loss_streak = _load_performance_stats(settings.state_dir)
     engine.record_performance(wr, pf, loss_streak)
@@ -374,19 +692,74 @@ def run_once(
 
     if settings.trade_all_symbols:
         lev = engine.scalp.base_leverage if engine.scalp else engine.doctrine.base_leverage
-        markets = load_tradeable_markets(ex, equity, lev, 0.95, 9999)
-        ex.refresh_markets(markets)
-        symbols = [m.symbol for m in markets]
+        reload_markets = (
+            not ex.markets
+            or (time.time() - getattr(engine, "_markets_loaded_at", 0.0)) > 3600.0
+        )
+        if reload_markets and not api_backoff.is_paused():
+            markets = load_tradeable_markets(ex, equity, lev, 0.95, 9999)
+            ex.refresh_markets(markets)
+            if markets:
+                ex.save_markets_cache(settings.state_dir)
+            engine._markets_loaded_at = time.time()
+        elif reload_markets and api_backoff.is_paused():
+            cached = ex.load_markets_from_cache(settings.state_dir)
+            if cached:
+                ex.markets = cached
+                engine._markets_loaded_at = time.time()
+        else:
+            ex.patch_prices_from_stream()
+        symbols = list(ex.markets.keys())
     else:
         symbols = [settings.symbol] if ex.market_for(settings.symbol) else []
 
     if steward:
-        open_positions = steward.run_once_now()
+        steward.run_once_now()
         free_margin = ex.fetch_free_equity_usdt()
+        # Fresh exchange snapshot (steward may have just closed positions; avoid stale TP/SL gate)
+        open_positions = ex.fetch_all_positions()
     else:
         open_positions = ex.fetch_all_positions()
-        registry.sync_with_exchange(set(open_positions.keys()))
+        open_syms = {str(p.get("symbol") or k.split("#")[0]) for k, p in open_positions.items()}
+        registry.sync_with_exchange(open_syms, api_ok=ex.positions_fetch_ok)
+        publish_account_snapshot(
+            settings.state_dir,
+            equity,
+            free_margin,
+            open_positions,
+            registry,
+            api_ok=ex.equity_fetch_ok and ex.positions_fetch_ok,
+        )
+    unprotected_n, unprotected_syms = _count_unprotected_positions(ex, open_positions)
+    if unprotected_n > 0 and not settings.dry_run:
+        log.error(
+            "exchange TP/SL missing on %d open position(s): %s — forcing repair before any new entries",
+            unprotected_n,
+            ", ".join(sorted({s.split("/")[0] for s in unprotected_syms})),
+        )
+        repaired_n = ex.repair_all_open_tpsl(settings, registry=registry)
+        open_positions = ex.fetch_all_positions()
+        unprotected_n, _ = _count_unprotected_positions(ex, open_positions)
+        if unprotected_n > 0:
+            log.error(
+                "TP/SL still missing on %d open position(s) after repair (%d repaired) — entries hard-paused",
+                unprotected_n,
+                repaired_n,
+            )
+            return max(6, min(15, int(getattr(settings, "scalp_steward_interval", 6))))
     engine.update_fluid(equity, free_margin, len(open_positions))
+    if settings.markov_regime_enabled:
+        anchor = "BTC/USDT:USDT"
+        if anchor not in symbols and symbols:
+            anchor = symbols[0]
+        try:
+            mk_ohlcv = ex.fetch_ohlcv(anchor, "1m", 120)
+            engine.update_markov_global(mk_ohlcv, state_dir=settings.state_dir)
+            mk = engine.markov_state
+            if mk:
+                log.info(mk.summary)
+        except Exception:
+            log.debug("markov global update failed", exc_info=True)
     opens_60m = optimizer.tuning.trades_last_hour if optimizer else 0
     if settings.throughput_brain_enabled:
         low_lev = count_below_target_leverage(
@@ -406,7 +779,7 @@ def run_once(
 
     log.info(
         "equity=$%.4f free=$%.4f open=%d | intensity=%.0f%% reliability=%.0f%% dd=%.1f%% | "
-        "pnl=%s vert=%.0f%% harvest=%.2fx | conf>=%.0f%% need=%.2f%%/day",
+        "account_curve=%s vert=%.0f%% harvest=%.2fx | conf>=%.0f%% need=%.2f%%/day",
         equity,
         free_margin,
         len(open_positions),
@@ -449,17 +822,48 @@ def run_once(
         log.info("entries gated: %s", gate_reason)
         return knobs.poll_seconds
 
-    if optimizer and settings.optimizer_enabled:
-        gap = effective_entry_gap(settings, optimizer.tuning)
+    from account_guard import universe_fill_active
+
+    fill_mode = universe_fill_active(settings)
+
+    tpsl_pace = use_tpsl_only_pacing(settings) and tpsl_pacer is not None
+    opens_allowed = True
+    if tpsl_pace:
+        wait = tpsl_pacer.seconds_until_ready()
+        opens_allowed = tpsl_pacer.can_open()
+        if not opens_allowed:
+            log.debug(
+                "TPSL pacer: %.1fs until next open (last=%s) — still scanning",
+                wait,
+                getattr(tpsl_pacer, "_last_kind", "") or "none",
+            )
     else:
-        gap = knobs.min_seconds_between_entries
-    if tp:
-        gap = min(gap, tp.target_entry_gap)
-    pacer.set_min_seconds(gap, floor=8.0 if settings.throughput_brain_enabled else 15.0)
-    wait = pacer.seconds_until_ready()
-    if not pacer.can_enter():
-        log.debug("entry pacer: %.0fs until next highest-conviction slot", wait)
-        return knobs.poll_seconds
+        if optimizer and settings.optimizer_enabled:
+            gap = effective_entry_gap(settings, optimizer.tuning)
+        else:
+            gap = knobs.min_seconds_between_entries
+        if tp:
+            gap = min(gap, tp.target_entry_gap)
+        pacer_floor = 2.0 if fill_mode else (8.0 if settings.throughput_brain_enabled else 15.0)
+        pacer.set_min_seconds(gap, floor=pacer_floor)
+        opens_allowed = pacer.can_enter()
+        if not opens_allowed:
+            log.debug(
+                "entry pacer: %.0fs until next open — still scanning",
+                pacer.seconds_until_ready(),
+            )
+
+    from hourly_3r import hourly_3r_active, is_entry_starved, is_opens_starved, is_wins_starved
+
+    starved = tp.starved if tp else (
+        optimizer is not None and is_entry_starved(settings, optimizer.tuning)
+    )
+    wins_starved = hourly_3r_active(settings) and is_wins_starved(
+        settings, optimizer.tuning if optimizer else None
+    )
+    opens_starved = hourly_3r_active(settings) and is_opens_starved(
+        settings, optimizer.tuning if optimizer else None
+    )
 
     held = set(open_positions.keys())
     scan = _scan_symbols_ws(ex, symbols, held, knobs, open_count=len(open_positions))
@@ -467,16 +871,57 @@ def run_once(
     candidates = []
     for sym in scan:
         try:
+            if (
+                quality_store is not None
+                and settings.symbol_quality_enabled
+                and not quality_store.allow(sym, settings.symbol_quality_floor)
+            ):
+                continue
+            if (
+                quality_store is not None
+                and getattr(settings, "runner_filter_enabled", True)
+                and quality_store.skip_choppy_symbol(sym, floor=getattr(settings, "runner_min_score", 0.48))
+            ):
+                log.debug("skip %s: remembered choppy runner score", sym.split("/")[0])
+                continue
+            scan_min_conf = knobs.min_confidence
+            scan_min_score = knobs.min_signal_score
+            if fill_mode and equity > 0 and equity < settings.micro_equity_threshold:
+                scan_min_conf = min(scan_min_conf, 0.52)
+                scan_min_score = min(scan_min_score, 52.0)
+            elif fill_mode and (starved or opens_starved):
+                scan_min_conf = min(scan_min_conf, 0.54)
+                scan_min_score = min(scan_min_score, 54.0)
             d = analyze_symbol(
                 ex,
                 settings,
                 sym,
                 ml,
                 equity=equity,
-                min_confidence=knobs.min_confidence,
-                min_signal_score=knobs.min_signal_score,
+                min_confidence=scan_min_conf,
+                min_signal_score=scan_min_score,
             )
-            if d and d.signal != Signal.FLAT and engine.passes_signal_gate(d, knobs):
+            if d and d.signal != Signal.FLAT and engine.passes_signal_gate(
+                d, knobs, min_confidence=scan_min_conf, min_signal_score=scan_min_score
+            ):
+                if quality_store is not None:
+                    quality_store.note_run_quality(
+                        sym,
+                        run_score=float(getattr(d, "run_score", 0.5) or 0.5),
+                        label=str(getattr(d, "run_label", "mixed") or "mixed"),
+                        is_runner=bool(getattr(d, "is_runner", False)),
+                        is_choppy=bool(getattr(d, "is_choppy", False)),
+                    )
+                    sq = quality_store.score(sym)
+                    try:
+                        from roe_learning import get_roe_store
+
+                        sq = max(0.0, min(1.0, sq + get_roe_store(settings.state_dir).symbol_score_delta(sym)))
+                    except Exception:
+                        pass
+                    d.symbol_quality = sq
+                    if settings.symbol_quality_enabled and sq < 0.35:
+                        d.score = max(0.0, d.score - (0.35 - sq) * 12.0)
                 candidates.append((sym, d))
             time.sleep(0.05)
         except Exception:
@@ -495,29 +940,53 @@ def run_once(
         per_tick = min(knobs.max_opens_per_tick, open_slots) if open_slots else 0
         if per_tick <= 0:
             return knobs.poll_seconds
-    tp = engine._last_throughput
-    starved = tp.starved if tp else (
-        optimizer is not None
-        and optimizer.tuning.trades_last_hour < settings.optimizer_target_min_tph
-    )
+    entry_press = fill_mode or starved or opens_starved or wins_starved
     mission_floor = knobs.min_confidence
+    if settings.llm_trading_enabled:
+        mission_floor = min(mission_floor, settings.llm_trading_min_confidence + 0.05)
+    if entry_press:
+        if wins_starved and not opens_starved:
+            mission_floor = min(
+                max(mission_floor, 0.48, knobs.min_confidence * 0.82),
+                0.56,
+            )
+        else:
+            mission_floor = min(
+                max(mission_floor, 0.46, knobs.min_confidence * 0.80),
+                0.52,
+            )
     if engine._last_mission is not None and not settings.unrestricted_trading:
-        mission_floor = max(mission_floor, engine._last_mission.min_conviction)
+        if not entry_press:
+            mission_floor = max(mission_floor, engine._last_mission.min_conviction)
+        else:
+            mission_floor = min(
+                mission_floor,
+                max(0.46, engine._last_mission.min_conviction - 0.10),
+            )
     allow_apex_fallback = (
-        (tp.allow_elite_fallback if tp else starved) or not settings.winner_apex_preferred
+        (tp.allow_elite_fallback if tp else starved)
+        or not settings.winner_apex_preferred
+        or entry_press
     )
     elite = select_conviction_ties(
         ranked,
         max_opens=per_tick,
         min_conviction=mission_floor,
-        apex_preferred=settings.winner_apex_preferred,
-        elite_only=settings.winner_elite_only,
+        apex_preferred=settings.winner_apex_preferred and not entry_press,
+        elite_only=settings.winner_elite_only and not entry_press,
         allow_elite_fallback=allow_apex_fallback,
     )
+    if not opens_allowed:
+        return knobs.poll_seconds
+
     if not elite:
         if ranked:
             top = ranked[0]
-            want = "apex" if settings.winner_apex_preferred and not starved else "elite+"
+            want = (
+                "apex"
+                if settings.winner_apex_preferred and not entry_press
+                else ("good+" if entry_press else "elite+")
+            )
             log.info(
                 "no open: top conv=%.3f tier=%s candidates=%d (need %s conv>=%.2f) | best=%s",
                 top.conviction,
@@ -566,9 +1035,12 @@ def run_once(
     if free_margin < engine.doctrine.min_free_margin_usdt:
         return knobs.poll_seconds
 
-    cd_sec = int(effective_cooldown_minutes(settings, optimizer.tuning if optimizer else None) * 60)
-    if optimizer:
-        cooldowns.cooldown_seconds = cd_sec
+    if not tpsl_pace:
+        cd_sec = int(effective_cooldown_minutes(settings, optimizer.tuning if optimizer else None) * 60)
+        if optimizer:
+            cooldowns.cooldown_seconds = cd_sec
+    else:
+        cd_sec = 0
 
     opened = 0
     tie_n = len(elite)
@@ -584,6 +1056,16 @@ def run_once(
             action_intensity=knobs.action_intensity,
             tie_count=tie_n,
         )
+        if equity < settings.micro_equity_threshold:
+            margin_frac = max(margin_frac, min(0.85, settings.micro_max_margin_frac * 3.0))
+        elif equity >= settings.small_account_threshold:
+            margin_frac = min(
+                0.28,
+                settings.margin_use_fraction * 0.38,
+                margin_frac * 1.4,
+            )
+        elif equity >= 25.0:
+            margin_frac = min(0.22, margin_frac * 1.2)
         try:
             if try_open(
                 ex,
@@ -597,6 +1079,7 @@ def run_once(
                 journal,
                 cooldowns,
                 tracker,
+                quality_store,
                 registry,
                 side_guard,
                 conviction=setup.conviction,
@@ -604,20 +1087,22 @@ def run_once(
                 cooldown_seconds=cd_sec,
             ):
                 opened += 1
-                cooldowns.block(setup.symbol, seconds=cd_sec)
+                if not tpsl_pace and cd_sec > 0:
+                    cooldowns.block(setup.symbol, seconds=cd_sec)
                 open_positions[setup.symbol] = {"side": setup.decision.signal.value}
-                tier = getattr(setup.decision, "winner_tier", "")
-                if tier in ("apex", "elite"):
-                    gap_s = (
-                        settings.winner_elite_entry_gap_seconds - 4.0
-                        if tier == "apex"
-                        else settings.winner_elite_entry_gap_seconds
-                    )
-                    pacer.set_min_seconds(gap_s, floor=8.0)
+                if not tpsl_pace:
+                    tier = getattr(setup.decision, "winner_tier", "")
+                    if tier in ("apex", "elite"):
+                        gap_s = (
+                            settings.winner_elite_entry_gap_seconds - 4.0
+                            if tier == "apex"
+                            else settings.winner_elite_entry_gap_seconds
+                        )
+                        pacer.set_min_seconds(gap_s, floor=8.0)
         except Exception:
             log.exception("open %s", setup.symbol)
 
-    if opened:
+    if opened and not tpsl_pace:
         pacer.record_entry()
         tiers = "+".join(sorted({getattr(s.decision, "winner_tier", "?") for s in elite}))
         log.info("opened %d/%d tied %s conviction(s) this cycle", opened, tie_n, tiers)
@@ -639,9 +1124,45 @@ def main() -> None:
         )
     log.info("AUTONOMOUS ENGINE: %s", engine.doctrine_summary())
 
+    if settings.llm_trading_enabled:
+        try:
+            from local_llm import resolve_provider, status_line, warmup_provider
+
+            log.info(
+                "CORTEX TRADING BRAIN on — provider=%s | %s | cache=%.0fs",
+                resolve_provider(),
+                status_line(),
+                settings.llm_policy_cache_sec,
+            )
+            log.info("LLM warmup: %s", warmup_provider())
+        except Exception as exc:
+            log.warning("LLM warmup failed: %s", exc)
+
     ex = BlofinExchange(settings)
     ex.load()
+    cross_migrator = None
+    if settings.mode == "live" and not settings.dry_run:
+        from margin_migrator import CrossMarginAutoMigrator
+
+        cross_migrator = CrossMarginAutoMigrator(settings.state_dir, settings)
+        try:
+            ex.ensure_account_margin_mode()
+        except Exception as exc:
+            log.warning("margin mode sync failed: %s", exc)
+        try:
+            n_tpsl = ex.repair_all_open_tpsl(settings)
+            if n_tpsl:
+                log.warning("STARTUP TPSL sweep: repaired %d open position(s)", n_tpsl)
+        except Exception as exc:
+            log.warning("STARTUP TPSL sweep failed: %s", exc)
     eq0 = ex.fetch_equity_usdt()
+    if not ex.equity_fetch_ok:
+        lk_eq, lk_free = _last_known_equity(settings.state_dir)
+        if lk_eq > 0:
+            eq0 = lk_eq
+            ex._cached_equity = lk_eq
+            ex._cached_free = lk_free if lk_free > 0 else lk_eq
+            log.info("startup equity from state cache: $%.4f", eq0)
     cap_label = (
         "unlimited (margin only)"
         if effective_max_open(settings, eq0) >= UNLIMITED_POSITIONS
@@ -683,11 +1204,55 @@ def main() -> None:
             settings.scalp_leverage_max,
             cap_msg,
         )
+    if getattr(settings, "hourly_3r_winner_mode", False):
+        log.warning(
+            "HOURLY 3R WINNER MODE: fixed %.1f:1 TP/SL | target >=%d win(s)/hr | >=%d opens/hr | LLM off-path",
+            settings.scalp_3r_min_rr,
+            settings.optimizer_target_min_wins_per_hour,
+            settings.optimizer_target_min_tph,
+        )
+    from account_guard import universe_fill_active as _ufa
+
+    if _ufa(settings):
+        log.warning(
+            "UNIVERSE FILL: no hourly open cap | up to %d opens/cycle | fills until free margin — margin_rate anti-liq",
+            settings.max_opens_per_tick,
+        )
+    if use_tpsl_only_pacing(settings):
+        log.warning(
+            "TPSL-ONLY PACING: scan always on | open gap TP=%.0fs SL=%.0fs | fast 3R stop<=%.2f%% take~%.2f%%",
+            settings.tpsl_pace_gap_after_tp_seconds,
+            settings.tpsl_pace_gap_after_sl_seconds,
+            settings.scalp_max_stop_pct * 100,
+            settings.scalp_max_stop_pct * settings.scalp_3r_min_rr * 100,
+        )
+    if getattr(settings, "momentum_wave_mode", False) and not getattr(
+        settings, "hourly_3r_winner_mode", False
+    ):
+        log.warning(
+            "MOMENTUM WAVE MODE: concurrent runners on | target >=%.0f%% leveraged winners | pace target >=%.1f%%/day",
+            settings.momentum_wave_target_levered_profit_pct,
+            settings.momentum_wave_target_daily_pct,
+        )
 
     if settings.trade_all_symbols:
         lev = engine.scalp.base_leverage if engine.scalp else engine.doctrine.base_leverage
-        mkts = load_tradeable_markets(ex, ex.fetch_equity_usdt(), lev, 0.95, 9999)
-        ex.refresh_markets(mkts)
+        sizing_eq = eq0 if eq0 > 0 else _last_known_equity(settings.state_dir)[0]
+        if api_backoff.is_paused():
+            cached = ex.load_markets_from_cache(settings.state_dir)
+            if cached:
+                ex.markets = cached
+            mkts = list(ex.markets.values())
+            if not mkts:
+                log.warning(
+                    "API paused (%.0fs) — no markets cache; stream will start with 0 instruments",
+                    api_backoff.seconds_left(),
+                )
+        else:
+            mkts = load_tradeable_markets(ex, sizing_eq, lev, 0.95, 9999)
+        if mkts:
+            ex.refresh_markets(mkts)
+            ex.save_markets_cache(settings.state_dir)
         inst_ids = [m.inst_id for m in mkts]
     else:
         inst_ids = [symbol_to_inst_id(settings.symbol)]
@@ -695,10 +1260,27 @@ def main() -> None:
     stream = BlofinMarketStream(ex.http, demo=settings.mode == "demo")
     stream.start(inst_ids)
     ex.attach_stream(stream)
-    log.info("websocket + REST ticker hub | %d assets live", len(inst_ids))
+    h = stream.stream_health()
+    log.info(
+        "websocket + REST ticker hub | %d assets | ws_live=%s ticker_cov=%.0f%%",
+        len(inst_ids),
+        h.get("ws_live"),
+        float(h.get("ticker_coverage", 0)) * 100,
+    )
 
     journal = TradeJournal(settings.state_dir / "trades.jsonl")
     registry = PositionRegistry(settings.state_dir)
+
+    if cross_migrator and cross_migrator.enabled():
+        try:
+            n_cross = cross_migrator.run(ex, registry, force=True, max_per_pass=8)
+            if n_cross:
+                log.warning(
+                    "STARTUP cross migrate: moved %d position(s) to cross margin",
+                    n_cross,
+                )
+        except Exception as exc:
+            log.warning("startup cross margin migrate failed: %s", exc)
 
     if settings.leverage_auto_upgrade:
         reconcile_open_book(ex, settings, registry, engine, max_closes_per_pass=2)
@@ -707,24 +1289,55 @@ def main() -> None:
         settings.scalp_cooldown_minutes if settings.scalp_mode else engine.doctrine.symbol_cooldown_minutes
     )
     cooldowns = SymbolCooldowns(settings.state_dir / "cooldowns.json", cd_min * 60)
+    engine.bind_exit_cooldowns(cooldowns)
     side_guard = SymbolSideGuard(
         settings.state_dir,
         block_seconds=settings.symbol_flip_block_minutes * 60.0,
     )
     pacer = EntryPacer(settings.state_dir, engine.doctrine.min_entry_gap_seconds)
+    tpsl_pacer = (
+        TpslPacer(settings.state_dir, settings) if use_tpsl_only_pacing(settings) else None
+    )
+    if tpsl_pacer is not None:
+        engine.bind_tpsl_pacer(tpsl_pacer)
     ml = MLPredictor(
         settings.state_dir,
         min_confidence=engine.doctrine.min_confidence_floor,
         min_score=engine.doctrine.min_signal_score_default,
     )
     tracker = TradeOutcomeTracker(settings.state_dir, max_samples=settings.ml_real_feedback_max_samples)
+    quality_store = SymbolQualityStore(settings.state_dir)
 
     def _harvest_eagerness() -> float:
         c = engine.curve_state
-        return c.harvest_eagerness if c else 1.0
+        base = c.harvest_eagerness if c else 1.0
+        if getattr(settings, "account_curve_maximize", True):
+            if c and c.curve_phase in ("vertical", "climbing"):
+                return min(0.52, base * 0.7)
+            if c and c.curve_phase == "flat":
+                return min(0.72, base * 0.85)
+        if getattr(settings, "stack_winners_mode", True):
+            return min(0.9, base)
+        return base
+
+    if cross_migrator is None and settings.mode == "live" and not settings.dry_run:
+        from margin_migrator import CrossMarginAutoMigrator
+
+        cross_migrator = CrossMarginAutoMigrator(settings.state_dir, settings)
+    if cross_migrator and cross_migrator.enabled():
+        log.info(
+            "auto cross-margin migrator on (every %.0fs, 1 position/pass)",
+            cross_migrator._interval(),
+        )
 
     steward = PositionSteward(
-        ex, settings, engine, registry, tracker, harvest_eagerness_fn=_harvest_eagerness
+        ex,
+        settings,
+        engine,
+        registry,
+        tracker,
+        harvest_eagerness_fn=_harvest_eagerness,
+        cross_migrator=cross_migrator,
     )
     steward.start()
 
@@ -741,11 +1354,25 @@ def main() -> None:
         ml_trainer = ContinuousMlTrainer(ex, settings, on_model_updated=_on_ml_updated)
         ml_trainer.start()
 
+    from stack_learning import run_startup_learning
+
+    run_startup_learning(settings, ml, ml_trainer, tracker)
+
     healer = SelfHealer(settings.state_dir, enabled=settings.self_heal_enabled)
     optimizer = ScalpOptimizer(settings.state_dir, settings)
     log.warning(
         "STARTUP: 3R scalp + winner-only + 15m optimizer (all in-process, single process)"
     )
+    if getattr(settings, "account_curve_maximize", True):
+        log.warning(
+            "ACCOUNT CURVE MAXIMIZE ON — entries and harvest tuned to steepen dashboard account curve"
+        )
+    if getattr(settings, "runner_filter_enabled", True):
+        log.warning(
+            "RUNNER FILTER ON — prefer steady directional coins; skip choppy up/down (run>=%.2f chop<=%.0f%%)",
+            getattr(settings, "runner_min_score", 0.48),
+            getattr(settings, "runner_max_chop", 0.56) * 100,
+        )
     if settings.optimizer_enabled:
         log.warning(
             "15m OPTIMIZER ON | target %d–%d trades/hr | interval=%ds | no pause rails",
@@ -756,13 +1383,45 @@ def main() -> None:
     if settings.signal_mode == "ml" and not ml.is_ready():
         if ml_trainer:
             log.info(
-                "ML warming up — background trainer bootstrapping %d symbols (bot trades on confluence until deploy)",
+                "ML warming up — auto-refit bootstrapping %d symbols (confluence until deploy)",
                 settings.ml_bootstrap_symbols,
             )
-            ml_trainer.request_full_refit()
             healer.mark_refit_requested()
         else:
-            log.info("ML not deployed — set ML_CONTINUOUS_TRAIN=true or run train_model.py")
+            log.info("ML not deployed — enable ML_CONTINUOUS_TRAIN (auto-refit on startup)")
+    if getattr(settings, "cortex_auto_train", True):
+        log.warning(
+            "CORTEX AUTO-TRAIN ON — knowledge.md rebuilds on startup + every %dm or after new closes",
+            getattr(settings, "cortex_train_interval_minutes", 15),
+        )
+    from margin_mode import is_cross_margin, normalize_margin_mode
+
+    mm = normalize_margin_mode(settings.margin_mode)
+    if is_cross_margin(mm):
+        log.warning(
+            "CROSS MARGIN — shared wallet collateral | max eff lev %dx | "
+            "TPSL repair min rate 100%% | pre-liq exit at %.0f%% buffer",
+            settings.max_effective_leverage,
+            settings.pre_liquidation_exit_factor * 100,
+        )
+    elif settings.margin_top_up_enabled:
+        log.warning(
+            "ISOLATED MARGIN CUSHION — target rate %.0f%% min %.0f%% | max eff lev %dx | "
+            "adds margin after fill + steward top-up | pre-liq exit at %.0f%% buffer",
+            settings.target_margin_rate * 100,
+            settings.min_margin_rate * 100,
+            settings.max_effective_leverage,
+            settings.pre_liquidation_exit_factor * 100,
+        )
+    else:
+        log.warning(
+            "ISOLATED MARGIN — target rate %.0f%% min %.0f%% | max eff lev %dx | "
+            "no margin top-up API | pre-liq exit at %.0f%% buffer",
+            settings.target_margin_rate * 100,
+            settings.min_margin_rate * 100,
+            settings.max_effective_leverage,
+            settings.pre_liquidation_exit_factor * 100,
+        )
 
     reloader = create_reloader(settings)
     runtime = RuntimeCtx(
@@ -773,6 +1432,7 @@ def main() -> None:
         optimizer=optimizer,
         ml=ml,
         healer=healer,
+        ex=ex,
     )
     if reloader:
         log.warning(
@@ -788,6 +1448,8 @@ def main() -> None:
                 reloader.poll_seconds = settings.live_update_poll_seconds
                 reloader.git_pull = settings.live_update_git_pull
                 reloader.git_interval_seconds = settings.live_update_git_interval_seconds
+                if runtime.ex is not None:
+                    ex = runtime.ex
             eq = ex.fetch_equity_usdt()
             fm = ex.fetch_free_equity_usdt()
             wr, pf, streak = _load_performance_stats(settings.state_dir)
@@ -797,6 +1459,8 @@ def main() -> None:
             engine.update_fluid(eq, fm, open_n)
             knobs = engine.compute_knobs(eq, fm, open_n)
             healer.tick(engine, settings, eq, fm, knobs, ml, ml_trainer)
+            if open_n > 0:
+                healer.heal_open_tpsl(ex, settings, ex.fetch_all_positions())
             optimizer.maybe_optimize(
                 eq,
                 win_rate=wr,
@@ -823,9 +1487,16 @@ def main() -> None:
                         registry,
                         engine,
                         max_closes_per_pass=1,
+                        tracker=tracker,
                     )
             if ml_trainer and tracker:
                 ml_trainer.maybe_refit_from_outcomes(tracker)
+            try:
+                from stack_learning import maybe_periodic_learning
+
+                maybe_periodic_learning(settings, ml, ml_trainer, tracker)
+            except Exception:
+                log.debug("periodic learning tick failed", exc_info=True)
             if healer.should_request_refit(engine, settings, knobs) and settings.signal_mode == "ml":
                 log.info("autonomous ML refit triggered (throttled, background)")
                 if ml_trainer:
@@ -846,11 +1517,13 @@ def main() -> None:
                 cooldowns,
                 ml,
                 tracker,
+                quality_store,
                 pacer,
                 registry,
                 side_guard,
                 steward,
                 optimizer,
+                tpsl_pacer,
             )
         except Exception:
             log.exception("tick failed")

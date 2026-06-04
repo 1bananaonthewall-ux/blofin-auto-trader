@@ -1,6 +1,6 @@
 """
-PnL curve intelligence — measures how vertical the equity curve is and
-steers every subsystem to keep it pointing up toward $95M.
+Account curve intelligence — measures how steep the dashboard account curve is
+and steers every subsystem to maximize upward slope (compound growth).
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class PnlCurveState:
 
 
 class PnlCurveEngine:
-    """Tracks equity curve shape and outputs control scales for the bot."""
+    """Tracks account curve shape (equity_ticks.jsonl) and outputs control scales for the bot."""
 
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -113,7 +114,18 @@ class PnlCurveEngine:
         hourly = total_ret / hours
         return hourly * 24.0 * 100.0
 
-    def record_trade(self, symbol: str, net_pnl_usd: float, *, side: str = "", event: str = "close") -> None:
+    def record_trade(
+        self,
+        symbol: str,
+        net_pnl_usd: float,
+        *,
+        side: str = "",
+        event: str = "close",
+        roe_pct: float | None = None,
+        entry: float | None = None,
+        exit_px: float | None = None,
+        leverage: int | None = None,
+    ) -> None:
         self.profit_path.parent.mkdir(parents=True, exist_ok=True)
         raw: dict = {"trades": []}
         if self.profit_path.exists():
@@ -122,26 +134,44 @@ class PnlCurveEngine:
             except Exception:
                 raw = {"trades": []}
         trades = raw.get("trades", [])
-        trades.append(
-            {
-                "ts": time.time(),
-                "symbol": symbol,
-                "side": side,
-                "net_pnl": round(net_pnl_usd, 6),
-                "event": event,
-            }
-        )
+        row: dict[str, Any] = {
+            "ts": time.time(),
+            "symbol": symbol,
+            "side": side,
+            "net_pnl": round(net_pnl_usd, 6),
+            "event": event,
+        }
+        if roe_pct is not None:
+            row["roe_pct"] = round(float(roe_pct), 2)
+        if entry is not None and entry > 0:
+            row["entry"] = round(float(entry), 8)
+        if exit_px is not None and exit_px > 0:
+            row["exit"] = round(float(exit_px), 8)
+        if leverage is not None and leverage > 0:
+            row["leverage"] = int(leverage)
+        trades.append(row)
         raw["trades"] = trades[-500:]
         self.profit_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
 
-    def update(self, equity: float, required_daily_pct: float, *, unrestricted: bool = False) -> PnlCurveState:
+    def update(
+        self,
+        equity: float,
+        required_daily_pct: float,
+        *,
+        unrestricted: bool = False,
+        account_curve_maximize: bool = False,
+        opens_starved: bool = False,
+    ) -> PnlCurveState:
         ticks = self._load_ticks()
         if equity > 0:
             ticks.append((time.time(), equity))
         ticks = sorted(set(ticks), key=lambda x: x[0])[-500:]
 
-        slope_1h = self._slope_pct(ticks, 3600)
-        slope_6h = self._slope_pct(ticks, 21600)
+        slope_1h_raw = self._slope_pct(ticks, 3600)
+        slope_6h_raw = self._slope_pct(ticks, 21600)
+        # Clamp wild spikes from sparse ticks (e.g. one open moving equity) so phase logic stays stable.
+        slope_1h = _clamp_range(slope_1h_raw, -25.0, 25.0)
+        slope_6h = _clamp_range(slope_6h_raw, -25.0, 25.0)
         acceleration = slope_1h - slope_6h
 
         peak = max(self._peak, equity, max((e for _, e in ticks), default=0.0))
@@ -159,19 +189,46 @@ class PnlCurveEngine:
             phase = "vertical"
         elif slope_1h >= required_daily_pct * 0.5 and acceleration >= 0:
             phase = "climbing"
-        elif slope_1h < -0.5 or dd_pct > 8:
+        elif slope_1h < -0.5 or dd_pct > 10:
             phase = "declining"
         else:
             phase = "flat"
 
-        preserve = False if unrestricted else (
-            phase in ("declining", "flat") or dd_pct > 6 or slope_1h < 0
-        )
+        if unrestricted:
+            preserve = False
+        elif account_curve_maximize:
+            # Only brake on real damage — flat is a signal to press, not hide.
+            preserve = dd_pct > 12.0 or slope_1h < -4.0
+        else:
+            preserve = phase in ("declining", "flat") or dd_pct > 6 or slope_1h < 0
 
         if unrestricted:
             harvest_eagerness = 1.0
             entry_scale = 1.0
             risk_scale = 1.0
+        elif account_curve_maximize and phase == "vertical":
+            harvest_eagerness = 0.55
+            entry_scale = min(1.28, 1.05 + verticality * 0.22)
+            risk_scale = min(1.22, 1.0 + verticality * 0.18)
+        elif account_curve_maximize and phase == "climbing":
+            harvest_eagerness = 0.62
+            entry_scale = min(1.18, 0.95 + verticality * 0.28)
+            risk_scale = min(1.15, 0.92 + verticality * 0.22)
+        elif account_curve_maximize and phase == "flat":
+            harvest_eagerness = 0.72
+            entry_scale = 0.95
+            risk_scale = 0.9
+        elif account_curve_maximize and phase == "declining":
+            harvest_eagerness = 0.78 if dd_pct < 10 else 0.88
+            if opens_starved:
+                entry_scale = max(0.88, 0.75 + verticality * 0.12)
+                risk_scale = max(0.62, 0.52 + verticality * 0.12)
+            elif dd_pct < 10:
+                entry_scale = max(0.72, 0.58 + verticality * 0.18)
+                risk_scale = max(0.55, 0.48 + verticality * 0.14)
+            else:
+                entry_scale = 0.72 if dd_pct < 14 else 0.55
+                risk_scale = 0.68 if dd_pct < 14 else 0.45
         elif phase == "vertical":
             harvest_eagerness = 0.85
             entry_scale = min(1.15, 0.95 + verticality * 0.2)
@@ -181,11 +238,11 @@ class PnlCurveEngine:
             entry_scale = 0.85 + verticality * 0.25
             risk_scale = 0.8 + verticality * 0.2
         elif phase == "flat":
-            harvest_eagerness = 1.35
+            harvest_eagerness = 0.92
             entry_scale = 0.55
             risk_scale = 0.5
         else:
-            harvest_eagerness = 1.55
+            harvest_eagerness = 0.85
             entry_scale = 0.35
             risk_scale = 0.3
 
@@ -213,7 +270,7 @@ class PnlCurveEngine:
         filled = int(state.verticality * bar_len)
         bar = "#" * filled + "-" * (bar_len - filled)
         return (
-            f"PNL CURVE | {state.curve_phase.upper()} | verticality [{bar}] {state.verticality:.0%}\n"
+            f"ACCOUNT CURVE | {state.curve_phase.upper()} | verticality [{bar}] {state.verticality:.0%}\n"
             f"  equity=${equity:.4f} peak=${state.peak_equity:.4f} dd={state.drawdown_from_peak_pct:.1f}%\n"
             f"  slope 1h={state.slope_1h_pct:+.2f}%/day-eq 6h={state.slope_6h_pct:+.2f}% accel={state.acceleration:+.2f}\n"
             f"  need {state.vs_required_daily_pct:.2f}%/day | harvest_eagerness={state.harvest_eagerness:.2f}x "
@@ -225,5 +282,14 @@ def _clamp(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
+def _clamp_range(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
 def _sigmoid(x: float, k: float = 1.0) -> float:
-    return 1.0 / (1.0 + math.exp(-k * x))
+    z = -k * x
+    if z > 60:
+        return 0.0
+    if z < -60:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(z))

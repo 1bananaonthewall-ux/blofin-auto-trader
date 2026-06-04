@@ -62,6 +62,12 @@ class ConfluenceResult:
     rsi: float
     model_confidence: float
     leveraged_rr: float
+    run_label: str = "mixed"
+    run_score: float = 0.5
+    path_efficiency: float = 0.5
+    chop_index: float = 0.5
+    is_runner: bool = False
+    is_choppy: bool = False
     votes: list[TAVote] = field(default_factory=list)
 
 
@@ -239,6 +245,28 @@ def run_all_analyses(
     close = closes[-1]
     regime = _detect_regime(ohlcv_1m)
 
+    run_label = "mixed"
+    run_score = 0.5
+    path_efficiency = 0.5
+    chop_index = 0.5
+    is_runner = False
+    is_choppy = False
+    try:
+        from run_quality import measure_run_quality
+
+        rq = measure_run_quality(ohlcv_1m, ohlcv_5m)
+        if rq:
+            run_label = rq.label
+            run_score = rq.runner_score
+            path_efficiency = rq.path_efficiency_1m
+            chop_index = rq.chop_index
+            is_runner = rq.is_runner
+            is_choppy = rq.is_choppy
+            if is_runner and regime == "ranging":
+                regime = "trending"
+    except Exception:
+        pass
+
     votes: list[TAVote] = [
         _ema_vote(closes, 9, 21, 1.2, "ema_1m"),
         _ema_vote(closes_5m, 9, 21, 1.3, "ema_5m") if len(closes_5m) >= 25 else _vote("ema_5m", Signal.FLAT, 0, 1.3),
@@ -395,4 +423,10 @@ def confluence_to_decision(cf: ConfluenceResult) -> StrategyDecision:
     dec.confluence_zone = zone
     dec.confluence_agreeing = len(cf.agreeing)
     dec.confluence_opposing = len(cf.opposing)
+    dec.run_label = cf.run_label
+    dec.run_score = cf.run_score
+    dec.path_efficiency = cf.path_efficiency
+    dec.chop_index = cf.chop_index
+    dec.is_runner = cf.is_runner
+    dec.is_choppy = cf.is_choppy
     return dec

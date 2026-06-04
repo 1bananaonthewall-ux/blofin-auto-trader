@@ -160,6 +160,19 @@ def _fast_win_score(
         s += 0.12
         tags.append("trend")
 
+    run_s = getattr(cf, "run_score", 0.5)
+    if getattr(cf, "is_runner", False):
+        s += 0.22
+        tags.append("runner")
+    elif run_s >= 0.55:
+        s += 0.08
+        tags.append("run_bias")
+    elif getattr(cf, "is_choppy", False):
+        s -= 0.14
+        tags.append("choppy_penalty")
+    elif run_s < 0.40:
+        s -= 0.06
+
     vd = cf.vwap_distance_pct
     chase = abs(vd)
     if side == Signal.LONG and -0.006 <= vd <= 0.008:
@@ -214,13 +227,46 @@ def evaluate_pick_for_symbol(
     if side == Signal.FLAT:
         return PickVerdict(False, 0.0, "flat")
 
+    from hourly_3r import hourly_3r_active, is_entry_starved
+
     opp_ratio = _weighted_opposition_ratio(cf, side)
     hard_opp = settings.winner_max_opposition_ratio + 0.14
+    starved_3r = hourly_3r_active(settings) and is_entry_starved(settings)
+    if starved_3r:
+        hard_opp += 0.14
     if opp_ratio > hard_opp:
         return PickVerdict(False, winner_score, f"opposition {opp_ratio:.0%} overwhelming")
 
+    from runner_momentum import runner_priority_active
+
+    runner_priority = runner_priority_active(settings)
+    if getattr(settings, "runner_filter_enabled", True):
+        chop = getattr(cf, "chop_index", 0.5)
+        path_eff = getattr(cf, "path_efficiency", 0.5)
+        max_chop = getattr(settings, "runner_max_chop", 0.56)
+        min_path = getattr(settings, "runner_min_path_eff", 0.26)
+        min_run = getattr(settings, "runner_min_score", 0.48)
+        is_runner = getattr(cf, "is_runner", False) or getattr(cf, "run_score", 0.5) >= min_run + 0.04
+        if getattr(cf, "is_choppy", False) or (chop >= max_chop and path_eff < min_path):
+            if not starved_3r and not (runner_priority and is_runner):
+                return PickVerdict(
+                    False,
+                    winner_score,
+                    f"choppy {chop:.0%} path={path_eff:.0%} — need directional runner",
+                )
+        if getattr(cf, "run_score", 0.5) < min_run - 0.14 and path_eff < min_path - 0.04:
+            if not starved_3r:
+                return PickVerdict(
+                    False,
+                    winner_score,
+                    f"weak runner score {getattr(cf, 'run_score', 0):.2f}",
+                )
+
     if _rsi_exhausted(side, decision.rsi):
-        return PickVerdict(False, winner_score, f"RSI exhausted ({decision.rsi:.0f})")
+        if starved_3r and len(cf.agreeing) >= 5 and len(cf.opposing) <= 2:
+            pass
+        else:
+            return PickVerdict(False, winner_score, f"RSI exhausted ({decision.rsi:.0f})")
 
     sym_wr, sym_n = _recent_side_edge(settings.state_dir, symbol, side.value)
     if sym_wr is not None and sym_wr < 0.22:
@@ -240,7 +286,24 @@ def evaluate_pick_for_symbol(
         pick = min(1.0, pick + 0.04)
 
     min_pick = getattr(settings, "pick_min_score", 0.62)
-    if pick < min_pick and winner_tier != "elite":
+    try:
+        starved = is_entry_starved(settings)
+    except Exception:
+        starved = False
+    if starved:
+        min_pick = min(min_pick, 0.42 if hourly_3r_active(settings) else 0.48)
+    try:
+        from account_guard import universe_fill_active
+
+        if universe_fill_active(settings):
+            min_pick = min(min_pick, 0.35)
+    except Exception:
+        pass
+    if getattr(decision, "confluence_zone", "") == "llm":
+        min_pick = min(min_pick, 0.45)
+    if winner_tier in ("elite", "apex"):
+        min_pick = min(min_pick, 0.50)
+    if pick < min_pick:
         return PickVerdict(
             False,
             pick,

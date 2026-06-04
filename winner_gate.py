@@ -15,7 +15,8 @@ from strategy import Signal, StrategyDecision
 
 from ml.edge_gate import rolling_expectancy
 from pick_engine import MLContext
-from scalp_optimizer import effective_winner_thresholds
+from scalp_optimizer import EffectiveWinnerThresholds, effective_winner_thresholds, get_active_tuning
+from hourly_3r import hourly_3r_active, is_entry_starved
 
 if TYPE_CHECKING:
     from config import Settings
@@ -61,6 +62,25 @@ def evaluate_winner(
     reasons: list[str] = []
     score = 0.0
     thr = effective_winner_thresholds(settings)
+    tuning = get_active_tuning()
+    starved = is_entry_starved(settings, tuning)
+    if starved:
+        relax = 0.10 if hourly_3r_active(settings) else 0.06
+        thr = EffectiveWinnerThresholds(
+            min_confluence=max(0.48, thr.min_confluence - relax),
+            min_agreeing=max(3 if hourly_3r_active(settings) else 4, thr.min_agreeing - 1),
+            max_opposing=thr.max_opposing + (3 if hourly_3r_active(settings) else 2),
+            min_ml_confidence=max(0.50, thr.min_ml_confidence - 0.12),
+            min_volume_ratio=max(0.30, thr.min_volume_ratio - 0.50),
+            min_score=max(0.42, thr.min_score - 0.08),
+            elite_score=max(0.54, thr.elite_score - 0.10),
+            apex_score=max(0.60, thr.apex_score - 0.10),
+        )
+
+    llm_zone = getattr(decision, "confluence_zone", "") == "llm"
+    conf_floor = thr.min_ml_confidence
+    if llm_zone and settings.llm_trading_enabled:
+        conf_floor = min(conf_floor, settings.llm_trading_min_confidence)
 
     # --- Hard rejects (BloHunter-style: only trade when the book agrees) ---
     if not cf.htf_aligned:
@@ -116,9 +136,9 @@ def evaluate_winner(
         if ml_decision and ml_decision.signal != Signal.LONG:
             return WinnerVerdict(False, "reject", 0.0, "long blocked: ML not aligned on weak long model")
 
-    if conf < thr.min_ml_confidence:
+    if conf < conf_floor:
         return WinnerVerdict(
-            False, "reject", 0.0, f"conf {conf:.2f} < {thr.min_ml_confidence:.2f}"
+            False, "reject", 0.0, f"conf {conf:.2f} < {conf_floor:.2f}"
         )
 
     if settings.require_ml_model and settings.signal_mode == "ml":
@@ -134,9 +154,12 @@ def evaluate_winner(
             )
 
     vol = cf.volume_ratio
-    if vol < thr.min_volume_ratio:
+    vol_floor = thr.min_volume_ratio
+    if llm_zone and starved:
+        vol_floor = min(vol_floor, 0.28)
+    if vol < vol_floor:
         return WinnerVerdict(
-            False, "reject", 0.0, f"volume {vol:.2f} < {thr.min_volume_ratio:.2f}"
+            False, "reject", 0.0, f"volume {vol:.2f} < {vol_floor:.2f}"
         )
 
     funding = decision.funding_rate
@@ -148,6 +171,27 @@ def evaluate_winner(
     chase = abs(cf.vwap_distance_pct)
     if chase > settings.winner_max_vwap_chase_pct:
         return WinnerVerdict(False, "reject", 0.0, f"chasing VWAP {chase:.2%}")
+
+    if getattr(settings, "runner_filter_enabled", True):
+        is_choppy = getattr(cf, "is_choppy", False) or (
+            cf.chop_index >= getattr(settings, "runner_max_chop", 0.56)
+            and cf.path_efficiency < getattr(settings, "runner_min_path_eff", 0.26) + 0.04
+        )
+        if is_choppy:
+            return WinnerVerdict(
+                False,
+                "reject",
+                0.0,
+                f"choppy up/down — chop={cf.chop_index:.0%} path={cf.path_efficiency:.0%}",
+            )
+        min_run = getattr(settings, "runner_min_score", 0.48)
+        if cf.run_score < min_run - 0.12 and cf.regime == "ranging":
+            return WinnerVerdict(
+                False,
+                "reject",
+                0.0,
+                f"not a steady runner — run={cf.run_score:.2f} path={cf.path_efficiency:.0%}",
+            )
 
     if cf.regime == "ranging" and cf.confluence_score < thr.min_confluence + 0.06:
         return WinnerVerdict(False, "reject", 0.0, "ranging chop — need stronger confluence")
@@ -172,6 +216,12 @@ def evaluate_winner(
             score += 0.02
     if cf.regime == "trending":
         score += 0.05
+    if getattr(cf, "is_runner", False):
+        score += 0.06
+    elif getattr(cf, "run_score", 0.5) >= 0.58:
+        score += 0.03
+    if getattr(cf, "is_choppy", False):
+        score -= 0.08
     pick_s = getattr(decision, "pick_score", 0.0) or 0.0
     if pick_s >= settings.pick_min_score + 0.06:
         score += 0.04

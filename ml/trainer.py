@@ -224,11 +224,23 @@ class _EnsembleModel:
 
         probas = self.predict_proba_all(X)
 
+        n = len(probas)
+
+        w = np.asarray(self.weights, dtype=np.float64).reshape(-1)
+
+        if w.shape[0] != n:
+
+            w = np.ones(n, dtype=np.float64) / max(n, 1)
+
+        else:
+
+            w = w / max(w.sum(), 1e-9)
+
         out = np.zeros_like(probas[0])
 
         for i, p in enumerate(probas):
 
-            out += self.weights[i] * p
+            out += w[i] * p
 
         return out
 
@@ -336,7 +348,7 @@ class SignalModel:
 
         val_short_p: list[float] = []
 
-        model_accs: list[float] = []
+        per_model_oos: list[list[float]] = [[], [], [], []]
 
 
 
@@ -362,15 +374,13 @@ class SignalModel:
 
             val_short_p.append(sp)
 
-            per_model = []
-
-            for proba in self.ensemble.predict_proba_all(X_va):
+            for i, proba in enumerate(self.ensemble.predict_proba_all(X_va)):
 
                 pred = np.argmax(proba, axis=1)
 
-                per_model.append(float(accuracy_score(y_va, pred)))
+                if i < len(per_model_oos):
 
-            model_accs.append(float(np.mean(per_model)))
+                    per_model_oos[i].append(float(accuracy_score(y_va, pred)))
 
 
 
@@ -392,13 +402,25 @@ class SignalModel:
 
             val_short_p = [sp]
 
-            model_accs = [acc]
+            for i, proba in enumerate(self.ensemble.predict_proba_all(X_va)):
+
+                pred = np.argmax(proba, axis=1)
+
+                if i < len(per_model_oos):
+
+                    per_model_oos[i].append(float(accuracy_score(y_va, pred)))
 
 
 
-        if model_accs:
+        oos_model_accs = [
 
-            self.ensemble.set_weights_from_oos(model_accs)
+            float(np.mean(accs)) if accs else 0.25 for accs in per_model_oos
+
+        ]
+
+        if any(per_model_oos):
+
+            self.ensemble.set_weights_from_oos(oos_model_accs)
 
 
 
@@ -556,11 +578,21 @@ class SignalModel:
 
                 if "weights" in artifacts:
 
-                    w = np.asarray(artifacts["weights"], dtype=np.float64)
+                    w = np.asarray(artifacts["weights"], dtype=np.float64).reshape(-1)
 
-                    if w.shape == (4,):
+                    if w.shape[0] == 4:
 
                         obj.ensemble.weights = w / max(w.sum(), 1e-9)
+
+                    else:
+
+                        log.warning(
+
+                            "ensemble weights length %d != 4 — using equal weights",
+
+                            w.shape[0],
+
+                        )
 
             else:
 

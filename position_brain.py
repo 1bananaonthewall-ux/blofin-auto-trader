@@ -34,6 +34,7 @@ def reconcile_open_book(
     *,
     throughput: "ThroughputState | None" = None,
     max_closes_per_pass: int = 1,
+    tracker=None,
 ) -> BookReconcileReport:
     """Delegate to CoreBrain.reconcile_book (throughput arg ignored)."""
     _ = throughput
@@ -42,6 +43,7 @@ def reconcile_open_book(
         settings,
         registry,
         max_closes=max_closes_per_pass,
+        tracker=tracker,
     )
     return BookReconcileReport(
         open_count=report.open_count,

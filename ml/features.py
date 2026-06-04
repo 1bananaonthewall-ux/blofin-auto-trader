@@ -64,6 +64,10 @@ FEATURE_NAMES = [
     "ema_cascade",
     "intra_bar_vol_pct",
     "momentum_fusion",
+    # Runner vs chop — same signals as run_quality filter (forward-training feedback)
+    "path_efficiency",
+    "chop_index",
+    "runner_score",
 ]
 
 
@@ -270,6 +274,20 @@ def build_feature_vector(
         + trend_consistency_val * 0.2
     )
 
+    path_eff_val = 0.5
+    chop_val = 0.5
+    runner_val = 0.5
+    try:
+        from run_quality import measure_run_quality
+
+        rq = measure_run_quality(ohlcv_1m, ohlcv_5m)
+        if rq:
+            path_eff_val = rq.path_efficiency_1m
+            chop_val = rq.chop_index
+            runner_val = rq.runner_score
+    except Exception:
+        pass
+
     return np.array(
         [
             _returns(closes, 1),
@@ -313,6 +331,9 @@ def build_feature_vector(
             ema_cascade_val,
             intra_bar_vol_val,
             momentum_fusion_val,
+            path_eff_val,
+            chop_val,
+            runner_val,
         ],
         dtype=np.float64,
     )

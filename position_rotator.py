@@ -52,6 +52,8 @@ def evaluate_harvest(
     min_hold_seconds: float = MIN_HOLD_SECONDS,
     fee_coverage_mult: float = FEE_COVERAGE_MULT,
     harvest_min_r: float = 0.0,
+    stack_winners: bool = False,
+    early_harvest: bool = False,
 ) -> RotationAction | None:
     entry = float(pos.get("entry_price") or (meta or {}).get("entry_price") or 0)
     side = pos.get("side") or "long"
@@ -67,6 +69,38 @@ def evaluate_harvest(
     stop_pct = float((meta or {}).get("stop_pct") or 0.012)
     take_pct = float((meta or {}).get("take_pct") or 0.022)
     gross = _gross_pnl_pct(side, entry, last_price)
+
+    # Stack-winners: let exchange TP fill; discretionary harvest only at full target.
+    if stack_winners and not early_harvest:
+        if take_pct <= 0 or gross < take_pct * 0.998:
+            return None
+
+    # Backup when exchange TPSL lags: price already at/through TP target.
+    fast_3r = harvest_min_r > 0 and harvest_min_r <= 2.25
+    if stack_winners and not early_harvest:
+        tp_hit_frac = 0.998
+    elif early_harvest:
+        tp_hit_frac = 0.92 if fast_3r else 0.97
+    else:
+        tp_hit_frac = 0.985 if fast_3r else 0.99
+    if take_pct > 0 and gross >= take_pct * tp_hit_frac:
+        fee_quick = analyze_trade_fees(
+            entry,
+            contracts,
+            market.contract_size,
+            stop_pct,
+            max(take_pct, gross),
+            lev,
+            taker_fee=fee_taker,
+            maker_fee=fee_maker,
+        )
+        if fee_quick.profit_after_fees_usd > 0:
+            return RotationAction(
+                symbol=symbol,
+                action="harvest",
+                reason=f"tp-zone gross={gross:.2%} target={take_pct:.2%} net=${fee_quick.profit_after_fees_usd:.4f}",
+                pnl_after_fees_usd=fee_quick.profit_after_fees_usd,
+            )
 
     fee = analyze_trade_fees(
         entry,
@@ -85,9 +119,11 @@ def evaluate_harvest(
     r_multiple = gross / stop_pct if stop_pct > 0 else 0.0
     if harvest_min_r > 0 and r_multiple < harvest_min_r:
         return None
+    if stack_winners and not early_harvest and take_pct > 0 and gross < take_pct * 0.998:
+        return None
 
     tp_progress = gross / take_pct if take_pct > 0 else 0
-    eagerness = max(0.85, min(1.8, harvest_eagerness))
+    eagerness = max(0.75, min(1.15 if stack_winners else 1.8, harvest_eagerness))
     fee_mult = fee_coverage_mult / eagerness
     target_rr = take_pct / max(stop_pct, 1e-9)
     if harvest_min_r > 0:
@@ -148,6 +184,9 @@ def find_upgrade_victim(
     if weakest is None:
         return None
     sym, _rank_conv, pos, gross, held_conv = weakest
+    # Never evict winners to make room — only free slots from flat/losing books.
+    if gross > 0.002:
+        return None
     if gross < -0.004:
         gap = SEMI_LOSER_UPGRADE_GAP
     elif gross < 0:
@@ -189,10 +228,25 @@ def execute_rotation(
         ex.close_position(action.symbol, pos, dry_run=False)
         registry.remove(action.symbol)
         if tracker and entry > 0:
-            close_px = entry * (1.01 if side == "long" else 0.99)
-            sl = entry * (1 - stop_pct) if side == "long" else entry * (1 + stop_pct)
-            tp = entry * (1 + take_pct) if side == "long" else entry * (1 - take_pct)
-            tracker.record_close(action.symbol, side, close_px, entry, sl, tp, reason=action.action)
+            from ml.outcomes import notify_trade_close
+
+            close_px = float(pos.get("mark_price") or 0)
+            if ex.stream:
+                stream_px = ex.stream.get_last_price(action.symbol)
+                if stream_px and stream_px > 0:
+                    close_px = float(stream_px)
+            if close_px <= 0:
+                close_px = entry * (1.01 if side == "long" else 0.99)
+            notify_trade_close(
+                tracker,
+                action.symbol,
+                str(side),
+                entry,
+                close_px,
+                stop_pct=stop_pct,
+                take_pct=take_pct,
+                reason=action.action,
+            )
         return True
     except Exception:
         log.exception("rotation close failed %s", action.symbol)

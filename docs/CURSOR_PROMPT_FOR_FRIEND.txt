@@ -1,0 +1,14 @@
+Paste this into Cursor Agent after cloning the repo:
+
+---
+I cloned the God Bot repo (blofin-auto-trader). Read docs/GETTING_STARTED.md and AGENT_READ_ME_FIRST.md.
+
+Help me:
+1. Run scripts\bootstrap_god_bot.ps1
+2. Create/configure .env with MY Blofin API (I will edit .env myself — do not ask for keys in chat)
+3. Keep BLOFIN_MODE=demo for first run
+4. Run smoke_test.py and stack_status.py
+5. Start with: God Bot.ps1 -Action ensure
+
+Never start a second bot.py. Tell me when the dashboard at http://127.0.0.1:5050 is ready.
+---

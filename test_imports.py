@@ -26,7 +26,8 @@ except Exception as e:
 
 # Test growth_optimizer
 try:
-    from growth_optimizer import CompoundGrowthOptimizer, GrowthMetrics, TARGET_CAPITAL
+    from growth_optimizer import CompoundGrowthOptimizer, GrowthMetrics
+    from mission_config import TARGET_DAILY_GROWTH_PCT
     print("  [OK] growth_optimizer")
 except Exception as e:
     print(f"  [FAIL] growth_optimizer: {e}")
@@ -92,7 +93,7 @@ from pathlib import Path
 import tempfile
 
 tmpdir = Path(tempfile.mkdtemp())
-optimizer = CompoundGrowthOptimizer(tmpdir, target_capital=1000000, start_capital=100)
+optimizer = CompoundGrowthOptimizer(tmpdir, start_capital=100)
 optimizer.record_equity_snapshot(100)
 optimizer.record_equity_snapshot(120)
 optimizer.record_equity_snapshot(150)

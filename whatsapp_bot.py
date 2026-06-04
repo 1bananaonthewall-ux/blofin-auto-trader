@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -52,8 +51,6 @@ if env_path.exists():
 from config import load_settings
 from exchange_client import BlofinExchange
 from markets import compute_max_open_positions
-from risk import DailyRiskManager
-
 log = logging.getLogger(__name__)
 
 # ─── State ──────────────────────────────────────────────────────────────
@@ -101,24 +98,27 @@ def send_whatsapp(to_number: str, message: str) -> bool:
 
 # ─── Bot State ──────────────────────────────────────────────────────────
 
-def get_bot_pid() -> int | None:
-    if BOT_PID_FILE.exists():
-        try:
-            return int(BOT_PID_FILE.read_text().strip())
-        except (ValueError, OSError):
-            return None
-    return None
-
-
 def is_bot_running() -> bool:
-    pid = get_bot_pid()
-    if pid is None:
-        return False
+    from whatsapp_agent import is_bot_running as _agent_running
+
+    return _agent_running()
+
+
+def _stack_control(action: str) -> str:
+    ps1 = Path(__file__).parent / "scripts" / "stack_control.ps1"
     try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, PermissionError):
-        return False
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-Action", action],
+            text=True,
+            timeout=45,
+            cwd=str(Path(__file__).parent),
+            stderr=subprocess.STDOUT,
+        )
+        return (out or "").strip() or f"stack {action} done"
+    except subprocess.CalledProcessError as e:
+        return f"stack {action} failed: {(e.output or e)!s}"[:500]
+    except Exception as e:
+        return f"stack {action} error: {e}"
 
 
 def read_trade_log(n: int = 10) -> list[dict]:
@@ -367,8 +367,11 @@ def cmd_help() -> str:
         "• *signals* — Latest ML signals\n"
         "• *log* — Last 15 bot log lines\n"
         "• *help* or *h* — Show this menu\n"
-        "• *start* — Start/resume trading bot\n"
-        "• *stop* — Stop the trading bot"
+        "• *slcheck* — Exchange SL vs mark per position\n"
+        "• *restart* — Restart bot via stack_control\n"
+        "• *start* — Start trading bot\n"
+        "• *stop* — Stop the trading bot\n\n"
+        "Or ask anything in plain English (local LLM if configured)."
     )
 
 
@@ -377,7 +380,8 @@ def cmd_help() -> str:
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
     """Handle incoming WhatsApp messages from Twilio."""
-    incoming_msg = request.values.get("Body", "").strip().lower()
+    incoming_raw = request.values.get("Body", "").strip()
+    incoming_msg = incoming_raw.lower()
     from_number = request.values.get("From", "").replace("whatsapp:", "")
 
     log.info("WhatsApp from %s: %s", from_number, incoming_msg)
@@ -397,42 +401,29 @@ def whatsapp_webhook():
         response = cmd_signals()
     elif incoming_msg in ("help", "h"):
         response = cmd_help()
+    elif incoming_msg in ("slcheck", "sl"):
+        from whatsapp_agent import cmd_slcheck
+
+        response = cmd_slcheck()
     elif incoming_msg == "log":
         log_text = get_latest_log_lines(15)
         response = f"📋 *Recent Log*\n\n{log_text[:1500]}"
     elif incoming_msg == "start":
-        pid = get_bot_pid()
-        if pid and is_bot_running():
+        if is_bot_running():
             response = "🤖 Bot is already running."
         else:
-            script = Path(__file__).parent / "bot.py"
-            try:
-                import subprocess
-                p = subprocess.Popen(
-                    [sys.executable, str(script)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                BOT_PID_FILE.write_text(str(p.pid))
-                response = "✅ Bot started successfully."
-            except Exception as e:
-                response = f"❌ Failed to start: {e}"
-    elif incoming_msg == "stop":
-        pid = get_bot_pid()
-        if pid and is_bot_running():
-            try:
-                os.kill(pid, signal.SIGTERM)
-                if BOT_PID_FILE.exists():
-                    BOT_PID_FILE.unlink()
-                response = "🛑 Bot stopped."
-            except Exception as e:
-                response = f"❌ Failed to stop: {e}"
-        else:
+            response = "✅ " + _stack_control("start")
+    elif incoming_msg in ("stop",):
+        if not is_bot_running():
             response = "🤖 Bot is not running."
+        else:
+            response = "🛑 " + _stack_control("stop")
+    elif incoming_msg == "restart":
+        response = "🔄 " + _stack_control("restart")
     else:
-        response = (
-            f"🤖 Unknown command: '{incoming_msg}'\n\n"
-            f"Try: status, positions, balance, trades, stats, signals, help"
-        )
+        from whatsapp_agent import reply_to_message
+
+        response = reply_to_message(from_number, incoming_raw)
 
     # Build TwiML response
     twiml = MessagingResponse()

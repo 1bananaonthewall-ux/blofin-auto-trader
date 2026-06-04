@@ -49,7 +49,12 @@ class Settings:
     ml_refit_min_shards: int
     ml_refit_interval_minutes: int
     ml_outcome_refit_min_new: int
+    ml_auto_refit_on_startup: bool
     ml_min_deploy_samples: int
+    cortex_auto_train: bool
+    cortex_train_on_startup: bool
+    cortex_train_interval_minutes: int
+    cortex_train_min_new_closes: int
     # --- walk-forward retraining ---
     ml_walk_forward_splits: int
     ml_walk_forward_min_train: int
@@ -77,6 +82,10 @@ class Settings:
     fee_est_maker_pct: float          # estimated maker fee
     min_take_profit_pct: float        # minimum TP % to cover fees + slippage
     small_account_threshold: float    # equity below this = "small account" mode
+    micro_equity_threshold: float     # stricter caps below this (e.g. $3 accounts)
+    micro_equity_max_open: int
+    micro_drawdown_pause_pct: float   # pause entries after this % drop from session peak
+    micro_max_margin_frac: float      # max margin per new open as fraction of equity
     auto_leverage_max: int            # max leverage allowed when auto-scaling
     profit_factor_window: int         # num trades to evaluate profitability
     update_existing_sltp: bool        # update SL/TP on existing positions each tick
@@ -86,6 +95,20 @@ class Settings:
     stop_loss_pct: float              # Stop loss percentage
     liquidation_buffer_pct: float     # Buffer from liquidation price (%)
     unrestricted_trading: bool        # skip drawdown/mission/fluid entry pauses
+    account_curve_maximize: bool      # steer entries/harvest to steepen dashboard account curve
+    runner_filter_enabled: bool       # favor steady directional runners, skip choppy up/down
+    runner_min_score: float           # minimum runner_score to enter (when filter on)
+    runner_max_chop: float            # chop_index above this => reject
+    runner_min_path_eff: float        # 1m path efficiency floor
+    runner_priority_mode: bool        # rank/enter directional runners ahead of fixed 3R scalps
+    runner_extend_take_pct: float     # max TP % for runner momentum (wider than fast 3R cap)
+    runner_extend_min_rr: float       # minimum R on runners when extending TP
+    runner_trail_enabled: bool        # steward: breakeven + lock profit on runners
+    runner_trail_after_r: float       # start trailing after this R multiple
+    runner_trail_lock_r: float        # lock this many R once trailing
+    runner_require_for_entry: bool    # only open when run_quality says runner
+    pick_min_score_runners: float     # lower pick floor for confirmed runners
+    universe_fill_mode: bool          # no hourly open cap; fill universe until out of margin
     self_heal_enabled: bool           # auto-recover peaks, ML, entry pauses
     scalp_mode: bool                  # high-lev momentum scalps, fast harvest
     scalp_leverage: int
@@ -127,6 +150,15 @@ class Settings:
     winner_max_opposition_ratio: float
     margin_use_fraction: float
     min_margin_rate: float
+    target_margin_rate: float
+    margin_top_up_enabled: bool
+    margin_mode: str  # isolated | cross (Blofin account margin mode)
+    auto_cross_margin_migrate: bool
+    auto_cross_margin_interval_sec: float
+    auto_cross_margin_symbol_cooldown_sec: float
+    max_effective_leverage: int
+    max_stop_liq_fraction: float
+    pre_liquidation_exit_factor: float
     sl_liq_buffer: float
     entries_paused: bool
     max_opens_per_tick: int
@@ -146,6 +178,9 @@ class Settings:
     optimizer_target_min_tph: int
     optimizer_target_max_tph: int
     optimizer_quality_first: bool
+    optimizer_flow_learning_enabled: bool
+    optimizer_flow_target_tph: int
+    optimizer_flow_lookback_reports: int
     live_update_enabled: bool
     live_update_poll_seconds: float
     live_update_git_pull: bool
@@ -155,6 +190,43 @@ class Settings:
     leverage_rotate_when_starved: bool
     leverage_rotate_interval_minutes: int
     leverage_auto_upgrade: bool
+    stack_winners_mode: bool
+    early_harvest_enabled: bool
+    moon_swarm_enabled: bool
+    markov_regime_enabled: bool
+    markov_confidence_boost_trend: float
+    markov_confidence_penalty_stress: float
+    symbol_quality_enabled: bool
+    symbol_quality_floor: float
+    exec_slippage_penalty_enabled: bool
+    exec_slippage_warn_bps: float
+    optimizer_autocode_enabled: bool
+    optimizer_autocode_cooldown_seconds: int
+    llm_trading_enabled: bool
+    llm_trading_min_confidence: float
+    llm_trading_temperature: float
+    llm_trading_max_tokens: int
+    llm_trading_respect_markov: bool
+    llm_trading_fail_open: bool
+    llm_trading_min_score: float
+    llm_trading_use_cortex: bool
+    llm_trading_strict: bool
+    llm_policy_cache_sec: float
+    momentum_wave_mode: bool
+    momentum_wave_target_daily_pct: float
+    momentum_wave_target_levered_profit_pct: float
+    hourly_3r_winner_mode: bool
+    optimizer_target_min_wins_per_hour: int
+    tpsl_only_pacing: bool
+    tpsl_pace_base_gap_seconds: float
+    tpsl_pace_gap_after_tp_seconds: float
+    tpsl_pace_gap_after_sl_seconds: float
+    tpsl_pace_symbol_sl_cooldown_seconds: float
+    scalp_fast_3r: bool
+    scalp_fast_max_stop_pct: float
+    scalp_fast_max_take_pct: float
+    scalp_momentum_max_stop_pct: float
+    scalp_skip_liq_tpsl: bool
 
     @property
     def trade_all_symbols(self) -> bool:
@@ -203,7 +275,12 @@ def load_settings() -> Settings:
         ml_refit_min_shards=int(os.getenv("ML_REFIT_MIN_SHARDS", "12")),
         ml_refit_interval_minutes=int(os.getenv("ML_REFIT_INTERVAL_MINUTES", "20")),
         ml_outcome_refit_min_new=int(os.getenv("ML_OUTCOME_REFIT_MIN_NEW", "3")),
+        ml_auto_refit_on_startup=_env_bool("ML_AUTO_REFIT_ON_STARTUP", True),
         ml_min_deploy_samples=int(os.getenv("ML_MIN_DEPLOY_SAMPLES", "350")),
+        cortex_auto_train=_env_bool("CORTEX_AUTO_TRAIN", True),
+        cortex_train_on_startup=_env_bool("CORTEX_TRAIN_ON_STARTUP", True),
+        cortex_train_interval_minutes=int(os.getenv("CORTEX_TRAIN_INTERVAL_MINUTES", "15")),
+        cortex_train_min_new_closes=int(os.getenv("CORTEX_TRAIN_MIN_NEW_CLOSES", "1")),
         ml_walk_forward_splits=int(os.getenv("ML_WALK_FORWARD_SPLITS", "10")),  # more splits for robustness
         ml_walk_forward_min_train=int(os.getenv("ML_WALK_FORWARD_MIN_TRAIN", "300")),
         ml_real_feedback_max_samples=int(os.getenv("ML_REAL_FEEDBACK_MAX_SAMPLES", "1000")),
@@ -233,7 +310,32 @@ def load_settings() -> Settings:
         take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "25.0")),  # 25% take profit
         stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "8.0")),  # 8% stop loss
         liquidation_buffer_pct=float(os.getenv("LIQUIDATION_BUFFER_PCT", "10.0")),
-        unrestricted_trading=_env_bool("UNRESTRICTED_TRADING", True),
+        unrestricted_trading=_env_bool("UNRESTRICTED_TRADING", False),
+        account_curve_maximize=(
+            _env_bool("ACCOUNT_CURVE_MAXIMIZE", True)
+            if os.getenv("ACCOUNT_CURVE_MAXIMIZE") is not None
+            else _env_bool("CURVE_MAXIMIZER", True)
+        ),
+        runner_filter_enabled=_env_bool("RUNNER_FILTER_ENABLED", True),
+        runner_min_score=float(os.getenv("RUNNER_MIN_SCORE", "0.48")),
+        runner_max_chop=float(os.getenv("RUNNER_MAX_CHOP", "0.56")),
+        runner_min_path_eff=float(os.getenv("RUNNER_MIN_PATH_EFF", "0.26")),
+        runner_priority_mode=_env_bool(
+            "RUNNER_PRIORITY_MODE",
+            _env_bool("MOMENTUM_WAVE_MODE", True),
+        ),
+        runner_extend_take_pct=float(os.getenv("RUNNER_EXTEND_TAKE_PCT", "0.08")),
+        runner_extend_min_rr=float(os.getenv("RUNNER_EXTEND_MIN_RR", "2.5")),
+        runner_trail_enabled=_env_bool("RUNNER_TRAIL_ENABLED", True),
+        runner_trail_after_r=float(os.getenv("RUNNER_TRAIL_AFTER_R", "1.0")),
+        runner_trail_lock_r=float(os.getenv("RUNNER_TRAIL_LOCK_R", "0.55")),
+        runner_require_for_entry=_env_bool("RUNNER_REQUIRE_FOR_ENTRY", False),
+        pick_min_score_runners=float(os.getenv("PICK_MIN_SCORE_RUNNERS", "0.38")),
+        universe_fill_mode=_env_bool("UNIVERSE_FILL_MODE", False),
+        micro_equity_threshold=float(os.getenv("MICRO_EQUITY_THRESHOLD", "10.0")),
+        micro_equity_max_open=int(os.getenv("MICRO_EQUITY_MAX_OPEN", "3")),
+        micro_drawdown_pause_pct=float(os.getenv("MICRO_DRAWDOWN_PAUSE_PCT", "6.0")),
+        micro_max_margin_frac=float(os.getenv("MICRO_MAX_MARGIN_FRAC", "0.12")),
         self_heal_enabled=_env_bool("SELF_HEAL", True),
         scalp_mode=_env_bool("SCALP_MODE", True),
         scalp_leverage=int(os.getenv("SCALP_LEVERAGE", "20")),
@@ -250,7 +352,7 @@ def load_settings() -> Settings:
         scalp_harvest_fee_mult=float(os.getenv("SCALP_HARVEST_FEE_MULT", "1.75")),
         scalp_steward_interval=float(os.getenv("SCALP_STEWARD_INTERVAL", "4")),
         scalp_fee_coverage_mult=float(os.getenv("SCALP_FEE_COVERAGE_MULT", "2.0")),
-        scalp_3r_mode=_env_bool("SCALP_3R_MODE", False),
+        scalp_3r_mode=_env_bool("SCALP_3R_MODE", True),
         scalp_3r_min_rr=float(os.getenv("SCALP_3R_MIN_RR", "3.0")),
         scalp_3r_harvest_min_r=float(os.getenv("SCALP_3R_HARVEST_MIN_R", "2.5")),
         scalp_3r_min_score_bump=float(os.getenv("SCALP_3R_MIN_SCORE_BUMP", "7")),
@@ -274,12 +376,25 @@ def load_settings() -> Settings:
         winner_min_anchor_votes=int(os.getenv("WINNER_MIN_ANCHOR_VOTES", "2")),
         winner_max_opposition_ratio=float(os.getenv("WINNER_MAX_OPPOSITION_RATIO", "0.38")),
         winner_ml_veto_min_confidence=float(os.getenv("WINNER_ML_VETO_MIN_CONFIDENCE", "0.58")),
-        margin_use_fraction=float(os.getenv("MARGIN_USE_FRACTION", "0.88")),
-        min_margin_rate=float(os.getenv("MIN_MARGIN_RATE", "0.92")),
-        sl_liq_buffer=float(os.getenv("SL_LIQ_BUFFER", "0.38")),
+        margin_use_fraction=float(os.getenv("MARGIN_USE_FRACTION", "0.68")),
+        min_margin_rate=float(os.getenv("MIN_MARGIN_RATE", "1.18")),
+        target_margin_rate=float(os.getenv("TARGET_MARGIN_RATE", "1.30")),
+        margin_top_up_enabled=_env_bool("MARGIN_TOP_UP_ENABLED", False),
+        margin_mode=os.getenv("MARGIN_MODE", "cross").strip().lower(),
+        auto_cross_margin_migrate=_env_bool("AUTO_CROSS_MARGIN_MIGRATE", True),
+        auto_cross_margin_interval_sec=float(
+            os.getenv("AUTO_CROSS_MARGIN_INTERVAL_SEC", "90")
+        ),
+        auto_cross_margin_symbol_cooldown_sec=float(
+            os.getenv("AUTO_CROSS_MARGIN_SYMBOL_COOLDOWN_SEC", "300")
+        ),
+        max_effective_leverage=int(os.getenv("MAX_EFFECTIVE_LEVERAGE", "18")),
+        max_stop_liq_fraction=float(os.getenv("MAX_STOP_LIQ_FRACTION", "0.22")),
+        pre_liquidation_exit_factor=float(os.getenv("PRE_LIQUIDATION_EXIT_FACTOR", "0.55")),
+        sl_liq_buffer=float(os.getenv("SL_LIQ_BUFFER", "0.50")),
         entries_paused=_env_bool("ENTRIES_PAUSED", False),
-        max_opens_per_tick=int(os.getenv("MAX_OPENS_PER_TICK", "1")),
-        small_account_max_open=int(os.getenv("SMALL_ACCOUNT_MAX_OPEN", "4")),
+        max_opens_per_tick=int(os.getenv("MAX_OPENS_PER_TICK", "8")),
+        small_account_max_open=int(os.getenv("SMALL_ACCOUNT_MAX_OPEN", "2")),
         small_account_max_opens_per_tick=int(os.getenv("SMALL_ACCOUNT_MAX_OPENS_PER_TICK", "1")),
         min_free_margin_pct=float(os.getenv("MIN_FREE_MARGIN_PCT", "0.18")),
         small_account_min_free_pct=float(os.getenv("SMALL_ACCOUNT_MIN_FREE_PCT", "0.28")),
@@ -292,8 +407,11 @@ def load_settings() -> Settings:
         optimizer_enabled=_env_bool("OPTIMIZER_ENABLED", True),
         optimizer_interval_seconds=float(os.getenv("OPTIMIZER_INTERVAL_SECONDS", "900")),
         optimizer_target_min_tph=int(os.getenv("OPTIMIZER_TARGET_MIN_TPH", "1")),
-        optimizer_target_max_tph=int(os.getenv("OPTIMIZER_TARGET_MAX_TPH", "3")),
+        optimizer_target_max_tph=int(os.getenv("OPTIMIZER_TARGET_MAX_TPH", "9999")),
         optimizer_quality_first=_env_bool("OPTIMIZER_QUALITY_FIRST", True),
+        optimizer_flow_learning_enabled=_env_bool("OPTIMIZER_FLOW_LEARNING_ENABLED", True),
+        optimizer_flow_target_tph=int(os.getenv("OPTIMIZER_FLOW_TARGET_TPH", "3")),
+        optimizer_flow_lookback_reports=int(os.getenv("OPTIMIZER_FLOW_LOOKBACK_REPORTS", "80")),
         live_update_enabled=_env_bool("LIVE_UPDATE_ENABLED", True),
         live_update_poll_seconds=float(os.getenv("LIVE_UPDATE_POLL_SECONDS", "3")),
         live_update_git_pull=_env_bool("LIVE_UPDATE_GIT_PULL", False),
@@ -302,7 +420,50 @@ def load_settings() -> Settings:
         ),
         throughput_brain_enabled=_env_bool("THROUGHPUT_BRAIN_ENABLED", True),
         leverage_rotate_on_start=_env_bool("LEVERAGE_ROTATE_ON_START", False),
-        leverage_rotate_when_starved=_env_bool("LEVERAGE_ROTATE_WHEN_STARVED", True),
+        leverage_rotate_when_starved=_env_bool("LEVERAGE_ROTATE_WHEN_STARVED", False),
         leverage_rotate_interval_minutes=int(os.getenv("LEVERAGE_ROTATE_INTERVAL_MINUTES", "45")),
-        leverage_auto_upgrade=_env_bool("LEVERAGE_AUTO_UPGRADE", True),
+        leverage_auto_upgrade=_env_bool("LEVERAGE_AUTO_UPGRADE", False),
+        stack_winners_mode=_env_bool("STACK_WINNERS_MODE", True),
+        early_harvest_enabled=_env_bool("EARLY_HARVEST_ENABLED", False),
+        moon_swarm_enabled=_env_bool("MOON_SWARM_ENABLED", True),
+        markov_regime_enabled=_env_bool("MARKOV_REGIME_ENABLED", True),
+        markov_confidence_boost_trend=float(os.getenv("MARKOV_CONFIDENCE_BOOST_TREND", "0.02")),
+        markov_confidence_penalty_stress=float(os.getenv("MARKOV_CONFIDENCE_PENALTY_STRESS", "0.06")),
+        symbol_quality_enabled=_env_bool("SYMBOL_QUALITY_ENABLED", True),
+        symbol_quality_floor=float(os.getenv("SYMBOL_QUALITY_FLOOR", "0.22")),
+        exec_slippage_penalty_enabled=_env_bool("EXEC_SLIPPAGE_PENALTY_ENABLED", True),
+        exec_slippage_warn_bps=float(os.getenv("EXEC_SLIPPAGE_WARN_BPS", "12")),
+        optimizer_autocode_enabled=_env_bool("OPTIMIZER_AUTOCODE_ENABLED", True),
+        optimizer_autocode_cooldown_seconds=int(os.getenv("OPTIMIZER_AUTOCODE_COOLDOWN_SECONDS", "900")),
+        llm_trading_enabled=_env_bool("LLM_TRADING_ENABLED", True),
+        llm_trading_min_confidence=float(os.getenv("LLM_TRADING_MIN_CONFIDENCE", "0.58")),
+        llm_trading_temperature=float(os.getenv("LLM_TRADING_TEMPERATURE", "0.10")),
+        llm_trading_max_tokens=int(os.getenv("LLM_TRADING_MAX_TOKENS", "128")),
+        llm_trading_respect_markov=_env_bool("LLM_TRADING_RESPECT_MARKOV", True),
+        llm_trading_fail_open=_env_bool("LLM_TRADING_FAIL_OPEN", True),
+        llm_trading_min_score=float(os.getenv("LLM_TRADING_MIN_SCORE", "50")),
+        llm_trading_use_cortex=_env_bool("LLM_TRADING_USE_CORTEX", True),
+        llm_trading_strict=_env_bool("LLM_TRADING_STRICT", False),
+        llm_policy_cache_sec=float(os.getenv("LLM_POLICY_CACHE_SEC", "45")),
+        momentum_wave_mode=_env_bool("MOMENTUM_WAVE_MODE", True),
+        momentum_wave_target_daily_pct=float(os.getenv("MOMENTUM_WAVE_TARGET_DAILY_PCT", "5.0")),
+        momentum_wave_target_levered_profit_pct=float(
+            os.getenv("MOMENTUM_WAVE_TARGET_LEVERED_PROFIT_PCT", "50.0")
+        ),
+        hourly_3r_winner_mode=_env_bool("HOURLY_3R_WINNER_MODE", True),
+        optimizer_target_min_wins_per_hour=int(
+            os.getenv("OPTIMIZER_TARGET_MIN_WINS_PER_HOUR", "3")
+        ),
+        tpsl_only_pacing=_env_bool("TPSL_ONLY_PACING", False),
+        tpsl_pace_base_gap_seconds=float(os.getenv("TPSL_PACE_BASE_GAP_SECONDS", "2")),
+        tpsl_pace_gap_after_tp_seconds=float(os.getenv("TPSL_PACE_GAP_AFTER_TP_SECONDS", "4")),
+        tpsl_pace_gap_after_sl_seconds=float(os.getenv("TPSL_PACE_GAP_AFTER_SL_SECONDS", "12")),
+        tpsl_pace_symbol_sl_cooldown_seconds=float(
+            os.getenv("TPSL_PACE_SYMBOL_SL_COOLDOWN_SECONDS", "25")
+        ),
+        scalp_fast_3r=_env_bool("SCALP_FAST_3R", True),
+        scalp_fast_max_stop_pct=float(os.getenv("SCALP_FAST_MAX_STOP_PCT", "0.010")),
+        scalp_fast_max_take_pct=float(os.getenv("SCALP_FAST_MAX_TAKE_PCT", "0.030")),
+        scalp_momentum_max_stop_pct=float(os.getenv("SCALP_MOMENTUM_MAX_STOP_PCT", "0.014")),
+        scalp_skip_liq_tpsl=_env_bool("SCALP_SKIP_LIQ_TPSL", True),
     )

@@ -5,10 +5,14 @@
 .cursor/HOURLY_DUE
 __pycache__/
 *.pyc
-logs/
-state/
+logs/*
+!logs/.gitkeep
+state/*
+!state/.gitkeep
+models/*.gguf
 treasury/wallets.json
 treasury/faucets.json
 treasury/acquisition.json
 treasury/state/
 *.log
+dashboard/node_modules/

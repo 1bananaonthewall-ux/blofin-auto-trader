@@ -4,6 +4,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+import api_backoff
 from leverage_intel import parse_instrument_max_leverage
 from markets import Market, inst_id_to_symbol
 
@@ -11,6 +12,17 @@ if TYPE_CHECKING:
     from exchange_client import BlofinExchange
 
 log = logging.getLogger(__name__)
+
+
+def _cached_tradeable_markets(ex: "BlofinExchange") -> list[Market]:
+    if ex.markets:
+        return list(ex.markets.values())
+    cached = ex.load_markets_from_cache(ex.settings.state_dir)
+    if cached:
+        ex.markets = cached
+        log.info("using %d markets from disk cache (API paused)", len(cached))
+        return list(cached.values())
+    return []
 
 
 def load_tradeable_markets(
@@ -22,6 +34,9 @@ def load_tradeable_markets(
 ) -> list[Market]:
     """Load ALL tradeable USDT markets. Filter only dead instruments.
     Tiny accounts get everything passed through - let the sizer decide."""
+    if api_backoff.is_paused():
+        return _cached_tradeable_markets(ex)
+
     instruments = ex.list_instruments()
     tickers = {t["instId"]: t for t in ex.list_tickers()}
 

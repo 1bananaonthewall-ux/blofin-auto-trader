@@ -43,9 +43,33 @@ class ScalpProfile:
     def from_settings(cls, s: Settings) -> ScalpProfile:
         three_r = s.scalp_3r_mode
         min_rr = s.scalp_3r_min_rr if three_r else 1.35
+        max_stop = s.scalp_max_stop_pct
         max_take = s.scalp_max_take_pct
-        if three_r:
-            max_take = max(max_take, s.scalp_max_stop_pct * min_rr * 1.05)
+        try:
+            from runner_momentum import runner_priority_active
+
+            runner_priority = runner_priority_active(s)
+        except Exception:
+            runner_priority = False
+        # Throughput brackets apply unless this entry is a momentum runner (signals.py tags those).
+        fast_3r = three_r and (
+            getattr(s, "scalp_fast_3r", False) or getattr(s, "hourly_3r_winner_mode", False)
+        )
+        if fast_3r:
+            # Tight brackets for high win-rate / hour (exchange TP/SL, not wide liq-gap stops).
+            max_stop = min(max_stop, float(getattr(s, "scalp_fast_max_stop_pct", 0.008) or 0.008))
+            max_take = min(
+                max_take,
+                float(getattr(s, "scalp_fast_max_take_pct", 0.0) or 0)
+                or max_stop * min_rr * 1.02,
+            )
+            min_hold_seconds = (
+                max(s.scalp_min_hold_seconds, 55.0)
+                if getattr(s, "stack_winners_mode", True)
+                else min(s.scalp_min_hold_seconds, 18.0)
+            )
+        elif three_r:
+            max_take = max(max_take, max_stop * min_rr * 1.05)
         return cls(
             base_leverage=s.scalp_leverage,
             max_leverage_cap=s.scalp_leverage_max,
@@ -55,7 +79,7 @@ class ScalpProfile:
             symbol_cooldown_minutes=s.scalp_cooldown_minutes,
             atr_stop_mult=s.scalp_atr_stop_mult,
             atr_take_mult=s.scalp_atr_take_mult,
-            max_stop_pct=s.scalp_max_stop_pct,
+            max_stop_pct=max_stop,
             max_take_pct=max_take,
             min_hold_seconds=s.scalp_min_hold_seconds,
             harvest_fee_mult=s.scalp_harvest_fee_mult,
@@ -66,7 +90,19 @@ class ScalpProfile:
             margin_use_fraction=s.margin_use_fraction,
             three_r_mode=three_r,
             min_rr=min_rr,
-            harvest_min_r=s.scalp_3r_harvest_min_r if three_r else 0.0,
+            harvest_min_r=(
+                min(s.scalp_3r_harvest_min_r, 1.0)
+                if fast_3r and not getattr(s, "stack_winners_mode", True)
+                else (
+                    min(s.scalp_3r_harvest_min_r, 1.35)
+                    if fast_3r
+                    else (
+                        max(s.scalp_3r_harvest_min_r, 2.5)
+                        if three_r and getattr(s, "hourly_3r_winner_mode", False)
+                        else (s.scalp_3r_harvest_min_r if three_r else 0.0)
+                    )
+                )
+            ),
             min_signal_score_bump=s.scalp_3r_min_score_bump if three_r else 0.0,
             min_confidence_bump=s.scalp_3r_min_confidence_bump if three_r else 0.0,
             enforce_tp_from_sl=three_r,

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from autonomous_engine import AutonomousGrowthEngine, RuntimeKnobs
     from config import Settings
+    from exchange_client import BlofinExchange
     from ml.predictor import MLPredictor
     from ml.universe_trainer import ContinuousMlTrainer
 
@@ -28,6 +29,7 @@ log = logging.getLogger(__name__)
 MIN_PEAK_RESET_INTERVAL = 1800.0
 MIN_REFIT_REQUEST_INTERVAL = 3600.0
 MIN_SUBPROCESS_TRAIN_INTERVAL = 7200.0
+MIN_TPSL_HEAL_INTERVAL = 30.0
 PAUSE_STREAK_FOR_RECOVERY = 3
 DRAWDOWN_PEAK_RESET_PCT = 25.0
 RECOVERY_DURATION_SEC = 3600.0
@@ -41,6 +43,7 @@ class HealPersisted:
     last_full_refit_request: float = 0.0
     last_subprocess_train: float = 0.0
     last_heal_log: float = 0.0
+    last_tpsl_heal: float = 0.0
     recent_actions: list[str] = field(default_factory=list)
 
 
@@ -62,6 +65,7 @@ class SelfHealer:
                 last_full_refit_request=float(raw.get("last_full_refit_request", 0)),
                 last_subprocess_train=float(raw.get("last_subprocess_train", 0)),
                 last_heal_log=float(raw.get("last_heal_log", 0)),
+                last_tpsl_heal=float(raw.get("last_tpsl_heal", 0)),
                 recent_actions=list(raw.get("recent_actions", []))[-20:],
             )
         except Exception:
@@ -79,6 +83,7 @@ class SelfHealer:
                     "last_full_refit_request": self._state.last_full_refit_request,
                     "last_subprocess_train": self._state.last_subprocess_train,
                     "last_heal_log": self._state.last_heal_log,
+                    "last_tpsl_heal": self._state.last_tpsl_heal,
                     "recent_actions": self._state.recent_actions,
                     "updated_at": time.time(),
                 },
@@ -157,6 +162,76 @@ class SelfHealer:
 
         return actions
 
+    def heal_open_tpsl(
+        self,
+        ex: "BlofinExchange",
+        settings: Settings,
+        positions: dict,
+    ) -> list[str]:
+        """Re-attach missing SL/TP without canceling winners; clears repair cooldown when naked."""
+        if not self.enabled:
+            return []
+        import api_backoff
+
+        if api_backoff.is_paused():
+            return []
+        now = time.time()
+        from markets import symbol_to_inst_id
+        from tpsl_guard import pending_is_adequate
+
+        actions: list[str] = []
+        any_naked = False
+        for symbol, pos in positions.items():
+            if "#" in symbol and not pos.get("position_key"):
+                continue
+            trade_sym = str(pos.get("symbol") or symbol).split("#", 1)[0]
+            side = str(pos.get("side") or "")
+            entry = float(pos.get("entry_price") or 0)
+            contracts = float(pos.get("contracts") or 0)
+            if not side or entry <= 0 or contracts <= 0:
+                continue
+            inst_id = symbol_to_inst_id(trade_sym)
+            position_side = ex._position_side_for_order(side, pos)
+            _, pending = ex._pending_tpsl(
+                inst_id,
+                side,
+                entry,
+                position_side=position_side,
+                allow_registry_fallback=False,
+            )
+            if pending.live_rows > 0 and pending_is_adequate(side, entry, pending):
+                continue
+            any_naked = True
+            ex._clear_tpsl_trust(trade_sym)
+            ex._tpsl_repair_at.pop(ex._canonical_symbol(trade_sym), None)
+            meta_take = float(pos.get("take_pct") or 0.022)
+            lev = int(pos.get("effective_leverage") or settings.scalp_leverage_max)
+            ok, _, _ = ex.repair_position_tpsl(
+                trade_sym,
+                side,
+                contracts,
+                take_pct=meta_take,
+                configured_leverage=lev,
+                dry_run=settings.dry_run,
+                cancel_existing=False,
+            )
+            tag = symbol.split("/")[0]
+            live_after = ex.live_exchange_tpsl(trade_sym, side, entry, pos=pos)
+            if ok and live_after:
+                actions.append(f"tpsl_healed_{tag}")
+            else:
+                actions.append(f"tpsl_naked_{tag}")
+
+        if not any_naked and now - self._state.last_tpsl_heal < MIN_TPSL_HEAL_INTERVAL:
+            return []
+        if actions:
+            self._state.last_tpsl_heal = now
+            log.warning("SELF-HEAL TPSL: %s", " | ".join(actions))
+            self._persist(actions)
+        elif any_naked:
+            log.warning("SELF-HEAL TPSL: naked positions but repair returned no success")
+        return actions
+
     def _heal_ml(
         self,
         settings: Settings,
@@ -186,6 +261,17 @@ class SelfHealer:
                     backup.unlink()
                 corrupt.rename(backup)
                 actions.append("quarantined_corrupt_model")
+
+        flag = settings.state_dir / "ml_force_refit.flag"
+        if flag.is_file():
+            try:
+                flag.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if ml_trainer:
+                ml_trainer.request_full_refit()
+                self._state.last_full_refit_request = time.time()
+                actions.append("ml_force_refit_flag")
 
         now = time.time()
         if ml_trainer and now - self._state.last_full_refit_request >= 600:

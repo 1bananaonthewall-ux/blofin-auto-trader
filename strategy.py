@@ -38,6 +38,7 @@ class StrategyDecision:
     winner_score: float = 0.0
     pick_score: float = 0.0
     fast_win_score: float = 0.0
+    trade_style: str = ""  # fast_3r | momentum | scalp (tpsl_policy)
 
 
 def _htf_bias(closes_5m: list[float]) -> str | None:

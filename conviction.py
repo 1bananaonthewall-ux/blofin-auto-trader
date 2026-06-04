@@ -47,6 +47,23 @@ def conviction_score(decision: StrategyDecision, path_reliability: float) -> flo
         conv = max(conv, ps * 0.92)
     elif tier == "good" and ps > 0:
         conv = max(conv, ps * 0.78)
+    swarm_c = float(getattr(decision, "swarm_confidence", 0.0) or 0.0)
+    if swarm_c > 0:
+        conv = min(1.0, conv * (0.90 + 0.10 * swarm_c))
+    mk_stress = float(getattr(decision, "markov_stress_p", 0.0) or 0.0)
+    if mk_stress > 0.35:
+        conv *= max(0.85, 1.0 - (mk_stress - 0.35) * 0.4)
+    elif getattr(decision, "markov_state", "") == "trend":
+        conv = min(1.0, conv * 1.03)
+    run_s = float(getattr(decision, "run_score", 0.5) or 0.5)
+    if getattr(decision, "is_runner", False):
+        conv = min(1.0, conv * (1.0 + 0.10 * run_s))
+    elif getattr(decision, "is_choppy", False):
+        conv *= max(0.72, 0.88 - run_s * 0.2)
+    elif run_s >= 0.55:
+        conv = min(1.0, conv * (1.0 + 0.04 * (run_s - 0.5)))
+    elif run_s < 0.38:
+        conv *= 0.90
     return conv
 
 
@@ -65,16 +82,21 @@ def rank_setups(
         ranked.append(
             RankedSetup(symbol=sym, decision=dec, conviction=conv, confidence=conf, score=dec.score)
         )
-    ranked.sort(
-        key=lambda r: (
-            getattr(r.decision, "pick_score", 0.0),
-            getattr(r.decision, "winner_score", 0.0),
+    def _sort_key(r: RankedSetup) -> tuple:
+        dec = r.decision
+        runner_flag = 1 if getattr(dec, "is_runner", False) else 0
+        run_s = float(getattr(dec, "run_score", 0.0) or 0.0)
+        return (
+            runner_flag,
+            run_s,
+            getattr(dec, "pick_score", 0.0),
+            getattr(dec, "winner_score", 0.0),
             r.conviction,
             r.confidence,
             r.score,
-        ),
-        reverse=True,
-    )
+        )
+
+    ranked.sort(key=_sort_key, reverse=True)
     return ranked
 
 
@@ -126,9 +148,11 @@ def select_conviction_ties(
     tier = getattr(pool[0].decision, "winner_tier", "")
     floor = min_conviction
     if tier == "apex":
-        floor = max(floor, 0.55)
-    elif tier in ("elite", "good"):
-        floor = max(floor, 0.48)
+        floor = max(floor, 0.52)
+    elif tier == "elite":
+        floor = max(floor, 0.46)
+    elif tier == "good":
+        floor = max(floor, 0.44)
     if top < floor:
         return []
 

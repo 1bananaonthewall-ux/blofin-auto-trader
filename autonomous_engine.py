@@ -1,5 +1,5 @@
 """
-Autonomous Growth Engine — fluid control toward $95M by 2027-09-01.
+Autonomous Growth Engine — fluid control toward mission_config sole objective.
 
 No discrete modes. A continuous manifold of signals blends each tick into
 how hard to trade, how selective to be, and whether new entries are reliable.
@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from fluid_manifold import FluidManifold, FluidSnapshot, ManifoldContext
 from growth_optimizer import CompoundGrowthOptimizer
 from core_brain import CoreBrain, CoreDirective
+from markov_regime import MarkovSnapshot, get_markov_engine
 from mission_brain import MissionBrain, MissionState
 from pnl_curve import PnlCurveEngine, PnlCurveState
 from scalp_profile import ScalpProfile, profile_for
@@ -28,13 +29,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-from mission_config import TARGET_CAPITAL_USD, TARGET_DATE_ISO
+from mission_config import TARGET_DAILY_GROWTH_PCT, sole_objective_label
 
 
 @dataclass(frozen=True)
 class TradingDoctrine:
-    target_capital_usd: float = TARGET_CAPITAL_USD
-    target_date_iso: str = TARGET_DATE_ISO
+    target_daily_growth_pct: float = TARGET_DAILY_GROWTH_PCT
+    sole_objective: str = sole_objective_label()
     signal_mode: str = "ml"
     min_confidence_floor: float = 0.68
     min_confidence_default: float = 0.74
@@ -104,22 +105,17 @@ class AutonomousGrowthEngine:
 
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
-        self.growth = CompoundGrowthOptimizer(state_dir, target_capital=self.doctrine.target_capital_usd)
+        self.growth = CompoundGrowthOptimizer(state_dir)
         self.manifold = FluidManifold(state_dir)
         self.pnl = PnlCurveEngine(state_dir)
-        self.mission = MissionBrain(
-            target_capital=self.doctrine.target_capital_usd,
-            target_date=self.doctrine.target_date_iso,
-        )
-        self.core = CoreBrain(
-            target_capital=self.doctrine.target_capital_usd,
-            target_date=self.doctrine.target_date_iso,
-        )
+        self.mission = MissionBrain()
+        self.core = CoreBrain()
         self._last_fluid: FluidSnapshot | None = None
         self._last_curve: PnlCurveState | None = None
         self._last_mission: MissionState | None = None
         self._last_core: CoreDirective | None = None
         self._last_throughput: ThroughputState | None = None
+        self._last_markov: MarkovSnapshot | None = None
         self._last_retrain_ts = 0.0
         self.unrestricted_trading = False
         self.recovery_active = False
@@ -131,12 +127,22 @@ class AutonomousGrowthEngine:
         self._ml_metrics: dict[str, float] = {}
         self.scalp: ScalpProfile | None = None
         self.settings: Settings | None = None
+        self._tpsl_pacer = None
+        self._exit_cooldowns = None
 
     def bind_settings(self, settings: "Settings") -> None:
         self.settings = settings
         self.scalp = profile_for(settings)
         if self.scalp:
             self.unrestricted_trading = settings.unrestricted_trading
+
+    def _account_curve_maximize(self) -> bool:
+        st = self.settings
+        return bool(
+            st
+            and getattr(st, "account_curve_maximize", True)
+            and not self.unrestricted_trading
+        )
 
     def set_ml_metrics(
         self,
@@ -164,13 +170,98 @@ class AutonomousGrowthEngine:
 
     def update_curve(self, equity: float) -> PnlCurveState:
         metrics = self.growth.get_growth_metrics(equity)
+        opens_starved = False
+        st = self.settings
+        if st is not None:
+            from hourly_3r import hourly_3r_active, is_opens_starved
+            from scalp_optimizer import get_active_tuning
+
+            if hourly_3r_active(st):
+                opens_starved = is_opens_starved(st, get_active_tuning())
         self._last_curve = self.pnl.update(
-            equity, metrics.required_daily_return_pct, unrestricted=self.unrestricted_trading
+            equity,
+            metrics.required_daily_return_pct,
+            unrestricted=self.unrestricted_trading,
+            account_curve_maximize=self._account_curve_maximize(),
+            opens_starved=opens_starved,
         )
         return self._last_curve
 
-    def record_closed_trade(self, symbol: str, net_pnl_usd: float, *, side: str = "", event: str = "close") -> None:
-        self.pnl.record_trade(symbol, net_pnl_usd, side=side, event=event)
+    def bind_tpsl_pacer(self, pacer) -> None:
+        self._tpsl_pacer = pacer
+
+    def bind_exit_cooldowns(self, cooldowns) -> None:
+        self._exit_cooldowns = cooldowns
+
+    def record_closed_trade(
+        self,
+        symbol: str,
+        net_pnl_usd: float,
+        *,
+        side: str = "",
+        event: str = "close",
+        roe_pct: float | None = None,
+        entry: float | None = None,
+        exit_px: float | None = None,
+        leverage: int | None = None,
+        margin_usdt: float | None = None,
+        contracts: float | None = None,
+    ) -> None:
+        from roe_learning import get_roe_store, journal_open_before, resolve_close_pnl_roe
+
+        margin = float(margin_usdt or 0)
+        contracts_v = float(contracts or 0) or None
+        lev = leverage
+        if margin <= 0 or not contracts_v:
+            j_margin, j_contracts, j_lev = journal_open_before(
+                self.pnl.state_dir, symbol, time.time()
+            )
+            if margin <= 0 and j_margin > 0:
+                margin = j_margin
+            if not contracts_v and j_contracts > 0:
+                contracts_v = j_contracts
+            if not lev and j_lev > 0:
+                lev = j_lev
+        if roe_pct is None and entry and exit_px and margin > 0:
+            _, roe_pct = resolve_close_pnl_roe(
+                side=side or "long",
+                entry=float(entry),
+                exit_px=float(exit_px),
+                prof_pnl=float(net_pnl_usd),
+                margin_usdt=margin,
+                leverage=lev,
+                contracts=contracts_v,
+            )
+        elif roe_pct is None and margin > 0:
+            roe_pct = round(float(net_pnl_usd) / margin * 100.0, 2)
+        self.pnl.record_trade(
+            symbol,
+            net_pnl_usd,
+            side=side,
+            event=event,
+            roe_pct=roe_pct,
+            entry=entry,
+            exit_px=exit_px,
+            leverage=leverage,
+        )
+        get_roe_store(self.pnl.state_dir).record_close(
+            symbol,
+            side=side or "long",
+            roe_pct=roe_pct,
+            pnl_usd=net_pnl_usd,
+            event=event,
+            entry=entry,
+            exit_px=exit_px,
+            leverage=leverage,
+            margin_usdt=margin_usdt,
+            contracts=contracts,
+        )
+        if self._tpsl_pacer is not None:
+            kind = self._tpsl_pacer.record_exit(event, net_pnl_usd)
+            if kind == "sl" and self._exit_cooldowns is not None:
+                sec = int(self._tpsl_pacer.symbol_sl_cooldown)
+                if sec > 0:
+                    self._exit_cooldowns.block(symbol, seconds=sec)
 
     def update_fluid(
         self, equity: float, free_margin: float, open_count: int
@@ -198,7 +289,11 @@ class AutonomousGrowthEngine:
             curve_slope_norm=slope_norm,
             curve_acceleration_norm=accel_norm,
         )
-        self._last_fluid = self.manifold.tick(ctx, unrestricted=self.unrestricted_trading)
+        self._last_fluid = self.manifold.tick(
+            ctx,
+            unrestricted=self.unrestricted_trading,
+            account_curve_maximize=self._account_curve_maximize(),
+        )
         metrics = self.growth.get_growth_metrics(equity)
         self._last_mission = self.mission.evaluate(
             equity,
@@ -206,6 +301,7 @@ class AutonomousGrowthEngine:
             curve,
             path_reliability=self._last_fluid.path_reliability,
             survival=self._last_fluid.survival,
+            account_curve_maximize=self._account_curve_maximize(),
         )
         return self._last_fluid
 
@@ -220,6 +316,18 @@ class AutonomousGrowthEngine:
     @property
     def core_directive(self) -> CoreDirective | None:
         return self._last_core or self.core.last
+
+    def update_markov_global(self, ohlcv_1m: list[list[float]], state_dir: Path | None = None) -> None:
+        if not ohlcv_1m:
+            return
+        eng = get_markov_engine(state_dir)
+        snap = eng.update("global", ohlcv_1m)
+        if snap:
+            self._last_markov = snap
+
+    @property
+    def markov_state(self) -> MarkovSnapshot | None:
+        return self._last_markov
 
     def evaluate_core(
         self,
@@ -237,6 +345,7 @@ class AutonomousGrowthEngine:
         fluid = self._last_fluid
         if fluid is None:
             fluid = self.update_fluid(equity, free_margin, open_count)
+        markov = self._last_markov if settings.markov_regime_enabled else None
         directive = self.core.evaluate(
             settings,
             equity=equity,
@@ -248,6 +357,7 @@ class AutonomousGrowthEngine:
             open_count=open_count,
             low_leverage_positions=low_leverage_positions,
             unrestricted=self.unrestricted_trading,
+            markov=markov,
         )
         self._last_core = directive
         self._last_throughput = _core_to_throughput(directive)
@@ -276,12 +386,16 @@ class AutonomousGrowthEngine:
         if mission is None:
             metrics = self.growth.get_growth_metrics(equity)
             mission = self.mission.evaluate(
-                equity, metrics, curve,
+                equity,
+                metrics,
+                curve,
                 path_reliability=fluid.path_reliability,
                 survival=fluid.survival,
+                account_curve_maximize=self._account_curve_maximize(),
             )
             self._last_mission = mission
         metrics = self.growth.get_growth_metrics(equity)
+        acm = self._account_curve_maximize()
         d = self.doctrine
         sp = self.scalp
         ai = fluid.action_intensity * curve.entry_scale
@@ -315,10 +429,12 @@ class AutonomousGrowthEngine:
                 1.0 - rel * 0.85,
             )
             min_conf = _blend(min_conf, d.min_confidence_default, ai * 0.5)
-            if curve.preserve_capital:
+            if curve.preserve_capital and not acm:
                 min_conf = _blend(min_conf, d.min_confidence_strict, 0.65)
-            if not curve.on_vertical_path:
+            if not curve.on_vertical_path and not acm:
                 min_conf = _blend(min_conf, d.min_confidence_strict, 0.35)
+            elif acm and curve.curve_phase in ("flat", "climbing"):
+                min_conf = min(min_conf, mission.min_conviction + 0.02)
             min_conf = max(min_conf, mission.min_conviction)
             min_score = _blend(52.0, 72.0, 1.0 - rel * 0.7)
             min_score = _blend(min_score, d.min_signal_score_default, ai * 0.4)
@@ -331,6 +447,14 @@ class AutonomousGrowthEngine:
                 * mission.risk_multiplier
             )
         risk_pct = max(0.0, min(0.18, risk_pct))
+        if acm:
+            risk_pct = min(0.18, risk_pct * (0.92 + 0.12 * curve.verticality))
+            if curve.curve_phase in ("vertical", "climbing", "flat"):
+                deploy_boost = 1.0 + 0.12 * curve.verticality
+            else:
+                deploy_boost = 1.0
+        else:
+            deploy_boost = 1.0
         if equity < 50:
             risk_pct = min(0.16, risk_pct * 1.15)
 
@@ -358,14 +482,23 @@ class AutonomousGrowthEngine:
         entry_gap = _blend(120.0, gap_base, ai)
         if sp:
             entry_gap = min(entry_gap, gap_base * 1.15)
-        core_d = self._last_core or self.core.last
-        if core_d is not None:
-            entry_gap = min(entry_gap, core_d.target_entry_gap)
-            max_lev = max(max_lev, min(lev_cap, core_d.target_leverage))
-        elif self._last_throughput is not None:
-            tp_state = self._last_throughput
-            entry_gap = min(entry_gap, tp_state.target_entry_gap)
-            max_lev = max(max_lev, min(lev_cap, tp_state.target_leverage))
+        st_pace = self.settings
+        tpsl_pace_only = False
+        if st_pace is not None:
+            from tpsl_pacing import use_tpsl_only_pacing
+
+            tpsl_pace_only = use_tpsl_only_pacing(st_pace)
+        if tpsl_pace_only and st_pace is not None:
+            entry_gap = float(getattr(st_pace, "tpsl_pace_base_gap_seconds", 2.0))
+        else:
+            core_d = self._last_core or self.core.last
+            if core_d is not None:
+                entry_gap = min(entry_gap, core_d.target_entry_gap)
+                max_lev = max(max_lev, min(lev_cap, core_d.target_leverage))
+            elif self._last_throughput is not None:
+                tp_state = self._last_throughput
+                entry_gap = min(entry_gap, tp_state.target_entry_gap)
+                max_lev = max(max_lev, min(lev_cap, tp_state.target_leverage))
         if sp:
             deploy_base = sp.margin_deploy_base * rel * curve.entry_scale
             deploy_max = sp.margin_deploy_max * ai * rel * curve.entry_scale
@@ -375,8 +508,13 @@ class AutonomousGrowthEngine:
 
         st = self.settings
         if st and equity > 0 and equity < st.small_account_threshold:
-            deploy_max = min(deploy_max, 0.32)
-            deploy_base = min(deploy_base, 0.14)
+            cap_max = 0.32 if acm else 0.28
+            cap_base = 0.14 if acm else 0.12
+            deploy_max = min(deploy_max, cap_max)
+            deploy_base = min(deploy_base, cap_base)
+        if acm:
+            deploy_base = min(0.22, deploy_base * deploy_boost)
+            deploy_max = min(0.38, deploy_max * deploy_boost)
 
         max_opens = d.max_opens_per_tick
         if st:
@@ -386,16 +524,86 @@ class AutonomousGrowthEngine:
 
         if self.unrestricted_trading or recovery:
             allow_entries = equity > 0 and free_margin > d.min_free_margin_usdt and risk_pct > 0.001
+        elif st_pace is not None and tpsl_pace_only:
+            allow_entries = equity > 0 and free_margin > d.min_free_margin_usdt and risk_pct > 0.001
         else:
             allow_entries = (
                 fluid.allow_new_entries
                 and risk_pct > 0.001
                 and mission.entry_allowed
             )
-            if curve.curve_phase == "declining":
+            if acm:
+                if curve.curve_phase == "declining":
+                    allow_entries = allow_entries and curve.drawdown_from_peak_pct < 14
+                elif curve.preserve_capital:
+                    allow_entries = allow_entries and curve.entry_scale >= 0.55
+            elif curve.curve_phase == "declining":
                 allow_entries = allow_entries and curve.verticality > 0.45 and ai > 0.25
             elif curve.preserve_capital:
                 allow_entries = allow_entries and curve.entry_scale >= 0.4
+            if (
+                st
+                and equity > 0
+                and equity < st.small_account_threshold
+                and open_count >= max(4, st.micro_equity_max_open + 1)
+                and curve.curve_phase == "declining"
+                and curve.actual_daily_pct < -2.0
+            ):
+                allow_entries = False
+            if (
+                st
+                and equity < st.small_account_threshold
+                and open_count >= 5
+                and curve.actual_daily_pct < -3.0
+                and curve.drawdown_from_peak_pct > 8.0
+            ):
+                allow_entries = False
+            if st and equity >= st.small_account_threshold:
+                deploy_base = max(deploy_base, 0.14)
+                deploy_max = max(deploy_max, min(0.38, st.margin_use_fraction * 0.42))
+                max_opens = max(max_opens, min(5, st.max_opens_per_tick))
+                entry_gap = min(entry_gap, max(25.0, gap_base * 0.55))
+                symbols_tick = max(symbols_tick, min(220, d.symbols_per_tick_base))
+            if st and equity >= 100.0:
+                deploy_base = max(deploy_base, 0.18)
+                deploy_max = max(deploy_max, min(0.48, st.margin_use_fraction * 0.55))
+                max_opens = max(max_opens, min(6, st.max_opens_per_tick))
+                entry_gap = min(entry_gap, 20.0)
+        # Hourly 3R winner mode: fast scan, enough opens for >=1 TP win/hour at 3:1.
+        if st and getattr(st, "hourly_3r_winner_mode", False):
+            from hourly_3r import target_wins_per_hour
+
+            wins_tgt = target_wins_per_hour(st)
+            min_conf = min(min_conf, 0.54 if wins_tgt >= 3 else 0.56)
+            min_score = min(min_score, 48.0 if wins_tgt >= 3 else 50.0)
+            symbols_tick = max(symbols_tick, min(240, st.symbols_per_tick))
+            poll = max(5, min(poll, 8 if wins_tgt >= 3 else 10))
+            entry_gap = min(entry_gap, 5.0 if wins_tgt >= 3 else 7.0)
+            max_opens = max(max_opens, min(6, st.max_opens_per_tick))
+            deploy_base = max(deploy_base, 0.14)
+            deploy_max = max(deploy_max, 0.26)
+        if st:
+            from account_guard import universe_fill_active
+
+            if universe_fill_active(st):
+                min_conf = min(min_conf, 0.52)
+                min_score = min(min_score, 48.0)
+                symbols_tick = max(symbols_tick, min(280, st.symbols_per_tick))
+                poll = max(5, min(poll, 8))
+                entry_gap = min(entry_gap, 4.0)
+                max_opens = max(max_opens, min(16, st.max_opens_per_tick))
+                deploy_base = max(deploy_base, 0.12)
+                deploy_max = max(deploy_max, min(0.32, st.margin_use_fraction * 0.45))
+        # Momentum wave mode: bias toward concurrent momentum runners and faster recycle.
+        elif st and getattr(st, "momentum_wave_mode", False):
+            min_conf = min(min_conf, 0.56)
+            min_score = min(min_score, 52.0)
+            symbols_tick = max(symbols_tick, min(220, st.symbols_per_tick))
+            poll = max(8, min(poll, 18))
+            entry_gap = min(entry_gap, 10.0)
+            max_opens = max(max_opens, min(8, st.max_opens_per_tick))
+            deploy_base = max(deploy_base, 0.16)
+            deploy_max = max(deploy_max, 0.30)
 
         return RuntimeKnobs(
             min_confidence=round(min_conf, 3),
@@ -421,7 +629,17 @@ class AutonomousGrowthEngine:
             margin_deploy_base_pct=round(deploy_base, 4),
             margin_deploy_max_pct=round(min(0.35, deploy_max), 4),
             max_opens_per_tick=max_opens,
-            harvest_eagerness=min(1.75, curve.harvest_eagerness * 1.25) if sp else curve.harvest_eagerness,
+            harvest_eagerness=(
+                (
+                    min(0.55, curve.harvest_eagerness * 0.72)
+                    if acm and curve.curve_phase in ("vertical", "climbing")
+                    else min(0.78, curve.harvest_eagerness * 0.88)
+                )
+                if getattr(self.settings, "stack_winners_mode", True)
+                else (
+                    min(1.75, curve.harvest_eagerness * 1.25) if sp else curve.harvest_eagerness
+                )
+            ),
             curve_verticality=curve.verticality,
             curve_phase=curve.curve_phase,
             preserve_capital=curve.preserve_capital,
@@ -437,6 +655,9 @@ class AutonomousGrowthEngine:
         if hour != self._last_report_hour:
             self._last_report_hour = hour
             log.info("\n%s", self.growth.format_growth_report(equity))
+            curve = self._last_curve
+            if curve is not None:
+                log.info("\n%s", self.pnl.format_report(curve, equity))
             curve = self._last_curve or self.update_curve(equity)
             metrics = self.growth.get_growth_metrics(equity)
             log.info("\n%s", self.pnl.format_report(curve, equity))
@@ -449,15 +670,28 @@ class AutonomousGrowthEngine:
                 f"{self.manifold.parameter_count_estimate:,}",
             )
 
-    def passes_signal_gate(self, decision, knobs: RuntimeKnobs) -> bool:
+    def passes_signal_gate(
+        self,
+        decision,
+        knobs: RuntimeKnobs,
+        *,
+        min_confidence: float | None = None,
+        min_signal_score: float | None = None,
+    ) -> bool:
         from strategy import Signal
 
         if decision is None or decision.signal == Signal.FLAT:
             return False
         conf = getattr(decision, "model_confidence", 0.0) or (decision.score / 100.0)
-        if conf < knobs.min_confidence:
+        min_c = knobs.min_confidence if min_confidence is None else min_confidence
+        min_s = knobs.min_signal_score if min_signal_score is None else min_signal_score
+        zone = getattr(decision, "confluence_zone", "") or ""
+        if zone == "llm" and self.settings is not None:
+            min_c = min(min_c, self.settings.llm_trading_min_confidence)
+            min_s = min(min_s, self.settings.llm_trading_min_score)
+        if conf < min_c:
             return False
-        if decision.score < knobs.min_signal_score:
+        if decision.score < min_s:
             return False
         # Extra fluid gate: signal must clear path reliability bar
         margin = abs(conf - 0.5) * 2
@@ -483,7 +717,7 @@ class AutonomousGrowthEngine:
                 f"poll~{sp.poll_seconds_base}s harvest@{sp.min_hold_seconds:.0f}s"
             )
         return (
-            f"CORE BRAIN: sole purpose ${d.target_capital_usd:,.0f} by {d.target_date_iso} — "
+            f"CORE BRAIN: sole purpose {d.sole_objective} — "
             f"no other goals | fluid manifold + ML + confluence | "
             f"up to {d.max_opens_per_tick} opens/cycle only if tied at top | margin from live free"
             f"{scalp}"

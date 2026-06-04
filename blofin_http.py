@@ -14,6 +14,9 @@ from urllib.parse import urlencode
 
 import requests
 
+import api_backoff
+from api_backoff import RateLimitPaused, parse_retry_after, register_429
+
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://openapi.blofin.com"
@@ -78,6 +81,9 @@ class BlofinHttp:
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
         }
+        if api_backoff.is_paused():
+            raise RateLimitPaused(api_backoff.seconds_left(), source=f"REST {method} {path}")
+
         url = self.base_url + path + query
         response = self.session.request(
             method.upper(),
@@ -86,8 +92,36 @@ class BlofinHttp:
             data=payload,
             timeout=self.timeout,
         )
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception:
+            body_text = response.text or ""
+            snippet = body_text[:220].replace("\n", " ")
+            is_rate_limit = (
+                response.status_code == 429
+                or "429" in snippet
+                or "1015" in body_text
+            )
+            if is_rate_limit:
+                retry = parse_retry_after(response.headers, response.status_code, body_text)
+                register_429(retry, source=f"REST {method} {path}")
+                raise RateLimitPaused(
+                    api_backoff.seconds_left(),
+                    source=f"REST {method} {path}",
+                )
+            raise RuntimeError(
+                f"Blofin API non-JSON response {response.status_code} "
+                f"body={snippet!r}"
+            )
         code = str(data.get("code", ""))
+        if response.status_code == 429:
+            body_text = response.text or ""
+            retry = parse_retry_after(response.headers, response.status_code, body_text)
+            register_429(retry, source=f"REST {method} {path}")
+            raise RateLimitPaused(
+                api_backoff.seconds_left(),
+                source=f"REST {method} {path}",
+            )
         if response.status_code >= 400 or code not in {"0", "200"}:
             detail = data.get("data")
             raise RuntimeError(
@@ -215,17 +249,51 @@ class BlofinHttp:
             raise RuntimeError(f"No ticker for {inst_id}")
         return rows[0]
 
-    def set_leverage(self, inst_id: str, leverage: int, position_side: str = "net") -> None:
-        self.request(
+    def get_margin_mode(self) -> dict[str, Any]:
+        data = self.request("GET", "/api/v1/account/margin-mode")
+        return data if isinstance(data, dict) else {}
+
+    def set_margin_mode(self, margin_mode: str) -> dict[str, Any]:
+        data = self.request(
             "POST",
-            "/api/v1/account/set-leverage",
-            body={
+            "/api/v1/account/set-margin-mode",
+            body={"marginMode": margin_mode},
+        )
+        return data if isinstance(data, dict) else {}
+
+    def get_leverage_info(
+        self,
+        inst_id: str,
+        *,
+        margin_mode: str = "cross",
+        position_side: str = "net",
+    ) -> dict[str, Any]:
+        data = self.request(
+            "GET",
+            "/api/v1/account/leverage-info",
+            params={
                 "instId": inst_id,
-                "leverage": str(leverage),
-                "marginMode": "isolated",
+                "marginMode": margin_mode,
                 "positionSide": position_side,
             },
         )
+        return data if isinstance(data, dict) else {}
+
+    def set_leverage(
+        self,
+        inst_id: str,
+        leverage: int,
+        position_side: str = "net",
+        *,
+        margin_mode: str = "cross",
+    ) -> None:
+        body: dict[str, Any] = {
+            "instId": inst_id,
+            "leverage": str(leverage),
+            "marginMode": margin_mode,
+            "positionSide": position_side,
+        }
+        self.request("POST", "/api/v1/account/set-leverage", body=body)
 
     def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
         result = self.request("POST", "/api/v1/trade/order", body=body)
@@ -249,6 +317,25 @@ class BlofinHttp:
                 "brokerId": broker_id,
             },
         )
+
+    def adjust_position_margin(
+        self,
+        inst_id: str,
+        *,
+        position_side: str = "net",
+        margin_mode: str = "isolated",
+        amount_usdt: float,
+        add: bool = True,
+    ) -> Any:
+        """Add or reduce isolated margin on an open position (pushes liquidation away)."""
+        body = {
+            "instId": inst_id,
+            "positionSide": position_side,
+            "marginMode": margin_mode,
+            "type": "1" if add else "2",
+            "amt": f"{max(0.01, float(amount_usdt)):.4f}",
+        }
+        return self.request("POST", "/api/v1/trade/position/margin-balance", body=body)
 
     def partial_close_position(
         self,
@@ -299,8 +386,10 @@ class BlofinHttp:
             return rows
         return {}
 
-    def get_pending_tpsl(self, inst_id: str | None = None) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {}
+    def get_pending_tpsl(
+        self, inst_id: str | None = None, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": str(min(100, max(1, limit)))}
         if inst_id:
             params["instId"] = inst_id
         rows = self.request("GET", "/api/v1/trade/orders-tpsl-pending", params=params) or []
@@ -328,3 +417,36 @@ class BlofinHttp:
         if isinstance(rows, dict):
             return rows
         raise RuntimeError(f"Order not found: {order_id}")
+
+    def get_fills_history(
+        self,
+        *,
+        inst_id: str | None = None,
+        order_id: str | None = None,
+        begin: int | None = None,
+        end: int | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": str(min(100, max(1, limit)))}
+        if inst_id:
+            params["instId"] = inst_id
+        if order_id:
+            params["orderId"] = order_id
+        if begin is not None:
+            params["begin"] = str(int(begin))
+        if end is not None:
+            params["end"] = str(int(end))
+        rows = self.request("GET", "/api/v1/trade/fills-history", params=params) or []
+        return rows if isinstance(rows, list) else []
+
+    def get_tpsl_history(
+        self,
+        *,
+        inst_id: str | None = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": str(min(100, max(1, limit)))}
+        if inst_id:
+            params["instId"] = inst_id
+        rows = self.request("GET", "/api/v1/trade/orders-tpsl-history", params=params) or []
+        return rows if isinstance(rows, list) else []

@@ -8,11 +8,14 @@ from dataclasses import dataclass
 
 from fee_engine import ensure_fee_overcoming
 from liquidation_guard import (
+    achievable_margin_rates,
     clamp_stop_take_pct,
     enforce_risk_reward,
     liquidation_distance_pct,
     margin_rate,
+    max_notional_for_margin_budget,
     max_safe_stop_pct,
+    open_stop_within_liq_room,
     size_for_min_margin_rate,
 )
 
@@ -64,8 +67,15 @@ class MarginAwareSizer:
         max_take_pct: float = 0.15,
         fee_coverage_multiple: float = 2.0,
         margin_use_fraction: float = 0.88,
-        min_margin_rate: float = 0.92,
+        min_margin_rate: float = 1.08,
+        target_margin_rate: float = 1.15,
+        max_effective_leverage: int = 32,
+        max_stop_liq_fraction: float = 0.26,
         min_rr: float = 1.35,
+        micro_equity_threshold: float = 10.0,
+        small_account_threshold: float = 50.0,
+        margin_top_up_enabled: bool = False,
+        skip_liq_room_check: bool = False,
     ) -> None:
         self.free_margin = max(0.0, free_margin)
         self.fee_taker = fee_taker
@@ -82,8 +92,17 @@ class MarginAwareSizer:
         self.max_take_pct = max_take_pct
         self.fee_coverage_multiple = fee_coverage_multiple
         self.margin_use_fraction = margin_use_fraction
-        self.min_margin_rate = max(0.5, min(1.0, min_margin_rate))
+        self.min_margin_rate = max(1.0, min(float(min_margin_rate), 1.35))
+        self.target_margin_rate = max(self.min_margin_rate, min(float(target_margin_rate), 1.40))
+        # Sizing uses mission leverage; margin_rate (not a lower lev cap) prevents liquidation.
+        self.max_effective_leverage = max(3, int(max_effective_leverage))
+        self._leverage_cap = max(self.max_leverage, self.max_effective_leverage)
+        self.max_stop_liq_fraction = max(0.08, min(0.45, float(max_stop_liq_fraction)))
         self.min_rr = max(1.0, min_rr)
+        self.micro_equity_threshold = float(micro_equity_threshold)
+        self.small_account_threshold = float(small_account_threshold)
+        self.margin_top_up_enabled = bool(margin_top_up_enabled)
+        self.skip_liq_room_check = bool(skip_liq_room_check)
 
     def _leverage_for_confidence(self) -> int:
         conf = self.model_confidence
@@ -110,7 +129,7 @@ class MarginAwareSizer:
                 lev = max(3, self.base_leverage // 2)
             lev = max(3, min(self.max_leverage, lev))
 
-        return lev
+        return max(3, min(lev, self.max_leverage))
 
     def plan_trade(
         self,
@@ -121,6 +140,7 @@ class MarginAwareSizer:
         min_size: float,
         *,
         margin_fraction: float | None = None,
+        equity: float = 0.0,
     ) -> TradePlan | None:
         if entry_price <= 0 or contract_size <= 0 or min_size <= 0:
             return None
@@ -179,12 +199,25 @@ class MarginAwareSizer:
                 )
                 return None
 
-        if margin_fraction is not None and margin_fraction > 0:
-            margin_budget = usable * min(margin_fraction, 0.92)
-        else:
-            margin_budget = usable * max(self.risk_fraction * 2.5, 0.18)
+        class _RateCtx:
+            min_margin_rate = self.min_margin_rate
+            target_margin_rate = self.target_margin_rate
+            micro_equity_threshold = self.micro_equity_threshold
+            small_account_threshold = self.small_account_threshold
+            margin_top_up_enabled = self.margin_top_up_enabled
 
-        target_margin = margin_budget * self.margin_use_fraction
+        min_mrate, tgt_mrate = achievable_margin_rates(_RateCtx(), equity)
+
+        micro_budget = equity > 0 and equity < self.micro_equity_threshold * 2.5
+        if margin_fraction is not None and margin_fraction > 0:
+            cap_frac = 0.88 if micro_budget else 0.42
+            margin_budget = usable * min(margin_fraction, cap_frac)
+        else:
+            margin_budget = usable * (0.75 if micro_budget else max(self.risk_fraction * 1.8, 0.12))
+
+        use_frac = 0.92 if micro_budget else min(self.margin_use_fraction, 0.72)
+        margin_budget = min(margin_budget, usable * use_frac)
+        target_margin = margin_budget * (0.95 if micro_budget else use_frac)
 
         sized = size_for_min_margin_rate(
             entry_price=entry_price,
@@ -192,21 +225,34 @@ class MarginAwareSizer:
             min_size=min_size,
             target_margin_usdt=target_margin,
             leverage=lev,
-            min_margin_rate=self.min_margin_rate,
+            min_margin_rate=tgt_mrate,
             margin_budget_usdt=margin_budget,
-            fixed_leverage=strict_3r,
+            fixed_leverage=False,
         )
-        if sized is None and strict_3r:
+        if sized is None:
+            sized = size_for_min_margin_rate(
+                entry_price=entry_price,
+                contract_size=contract_size,
+                min_size=min_size,
+                target_margin_usdt=target_margin,
+                leverage=lev,
+                min_margin_rate=tgt_mrate,
+                margin_budget_usdt=margin_budget,
+                fixed_leverage=strict_3r,
+            )
+        if sized is None:
             log.info(
-                "skip: cannot fit min lot at %dx within margin $%.3f (use cheaper symbol)",
+                "sizing fallback at %dx within margin $%.3f (margin-rate fit failed, trying notional cap)",
                 lev,
                 margin_budget,
             )
-            return None
         if sized:
             contracts, lev = sized
         else:
-            raw = (target_margin * lev) / (entry_price * contract_size)
+            max_notional = max_notional_for_margin_budget(
+                target_margin, lev, tgt_mrate
+            )
+            raw = max_notional / (entry_price * contract_size)
             contracts = max(min_size, math.floor(raw / min_size) * min_size)
 
         margin = margin_required_usdt(entry_price, contracts, contract_size, lev)
@@ -222,17 +268,30 @@ class MarginAwareSizer:
         if margin > usable or contracts < min_size:
             return None
 
-        min_mrate = self.min_margin_rate * (0.72 if strict_3r else 0.85)
+        while mrate < min_mrate and contracts >= min_size * 2:
+            contracts -= min_size
+            margin = margin_required_usdt(entry_price, contracts, contract_size, lev)
+            notional = contracts * contract_size * entry_price
+            mrate = margin_rate(notional, margin, lev)
         if mrate < min_mrate:
-            log.warning(
-                "skip %dx: margin rate %.0f%% < min %.0f%% (margin=$%.3f notional=$%.3f)",
-                lev,
-                mrate * 100,
-                self.min_margin_rate * 100,
-                margin,
-                notional,
-            )
-            return None
+            min_margin = min_size * contract_size * entry_price / lev
+            if min_margin <= margin_budget + 0.001 and min_margin <= usable:
+                contracts = min_size
+                margin = min_margin
+                notional = contracts * contract_size * entry_price
+                mrate = margin_rate(notional, margin, lev)
+            if mrate < min_mrate:
+                log.warning(
+                    "skip %dx: margin rate %.0f%% < floor %.0f%% "
+                    "(free=$%.2f budget=$%.2f min_lot_margin=$%.3f — need cheaper symbol or more balance)",
+                    lev,
+                    mrate * 100,
+                    min_mrate * 100,
+                    usable,
+                    margin_budget,
+                    min_margin,
+                )
+                return None
 
         adjusted_stop, adjusted_take, fee_info = ensure_fee_overcoming(
             entry_price=entry_price,
@@ -265,6 +324,40 @@ class MarginAwareSizer:
             )
         if not fee_info["fee_covered"]:
             return None
+
+        max_loss_usd = notional * adjusted_stop
+        if equity > 0 and max_loss_usd > equity * 0.04:
+            while contracts >= min_size * 2 and max_loss_usd > equity * 0.04:
+                contracts -= min_size
+                margin = margin_required_usdt(entry_price, contracts, contract_size, lev)
+                notional = contracts * contract_size * entry_price
+                mrate = margin_rate(notional, margin, lev)
+                max_loss_usd = notional * adjusted_stop
+            if max_loss_usd > equity * 0.04 or mrate < min_mrate:
+                log.info(
+                    "skip: SL risk $%.2f > 4%% equity ($%.2f) at %dx",
+                    max_loss_usd,
+                    equity * 0.04,
+                    lev,
+                )
+                return None
+
+        if not self.skip_liq_room_check:
+            liq_frac = self.max_stop_liq_fraction
+            if strict_3r:
+                liq_dist = liquidation_distance_pct(lev)
+                # Fast 3R stop (~1%) must fit inside entry→liq cushion, not only 26% of that span.
+                liq_frac = max(liq_frac, min(0.45, (adjusted_stop / max(liq_dist, 1e-9)) * 1.05))
+            if not open_stop_within_liq_room(
+                adjusted_stop, lev, max_fraction_of_liq_dist=liq_frac
+            ):
+                log.info(
+                    "skip %dx: stop %.2f%% too tight vs liq room %.2f%% (raise margin or lower lev)",
+                    lev,
+                    adjusted_stop * 100,
+                    liquidation_distance_pct(lev) * 100,
+                )
+                return None
 
         final_margin = margin_required_usdt(entry_price, contracts, contract_size, lev)
         log.info(

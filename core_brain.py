@@ -1,9 +1,10 @@
 """
 Core brain — single local intelligence for the entire bot.
 
-Mission ($95M by 2027), throughput (3–12 quality 3R/hr), leverage (50x),
-open-book health (3R SL/TP repair + smart upgrade), and entry policy — one
-evaluate() per tick. No paid APIs; runs entirely on your machine.
+Mission (mission_config), throughput (3–12 quality 3R/hr), leverage (50x),
+open-book health (3R SL/TP repair + smart upgrade), entry policy, optional
+Markov regime filter (Hamilton-style latent states), and local swarm votes — one
+evaluate() per tick. No paid LLM APIs; runs entirely on your machine.
 
 Ancillary modules (mission_brain, throughput_brain, position_brain) are thin
 wrappers for compatibility; wire everything through AutonomousGrowthEngine.core.
@@ -18,11 +19,22 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from growth_optimizer import GrowthMetrics
+from markov_regime import MarkovSnapshot
 from mission_brain import MissionBrain, SOLE_OBJECTIVE
 from leverage_intel import leverage_needs_reentry
-from mission_config import TARGET_CAPITAL_USD, TARGET_DATE_ISO
+from liquidation_guard import mission_safe_leverage
+from mission_config import TARGET_DAILY_GROWTH_PCT, progress_toward_daily_goal_pct
 from pnl_curve import PnlCurveState
 from position_registry import PositionRegistry
+from hourly_3r import (
+    hourly_3r_active,
+    is_entry_starved,
+    is_opens_starved,
+    target_min_opens_per_hour,
+    target_wins_per_hour,
+)
+import api_backoff
+from scalp_optimizer import get_active_tuning
 
 if TYPE_CHECKING:
     from autonomous_engine import AutonomousGrowthEngine
@@ -82,14 +94,8 @@ class CoreBrain:
     One brain to rule pacing, mission, book health, and entry quality.
     """
 
-    def __init__(
-        self,
-        target_capital: float = TARGET_CAPITAL_USD,
-        target_date: str | None = None,
-    ) -> None:
-        self.target_capital = target_capital
-        self.target_date_iso = target_date or TARGET_DATE_ISO
-        self._mission = MissionBrain(target_capital, target_date)
+    def __init__(self) -> None:
+        self._mission = MissionBrain()
         self._last: CoreDirective | None = None
         self._last_book_pass = 0.0
 
@@ -110,6 +116,7 @@ class CoreBrain:
         open_count: int,
         low_leverage_positions: int = 0,
         unrestricted: bool = False,
+        markov: MarkovSnapshot | None = None,
     ) -> CoreDirective:
         path_rel = fluid.path_reliability if fluid else 0.5
         survival = fluid.survival if fluid else 0.5
@@ -132,33 +139,90 @@ class CoreBrain:
             mission_focus = ms.mission_focus
             behind = ms.behind_schedule
 
+        from account_guard import effective_hourly_tph_cap, universe_fill_active
+
+        fill_mode = universe_fill_active(settings)
         tmin = settings.optimizer_target_min_tph
-        tmax = settings.optimizer_target_max_tph
-        starved = opens_last_hour < tmin
-        overheating = opens_last_hour > tmax
+        tmax = effective_hourly_tph_cap(settings)
+        tuning = get_active_tuning()
+        if fill_mode:
+            starved = free_margin > settings.margin_reserve_usdt * 2
+            overheating = False
+        elif hourly_3r_active(settings):
+            w_need = target_wins_per_hour(settings)
+            o_need = target_min_opens_per_hour(settings)
+            starved = tuning.wins_last_hour < w_need or opens_last_hour < o_need
+            overheating = False
+        else:
+            starved = opens_last_hour < tmin
+            overheating = opens_last_hour > tmax
+
+        from tpsl_pacing import use_tpsl_only_pacing
 
         gap = float(settings.scalp_entry_gap_seconds)
-        if starved:
+        if use_tpsl_only_pacing(settings):
+            gap = float(getattr(settings, "tpsl_pace_base_gap_seconds", 2.0))
+        elif starved:
             gap = max(6.0, gap - 8.0)
         elif overheating:
             gap = min(50.0, gap + 10.0)
 
-        target_lev = int(settings.scalp_leverage_max)
+        target_lev = mission_safe_leverage(
+            settings, int(settings.scalp_leverage_max)
+        )
         allow_fallback = starved or not settings.winner_apex_preferred
-        if behind and not starved:
+        wins_starved = hourly_3r_active(settings) and tuning.wins_last_hour < target_wins_per_hour(
+            settings
+        )
+        if behind and not starved and not wins_starved:
             allow_fallback = False
             min_conv = max(min_conv, settings.winner_elite_score - 0.06)
+        elif wins_starved or is_opens_starved(settings, tuning):
+            min_conv = min(min_conv, 0.52)
+            allow_fallback = True
+
+        if markov is not None:
+            if markov.state == "stress":
+                min_conv = min(0.92, min_conv + 0.06)
+                gap = min(55.0, gap + 8.0)
+                risk_mult *= 0.88
+            elif markov.state == "trend" and starved:
+                min_conv = max(0.48, min_conv - 0.02)
+                gap = max(6.0, gap - 2.0)
+            if markov.transition_risk >= 0.12:
+                min_conv = min(0.94, min_conv + markov.transition_risk * 0.12)
+            stress_pause = markov.probs[2] > 0.42
+            if equity < settings.small_account_threshold:
+                stress_pause = markov.probs[2] > 0.34
+            if stress_pause and not unrestricted and not fill_mode and not (
+                hourly_3r_active(settings)
+                and (is_entry_starved(settings) or is_opens_starved(settings))
+            ):
+                entry_ok = False
+                mission_dir = f"Markov stress {markov.probs[2]:.0%} — entries paused"
 
         upgrade_closes = 0
-        if settings.leverage_auto_upgrade and open_count > 0 and low_leverage_positions > 0:
+        if (
+            settings.leverage_auto_upgrade
+            and not getattr(settings, "stack_winners_mode", True)
+            and open_count > 0
+            and low_leverage_positions > 0
+        ):
             if starved:
-                upgrade_closes = 2
-            elif low_leverage_positions >= 2:
+                upgrade_closes = 1
+            elif low_leverage_positions >= 3:
                 upgrade_closes = 1
 
         parts: list[str] = []
         if starved:
-            parts.append(f"STARVED {opens_last_hour}/{tmin} tph gap={gap:.0f}s")
+            if hourly_3r_active(settings):
+                w_need = target_wins_per_hour(settings)
+                o_need = target_min_opens_per_hour(settings)
+                parts.append(
+                    f"STARVED wins={tuning.wins_last_hour}/{w_need} opens={opens_last_hour}/{o_need} gap={gap:.0f}s"
+                )
+            else:
+                parts.append(f"STARVED {opens_last_hour}/{tmin} tph gap={gap:.0f}s")
         elif overheating:
             parts.append(f"HOT {opens_last_hour}>{tmax}/hr")
         else:
@@ -166,6 +230,8 @@ class CoreBrain:
         parts.append(f"{target_lev}x 3R")
         if low_leverage_positions:
             parts.append(f"{low_leverage_positions} under-lev")
+        if markov is not None:
+            parts.append(f"mkov={markov.state}")
         parts.append(mission_dir.split("—")[-1].strip()[:40])
 
         directive = CoreDirective(
@@ -184,7 +250,8 @@ class CoreBrain:
             allow_elite_fallback=allow_fallback,
             maintain_open_book=open_count > 0,
             max_upgrade_closes=upgrade_closes,
-            force_max_leverage_on_open=bool(settings.scalp_3r_mode),
+            force_max_leverage_on_open=bool(settings.scalp_3r_mode)
+            and settings.max_effective_leverage >= settings.scalp_leverage_max - 1,
             summary=" | ".join(parts),
         )
         self._last = directive
@@ -220,16 +287,17 @@ class CoreBrain:
         d = self._last
         if d is None:
             return "CORE BRAIN | not yet evaluated"
-        gap_pct = metrics.projected_capital_at_target / self.target_capital if metrics else 0
-        progress = (
-            100.0 * math.log(max(equity, 1e-9)) / math.log(self.target_capital)
-            if equity > 0 and self.target_capital > 1
+        day_start = (
+            metrics.projected_capital_at_target / (1 + TARGET_DAILY_GROWTH_PCT / 100)
+            if metrics and metrics.projected_capital_at_target > 0
             else 0.0
         )
+        today_pct = (equity / day_start - 1.0) * 100.0 if day_start > 0 and equity > 0 else 0.0
+        progress = progress_toward_daily_goal_pct(today_pct)
         return (
             f"CORE BRAIN | {d.sole_objective}\n"
-            f"  equity=${equity:,.2f} progress={progress:.4f}% | "
-            f"need {metrics.required_daily_return_pct:.2f}%/day | {metrics.days_remaining}d\n"
+            f"  equity=${equity:,.2f} today={today_pct:+.2f}% ({progress:.1f}% of +{TARGET_DAILY_GROWTH_PCT:.0f}% goal) | "
+            f"EOD target=${metrics.projected_capital_at_target:,.2f}\n"
             f"  {d.summary} | focus={d.mission_focus:.0%}\n"
             f"  >> {d.mission_directive}"
         )
@@ -241,30 +309,46 @@ class CoreBrain:
         registry: PositionRegistry,
         *,
         max_closes: int | None = None,
+        tracker=None,
     ) -> BookReport:
         """Maintain every open trade: 50x setting + 3R SL/TP; upgrade under-levered slots."""
         d = self._last
-        mission_lev = int(settings.scalp_leverage_max)
         starved = d.starved if d else False
         max_closes = max_closes if max_closes is not None else (d.max_upgrade_closes if d else 1)
 
         positions = ex.fetch_all_positions()
+        if api_backoff.is_paused():
+            n = len(positions)
+            return BookReport(
+                open_count=n,
+                sltp_repaired=0,
+                leverage_set=0,
+                upgraded_closed=0,
+                healthy=n,
+                under_levered=0,
+            )
         sltp_n = lev_n = closed = healthy = under = 0
         closes_left = max_closes
 
         for symbol, pos in list(positions.items()):
-            symbol_target = ex.symbol_leverage_cap(symbol)
-            exchange_max = ex.leverage_intel.exchange_max(symbol) or symbol_target
             side = pos.get("side")
             contracts = float(pos.get("contracts") or 0)
             entry = float(pos.get("entry_price") or 0)
             if not side or contracts <= 0 or entry <= 0:
                 continue
 
+            trade_sym = str(pos.get("symbol") or symbol).split("#", 1)[0]
+            meta = registry.get(trade_sym)
+            exchange_cap = ex.symbol_leverage_cap(trade_sym)
+            registry_lev = int((meta or {}).get("leverage") or 0)
+            symbol_target = mission_safe_leverage(
+                settings, exchange_cap, planned=registry_lev or None
+            )
+            exchange_max = ex.leverage_intel.exchange_max(trade_sym) or exchange_cap
+
             eff_lev = int(pos.get("effective_leverage") or pos.get("leverage") or 0)
             inst_lev = int(pos.get("leverage") or 0)
-            age = _position_age(registry, symbol)
-            meta = registry.get(symbol)
+            age = _position_age(registry, trade_sym)
             take_pct = float(
                 pos.get("take_pct")
                 or (meta or {}).get("take_pct")
@@ -282,22 +366,35 @@ class CoreBrain:
 
             try:
                 ok, rep_stop, rep_take = ex.repair_position_tpsl(
-                    symbol,
+                    trade_sym,
                     side,
                     contracts,
                     take_pct=take_pct,
                     configured_leverage=symbol_target,
                     dry_run=settings.dry_run,
-                    cancel_existing=True,
+                    cancel_existing=False,
+                    registry_meta=meta,
                 )
                 if ok and rep_stop > 0 and rep_take > 0:
-                    registry.update_tpsl(symbol, stop_pct=rep_stop, take_pct=rep_take)
+                    sl_px, tp_px = 0.0, 0.0
+                    prices = getattr(ex, "last_repaired_tpsl_prices", None)
+                    if prices and len(prices) >= 2:
+                        sl_px, tp_px = float(prices[0]), float(prices[1])
+                    registry.update_tpsl(
+                        trade_sym,
+                        stop_pct=rep_stop,
+                        take_pct=rep_take,
+                        sl_price=sl_px,
+                        tp_price=tp_px,
+                    )
                     if meta:
-                        registry.update_leverage(symbol, leverage=applied or symbol_target)
+                        registry.update_leverage(
+                            trade_sym, leverage=applied or symbol_target
+                        )
                     sltp_n += 1
                     rr = rep_take / max(rep_stop, 1e-9)
                     log.info(
-                        "CORE %s %s | %dx cap 3R rr=%.2f:1 stop=%.2f%% take=%.2f%% inst=%dx eff=%dx",
+                        "CORE %s %s | %dx cap 3R rr=%.2f:1 stop=%.2f%% take=%.2f%% inst=%dx eff=%dx | exchange TP/SL live",
                         symbol.split("/")[0],
                         side,
                         symbol_target,
@@ -307,10 +404,16 @@ class CoreBrain:
                         inst_lev,
                         eff_lev,
                     )
+                else:
+                    log.warning(
+                        "CORE %s %s — NO exchange TP/SL (repair failed; steward will retry)",
+                        symbol.split("/")[0],
+                        side,
+                    )
             except Exception:
                 log.exception("core book SL/TP %s", symbol)
 
-            pos = ex.fetch_all_positions().get(symbol) or pos
+            pos = ex._lookup_open_position(trade_sym, side) or pos
             eff_lev = int(pos.get("effective_leverage") or eff_lev)
             inst_lev = int(pos.get("leverage") or inst_lev)
 
@@ -320,18 +423,55 @@ class CoreBrain:
 
             under += 1
             needs_close, reason = leverage_needs_reentry(
-                pos, target_lev=mission_lev, exchange_max=exchange_max
+                pos, target_lev=symbol_target, exchange_max=exchange_max
             )
             if not needs_close:
                 continue
             if age < 90 or closes_left <= 0 or not settings.leverage_auto_upgrade:
                 continue
+            if getattr(settings, "stack_winners_mode", True):
+                continue
             if not starved and eff_lev >= symbol_target // 2 and inst_lev >= symbol_target - 2:
+                continue
+            mark_px = float(pos.get("mark_price") or entry)
+            if ex.stream:
+                spx = ex.stream.get_last_price(symbol)
+                if spx and spx > 0:
+                    mark_px = float(spx)
+            side_l = str(pos.get("side") or "long").lower()
+            gross = (
+                (mark_px - entry) / entry
+                if side_l == "long"
+                else (entry - mark_px) / entry
+            )
+            if gross > 0.003:
                 continue
 
             try:
+                meta = registry.get(symbol) or {}
+                side_s = str(pos.get("side") or meta.get("side") or "long")
+                stop_pct_m = float(meta.get("stop_pct") or take_pct * 0.35)
+                take_pct_m = float(meta.get("take_pct") or take_pct)
+                close_px = float(pos.get("mark_price") or entry)
+                if ex.stream:
+                    px = ex.stream.get_last_price(symbol)
+                    if px and px > 0:
+                        close_px = float(px)
                 ex.close_position(symbol, pos, settings.dry_run)
                 registry.remove(symbol)
+                if not settings.dry_run:
+                    from ml.outcomes import notify_trade_close
+
+                    notify_trade_close(
+                        tracker,
+                        symbol,
+                        side_s,
+                        entry,
+                        close_px,
+                        stop_pct=stop_pct_m,
+                        take_pct=take_pct_m,
+                        reason=f"upgrade_close:{reason}",
+                    )
                 closed += 1
                 closes_left -= 1
                 log.warning(
@@ -367,7 +507,7 @@ class CoreBrain:
             under_levered=under,
         )
 
-    def should_run_book_pass(self, open_count: int, *, interval_sec: float = 4.0) -> bool:
+    def should_run_book_pass(self, open_count: int, *, interval_sec: float = 20.0) -> bool:
         if open_count <= 0:
             return False
         return (time.time() - self._last_book_pass) >= interval_sec

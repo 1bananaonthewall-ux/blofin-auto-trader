@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "source": "Moon Dev open-agent patterns (moon-dev-ai-agents) + @de1lymoon",
+  "references": [
+    "https://x.com/de1lymoon/status/2059382168892145813",
+    "playbooks/markov_mit.json",
+    "https://github.com/yolojewjitsu/moon-dev-ai-agents"
+  ],
+  "doctrines": [
+    {
+      "id": "swarm_consensus",
+      "title": "6-agent majority vote",
+      "summary": "Multiple specialized agents vote Buy/Sell/Flat; trade only on strong majority.",
+      "min_majority": 0.67,
+      "min_votes": 4
+    },
+    {
+      "id": "rbi_backtest_first",
+      "title": "Research before risk",
+      "summary": "Ideas from video/text should be backtested; live bot uses only proven gates.",
+      "live_requires_winner_tier": "elite"
+    },
+    {
+      "id": "risk_agent",
+      "title": "Risk agent veto",
+      "summary": "Block when opposition dominates or funding fights the trade.",
+      "max_opposition_ratio": 0.45,
+      "funding_veto": true
+    },
+    {
+      "id": "strategy_last_say",
+      "title": "Strategy agent",
+      "summary": "Confluence + 3R R:R must pass before swarm can affirm.",
+      "min_rr": 2.8,
+      "min_confluence": 0.58
+    },
+    {
+      "id": "dual_mode",
+      "title": "Fast vs swarm quality",
+      "summary": "When starved, slightly lower consensus; when hot, raise bar.",
+      "starved_consensus": 0.58,
+      "normal_consensus": 0.67,
+      "hot_consensus": 0.75
+    },
+    {
+      "id": "volume_early",
+      "title": "Volume agent",
+      "summary": "Prefer symbols with real volume spike vs dead book.",
+      "min_volume_ratio": 0.85
+    }
+  ]
+}

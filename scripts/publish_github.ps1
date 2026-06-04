@@ -20,7 +20,7 @@ $exists = $false
 try { & $Gh repo view "$user/$repoName" 2>$null | Out-Null; $exists = ($LASTEXITCODE -eq 0) } catch {}
 
 if (-not $exists) {
-    & $Gh repo create $repoName --private --source=. --remote=origin --description "Blofin 3R scalper — core brain, hourly maintain" --push
+    & $Gh repo create $repoName --private --source=. --remote=origin --description "God Bot - Blofin 3R scalper, dashboard, Cursor agent setup" --push
 } else {
     git remote remove origin 2>$null
     git remote add origin "https://github.com/$user/$repoName.git"

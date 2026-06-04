@@ -7,12 +7,12 @@ description: >-
 ---
 # Blofin hourly maintenance (Cursor agent)
 
-Run this checklist on the machine with API access (`C:\Users\mknig\blofin-auto-trader`). Use shell + read tools; do not change steward harvest logic or commit unless the user asks.
+Run this checklist on the machine with API access (project root = God Bot repo clone). Use shell + read tools; do not change steward harvest logic or commit unless the user asks.
 
 ## 1. Snapshot
 
 ```powershell
-cd C:\Users\mknig\blofin-auto-trader
+cd <PROJECT_ROOT>
 python scripts\hourly_health_report.py
 ```
 

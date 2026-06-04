@@ -46,8 +46,15 @@ _RELOAD_ORDER = (
     "symbol_side_guard",
     "scan_orchestrator",
     "scalp_optimizer",
+    "optimizer_autocode",
+    "optimizer_overrides",
     "margin_engine",
     "liquidation_guard",
+    "tpsl_guard",
+    "blofin_http",
+    "exchange_client",
+    "position_steward",
+    "position_registry",
     "fee_engine",
     "risk",
     "position_rotator",
@@ -61,6 +68,9 @@ _RELOAD_ORDER = (
     "growth_optimizer",
     "mission_brain",
     "core_brain",
+    "swarm_brain",
+    "playbook_loader",
+    "markov_regime",
     "fluid_manifold",
     "pnl_curve",
     "drawdown_guard",
@@ -79,6 +89,7 @@ class RuntimeCtx:
     optimizer: Any
     ml: Any
     healer: Any
+    ex: Any | None = None
 
 
 class LiveReloader:
@@ -293,6 +304,23 @@ def _apply_runtime(ctx: RuntimeCtx) -> None:
     ctx.optimizer.settings = s
     if ctx.ml_trainer is not None:
         ctx.ml_trainer.settings = s
+    # Steward thread holds a BlofinExchange instance; hot-swap so TP/SL repair code updates apply.
+    try:
+        from exchange_client import BlofinExchange
+
+        old_ex = ctx.steward.ex
+        new_ex = BlofinExchange(s)
+        new_ex.markets = getattr(old_ex, "markets", {}) or {}
+        new_ex.stream = getattr(old_ex, "stream", None)
+        new_ex._hedge_mode = getattr(old_ex, "_hedge_mode", new_ex._hedge_mode)
+        new_ex._cached_positions = dict(getattr(old_ex, "_cached_positions", {}) or {})
+        new_ex._cached_equity = float(getattr(old_ex, "_cached_equity", 0) or 0)
+        new_ex._cached_free = float(getattr(old_ex, "_cached_free", 0) or 0)
+        ctx.steward.ex = new_ex
+        ctx.ex = new_ex
+        log.warning("live update: exchange client hot-swapped (TP/SL repair)")
+    except Exception:
+        log.exception("live update: steward exchange hot-swap failed — restart bot for TP/SL fix")
 
 
 def create_reloader(settings: Any) -> LiveReloader | None:

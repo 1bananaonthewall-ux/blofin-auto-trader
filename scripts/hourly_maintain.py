@@ -139,6 +139,14 @@ def main() -> int:
     }
     _log_line(state_dir, record)
 
+    try:
+        from local_cortex import train
+
+        train(state_dir)
+        print("cortex: retrained")
+    except Exception as exc:
+        print("cortex: skip", exc)
+
     stamp = state_dir / "last_cursor_hourly.txt"
     stamp.write_text(str(time.time()), encoding="utf-8")
     due = ROOT / ".cursor" / "HOURLY_DUE"

@@ -91,7 +91,9 @@ class ScanOrchestrator:
         depth = self.compute_depth(universe_n, knobs, health, open_count=open_count)
         held_n = len(held)
         budget = depth + held_n
-        momentum_slots = max(0, int((budget - held_n) * 0.72))
+        prefer_runners = "ACCOUNT CURVE" in (getattr(knobs, "mission_directive", "") or "")
+        mom_frac = 0.84 if prefer_runners else 0.72
+        momentum_slots = max(0, int((budget - held_n) * mom_frac))
         rotation_slots = max(0, budget - held_n - momentum_slots)
 
         fresh = bool(health and health.get("ticker_age_sec", 99) < 16)
