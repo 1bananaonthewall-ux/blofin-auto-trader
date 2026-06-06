@@ -12,6 +12,8 @@ state/*
 models/*.gguf
 models/*.gguf.part
 *.gguf.part
+tools/llama-cpp-cpu/
+tools/*.zip
 treasury/wallets.json
 treasury/faucets.json
 treasury/acquisition.json
