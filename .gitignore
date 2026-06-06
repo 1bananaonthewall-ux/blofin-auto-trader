@@ -3,7 +3,6 @@
 !.env.example
 .venv/
 .cursor/HOURLY_DUE
-.cursor/AGENT_5M_DUE
 __pycache__/
 *.pyc
 logs/*

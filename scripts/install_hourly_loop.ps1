@@ -43,10 +43,6 @@ Automation installed. You no longer need to prompt Cursor every hour for:
 Cursor agent review still runs when you open the IDE if hourly is due
 (.cursor/hooks/hourly_session_reminder.py + .cursor/HOURLY_DUE).
 
-5-minute agent maintain (vertical curve / tph / ML):
-  powershell -File scripts\install_cursor_agent_5m_loop.ps1
-  IDE wake loop: scripts\cursor_agent_5m_loop.ps1
-
 Optional cloud agent:  powershell -File scripts\setup_cursor_automation.ps1
 
 "@ -ForegroundColor Yellow

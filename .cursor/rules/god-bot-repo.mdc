@@ -14,6 +14,5 @@ This repo is the **God Bot** Blofin scalper. On first session or setup requests:
 4. Start with `BLOFIN_MODE=demo` unless the user explicitly wants live.
 5. Only one `bot.py` — use `scripts\stack_control.ps1 -Action restart-fresh` if duplicated or stale.
 6. If `.cursor/HOURLY_DUE` exists, run `.cursor/skills/blofin-hourly/SKILL.md` first.
-7. If `.cursor/AGENT_5M_DUE` exists (and hourly is not due), run `.cursor/skills/blofin-5m/SKILL.md`.
 
 Default stack: `God Bot.ps1 -Action ensure` (bot + dashboard :5050).
