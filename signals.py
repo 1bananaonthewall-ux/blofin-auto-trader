@@ -12,7 +12,7 @@ from scalp_profile import profile_for
 from ta_confluence import confluence_to_decision, run_all_analyses
 
 from pick_engine import MLContext, evaluate_pick_for_symbol
-from winner_gate import evaluate_winner
+from winner_gate import WinnerVerdict, evaluate_winner
 from llm_policy import decide_with_llm
 from hourly_3r import hourly_3r_active, is_entry_starved, is_opens_starved
 
@@ -220,10 +220,14 @@ def analyze_symbol(
     decision = confluence_to_decision(cf)
     conf = decision.model_confidence
     used_llm = False
-    if settings.llm_trading_enabled and not hourly_3r_active(settings):
-        pre_conf = max(0.40, settings.llm_trading_min_confidence - 0.10)
-        pre_score = max(40.0, settings.llm_trading_min_score - 10.0)
-        if conf >= pre_conf and decision.score >= pre_score:
+    llm_only = bool(getattr(settings, "llm_only_trading", False))
+    if settings.llm_trading_enabled and (llm_only or not hourly_3r_active(settings)):
+        pre_conf = 0.0 if llm_only else max(0.40, settings.llm_trading_min_confidence - 0.10)
+        pre_score = 0.0 if llm_only else max(40.0, settings.llm_trading_min_score - 10.0)
+        fail_open = False if llm_only else settings.llm_trading_fail_open
+        strict = True if llm_only else settings.llm_trading_strict
+        should_call = llm_only or (conf >= pre_conf and decision.score >= pre_score)
+        if should_call:
             llm_dec = decide_with_llm(
                 symbol=symbol,
                 close=decision.close,
@@ -237,10 +241,10 @@ def analyze_symbol(
                 min_confidence=settings.llm_trading_min_confidence,
                 max_tokens=settings.llm_trading_max_tokens,
                 temperature=settings.llm_trading_temperature,
-                fail_open=settings.llm_trading_fail_open,
+                fail_open=fail_open,
                 use_cortex=settings.llm_trading_use_cortex,
-                strict=settings.llm_trading_strict,
-                respect_markov=settings.llm_trading_respect_markov,
+                strict=strict,
+                respect_markov=False if llm_only else settings.llm_trading_respect_markov,
                 equity=equity,
                 state_dir=settings.state_dir,
                 cache_sec=settings.llm_policy_cache_sec,
@@ -250,15 +254,21 @@ def analyze_symbol(
                 conf = decision.model_confidence
                 used_llm = True
                 log.info(
-                    "LLM POLICY %s %s conf=%.2f score=%.0f zone=%s",
+                    "LLM POLICY %s %s conf=%.2f score=%.0f zone=%s%s",
                     symbol,
                     decision.signal.value,
                     conf,
                     decision.score,
                     getattr(decision, "confluence_zone", ""),
+                    " (llm_only)" if llm_only else "",
                 )
-        elif not settings.llm_trading_fail_open:
+        elif llm_only or not fail_open:
             return None
+
+    if llm_only and not used_llm:
+        return None
+    if llm_only and decision.signal == Signal.FLAT:
+        return None
 
     if used_llm:
         post_conf_gate = settings.llm_trading_min_confidence
@@ -398,19 +408,26 @@ def analyze_symbol(
     decision.leveraged_rr = tp / max(sp, 0.001) * estimated_lev
     decision.funding_rate = funding
 
-    verdict = evaluate_winner(
-        decision,
-        cf,
-        settings,
-        symbol=symbol,
-        ml_decision=ml_decision,
-        ml_ready=ml_ready,
-        ml_ctx=ml_ctx,
-    )
-    if not verdict.ok:
-        log.info("WINNER skip %s: %s", symbol, verdict.reason)
-        return None
-    if getattr(settings, "runner_require_for_entry", False) and not cf_runner:
+    if llm_only and used_llm:
+        verdict = WinnerVerdict(True, "apex", max(0.9, conf), "llm_only_brain")
+    else:
+        verdict = evaluate_winner(
+            decision,
+            cf,
+            settings,
+            symbol=symbol,
+            ml_decision=ml_decision,
+            ml_ready=ml_ready,
+            ml_ctx=ml_ctx,
+        )
+        if not verdict.ok:
+            log.info("WINNER skip %s: %s", symbol, verdict.reason)
+            return None
+    if (
+        not llm_only
+        and getattr(settings, "runner_require_for_entry", False)
+        and not cf_runner
+    ):
         log.info(
             "RUNNER skip %s: runner-only mode (run_score=%.2f)",
             symbol,
@@ -420,18 +437,23 @@ def analyze_symbol(
     decision.winner_tier = verdict.tier
     decision.winner_score = verdict.score
 
-    pick = evaluate_pick_for_symbol(
-        symbol,
-        decision,
-        cf,
-        settings,
-        ml_ctx=ml_ctx,
-        winner_score=verdict.score,
-        winner_tier=verdict.tier,
-    )
-    if not pick.ok:
-        log.info("PICK skip %s: %s", symbol, pick.reason)
-        return None
+    if llm_only and used_llm:
+        from pick_engine import PickVerdict
+
+        pick = PickVerdict(True, verdict.score, "llm_only_brain")
+    else:
+        pick = evaluate_pick_for_symbol(
+            symbol,
+            decision,
+            cf,
+            settings,
+            ml_ctx=ml_ctx,
+            winner_score=verdict.score,
+            winner_tier=verdict.tier,
+        )
+        if not pick.ok:
+            log.info("PICK skip %s: %s", symbol, pick.reason)
+            return None
     decision.winner_score = max(verdict.score, pick.score)
     decision.pick_score = pick.score
     decision.fast_win_score = pick.fast_win

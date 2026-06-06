@@ -1238,11 +1238,29 @@ def main() -> None:
 
     if settings.llm_trading_enabled:
         try:
-            from local_llm import resolve_provider, status_line, warmup_provider
+            from local_llm import gguf_path, resolve_provider, status_line, warmup_provider
 
+            provider = resolve_provider()
+            if getattr(settings, "llm_only_trading", False):
+                log.warning(
+                    "LLM-ONLY TRADING: 7B GGUF is the sole entry brain — "
+                    "no winner/ML/pick gate after policy (steward/TP/SL unchanged)"
+                )
+                if provider == "none":
+                    log.error(
+                        "LLM_ONLY_TRADING=true but no GGUF loaded — "
+                        "run scripts\\enable_llm_only_7b.ps1 then restart-fresh"
+                    )
+                else:
+                    g = gguf_path()
+                    log.warning(
+                        "LLM-ONLY model: %s | provider=%s",
+                        g.name if g else "unknown",
+                        provider,
+                    )
             log.info(
                 "CORTEX TRADING BRAIN on — provider=%s | %s | cache=%.0fs",
-                resolve_provider(),
+                provider,
                 status_line(),
                 settings.llm_policy_cache_sec,
             )
