@@ -17,6 +17,10 @@ $HourlyPs1 = Join-Path $Root "run_hourly.ps1"
 $Py = if (Test-Path ".\.venv\Scripts\python.exe") { Resolve-Path ".\.venv\Scripts\python.exe" } else { (Get-Command python).Source }
 
 function Resolve-BotPython {
+    $venvPy = Join-Path $Root ".venv\Scripts\python.exe"
+    if (Test-Path $venvPy) {
+        return (Resolve-Path $venvPy).Path
+    }
     try {
         $real = (& $Py -c "import sys; print(sys._base_executable)" 2>&1 | Out-String).Trim()
         if ($real -and (Test-Path $real) -and $real -notmatch '\\\.venv\\Scripts\\python\.exe$') {

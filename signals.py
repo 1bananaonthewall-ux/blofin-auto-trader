@@ -20,6 +20,124 @@ log = logging.getLogger(__name__)
 _OVERRIDE_MOD = None
 
 
+def _analyze_llm_only(
+    settings: Settings,
+    symbol: str,
+    ohlcv_1m,
+    ohlcv_5m,
+    funding: float | None,
+    *,
+    equity: float | None,
+) -> StrategyDecision | None:
+    """7B GGUF sole entry brain — no ML, winner, pick, markov, or swarm gates."""
+    sp_prof = profile_for(settings)
+    if sp_prof:
+        run_all_analyses._scalp_ctx = {
+            "atr_stop_mult": sp_prof.atr_stop_mult,
+            "atr_take_mult": sp_prof.atr_take_mult,
+            "max_stop_pct": sp_prof.max_stop_pct,
+            "max_take_pct": sp_prof.max_take_pct,
+            "min_rr": sp_prof.min_rr,
+            "three_r_mode": sp_prof.three_r_mode,
+        }
+    else:
+        run_all_analyses._scalp_ctx = None
+
+    cf = run_all_analyses(ohlcv_1m, ohlcv_5m, funding_rate=funding, ml_decision=None)
+    if cf is None:
+        return None
+
+    baseline = confluence_to_decision(cf)
+    llm_dec = decide_with_llm(
+        symbol=symbol,
+        close=baseline.close,
+        baseline=baseline,
+        confluence_score=cf.confluence_score,
+        agreeing=len(cf.agreeing),
+        opposing=len(cf.opposing),
+        funding_rate=funding,
+        markov_state=None,
+        markov_stress_p=None,
+        min_confidence=settings.llm_trading_min_confidence,
+        max_tokens=settings.llm_trading_max_tokens,
+        temperature=settings.llm_trading_temperature,
+        fail_open=False,
+        use_cortex=settings.llm_trading_use_cortex,
+        strict=True,
+        respect_markov=False,
+        equity=equity,
+        state_dir=settings.state_dir,
+        cache_sec=settings.llm_policy_cache_sec,
+        llm_only=True,
+    )
+    if llm_dec is None or llm_dec.signal == Signal.FLAT:
+        return None
+
+    decision = llm_dec
+    conf = decision.model_confidence
+    if conf + 1e-4 < settings.llm_trading_min_confidence:
+        return None
+    if decision.score < settings.llm_trading_min_score:
+        return None
+
+    if sp_prof:
+        estimated_lev = max(
+            sp_prof.base_leverage,
+            min(
+                sp_prof.max_leverage_cap,
+                int(sp_prof.base_leverage + (sp_prof.max_leverage_cap - sp_prof.base_leverage) * conf),
+            ),
+        )
+        min_tp = sp_prof.min_take_profit_pct
+    else:
+        estimated_lev = _estimate_leverage_from_confidence(conf, settings)
+        min_tp = settings.min_take_profit_pct
+
+    sp, tp, _ = _fee_aware_adjust(
+        decision.stop_pct,
+        decision.take_pct,
+        equity,
+        settings.small_account_threshold,
+        min_tp,
+        (settings.fee_est_taker_pct + settings.fee_est_maker_pct) * 100,
+        model_confidence=conf,
+        leverage=estimated_lev,
+        regime=decision.regime,
+        min_rr_override=sp_prof.min_rr if sp_prof and sp_prof.three_r_mode else None,
+    )
+    if sp_prof:
+        sp = min(sp_prof.max_stop_pct, sp)
+        tp = min(sp_prof.max_take_pct, max(tp, sp * sp_prof.min_rr))
+        tp = sp * sp_prof.min_rr
+    from tpsl_policy import align_stop_take, resolve_tpsl_policy
+
+    pol = resolve_tpsl_policy(settings, decision=decision)
+    sp, tp, pol = align_stop_take(settings, sp, tp, estimated_lev, decision=decision, style=pol.style)
+    if sp <= 0 or tp / max(sp, 1e-9) < pol.min_rr * 0.98:
+        return None
+
+    decision.stop_pct = sp
+    decision.take_pct = tp
+    decision.trade_style = pol.style
+    decision.leveraged_rr = tp / max(sp, 0.001) * estimated_lev
+    decision.funding_rate = funding
+    decision.winner_tier = "apex"
+    decision.winner_score = conf
+    decision.pick_score = conf
+    decision.fast_win_score = conf
+
+    log.info(
+        "LLM-ONLY %s %s conf=%.2f score=%.0f rr=%.2f:1 zone=%s",
+        symbol,
+        decision.signal.value,
+        conf,
+        decision.score,
+        tp / max(sp, 1e-9),
+        getattr(decision, "confluence_zone", ""),
+    )
+    return decision
+
+
 def _apply_optimizer_overrides(
     conf_gate: float,
     score_gate: float,
@@ -93,6 +211,11 @@ def analyze_symbol(
     ohlcv_1m = ex.fetch_ohlcv(symbol, "1m", 100)
     ohlcv_5m = ex.fetch_ohlcv(symbol, "5m", 50)
     funding = ex.fetch_funding_rate(symbol)
+
+    if getattr(settings, "llm_only_trading", False):
+        return _analyze_llm_only(
+            settings, symbol, ohlcv_1m, ohlcv_5m, funding, equity=equity
+        )
 
     if settings.signal_mode == "10x30":
         dec = evaluate_10x30(ohlcv_1m, ohlcv_5m, funding_rate=funding)

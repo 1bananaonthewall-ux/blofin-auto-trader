@@ -70,6 +70,24 @@ def conviction_score(decision: StrategyDecision, path_reliability: float) -> flo
     return conv
 
 
+def rank_llm_only_opens(
+    candidates: list[tuple[str, StrategyDecision]],
+    max_opens: int,
+) -> list[RankedSetup]:
+    """LLM-only: rank by model confidence — no ML/winner/swarm blending."""
+    pool: list[RankedSetup] = []
+    for sym, dec in candidates:
+        zone = getattr(dec, "confluence_zone", "") or ""
+        if zone != "cortex_llm":
+            continue
+        conf = float(getattr(dec, "model_confidence", 0.0) or (dec.score / 100.0))
+        pool.append(
+            RankedSetup(symbol=sym, decision=dec, conviction=conf, confidence=conf, score=dec.score)
+        )
+    pool.sort(key=lambda r: (r.confidence, r.score), reverse=True)
+    return pool[: max(1, max_opens)]
+
+
 def rank_setups(
     candidates: list[tuple[str, StrategyDecision]],
     path_reliability: float,

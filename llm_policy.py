@@ -84,7 +84,11 @@ def decide_with_llm(
     equity: float | None = None,
     state_dir: Path | None = None,
     cache_sec: float | None = None,
+    llm_only: bool = False,
 ) -> StrategyDecision | None:
+    llm_only = llm_only or (
+        str(__import__("os").environ.get("LLM_ONLY_TRADING", "")).lower() in ("1", "true", "yes")
+    )
     if resolve_provider() == "none":
         if fail_open:
             dec = baseline
@@ -215,19 +219,23 @@ def decide_with_llm(
 
     conf_raw = _clamp(_num(blob.get("confidence"), baseline.model_confidence or 0.0), 0.0, 1.0)
     score_raw = _clamp(_num(blob.get("score"), baseline.score or 0.0), 0.0, 100.0)
-    llm_weight = 0.78 if conf_raw >= 0.72 else 0.58
-    conf = _clamp(
-        llm_weight * conf_raw
-        + (1.0 - llm_weight) * _clamp(float(baseline.model_confidence or 0.0), 0.0, 1.0)
-        + 0.08 * _clamp(float(confluence_score) / 100.0, 0.0, 1.0),
-        0.0,
-        1.0,
-    )
-    score = _clamp(
-        0.65 * score_raw + 0.35 * _clamp(float(confluence_score), 0.0, 100.0),
-        0.0,
-        100.0,
-    )
+    if llm_only:
+        conf = conf_raw
+        score = score_raw
+    else:
+        llm_weight = 0.78 if conf_raw >= 0.72 else 0.58
+        conf = _clamp(
+            llm_weight * conf_raw
+            + (1.0 - llm_weight) * _clamp(float(baseline.model_confidence or 0.0), 0.0, 1.0)
+            + 0.08 * _clamp(float(confluence_score) / 100.0, 0.0, 1.0),
+            0.0,
+            1.0,
+        )
+        score = _clamp(
+            0.65 * score_raw + 0.35 * _clamp(float(confluence_score), 0.0, 100.0),
+            0.0,
+            100.0,
+        )
     if conf < min_confidence:
         if fail_open:
             dec = baseline

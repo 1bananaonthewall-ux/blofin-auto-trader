@@ -702,7 +702,14 @@ class AutonomousGrowthEngine:
         min_c = knobs.min_confidence if min_confidence is None else min_confidence
         min_s = knobs.min_signal_score if min_signal_score is None else min_signal_score
         zone = getattr(decision, "confluence_zone", "") or ""
-        if zone == "llm" and self.settings is not None:
+        if self.settings is not None and getattr(self.settings, "llm_only_trading", False):
+            if zone == "cortex_llm":
+                min_c = self.settings.llm_trading_min_confidence
+                min_s = self.settings.llm_trading_min_score
+                if conf + 1e-4 >= min_c and decision.score >= min_s:
+                    return True, "llm_only_brain"
+                return False, f"llm conf {conf:.2f} score {decision.score:.0f}"
+        if zone in ("llm", "cortex_llm") and self.settings is not None:
             min_c = min(min_c, self.settings.llm_trading_min_confidence)
             min_s = min(min_s, self.settings.llm_trading_min_score)
         if conf < min_c:

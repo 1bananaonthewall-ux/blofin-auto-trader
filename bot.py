@@ -18,6 +18,7 @@ from autonomous_engine import AutonomousGrowthEngine, create_engine
 from config import Settings, load_settings
 from conviction import (
     margin_fraction_for_conviction,
+    rank_llm_only_opens,
     rank_setups,
     select_conviction_ties,
 )
@@ -344,6 +345,9 @@ def try_open(
                 liq_stop_frac * 100,
             )
             return False
+    llm_only_entry = bool(getattr(settings, "llm_only_trading", False)) and (
+        getattr(decision, "confluence_zone", "") == "cortex_llm"
+    )
     mk_stress = float(getattr(decision, "markov_stress_p", 0.0) or 0.0)
     tier = getattr(decision, "winner_tier", "") or ""
     micro_acct = equity > 0 and equity < settings.micro_equity_threshold
@@ -356,7 +360,7 @@ def try_open(
         stress_conv_min = 0.52
     else:
         stress_conv_min = 0.74
-    if mk_stress >= 0.36 and conviction < stress_conv_min:
+    if not llm_only_entry and mk_stress >= 0.36 and conviction < stress_conv_min:
         log.info(
             "skip %s: markov stress %.0f%% needs conv>=%.2f (have %.3f)",
             symbol.split("/")[0],
@@ -366,7 +370,13 @@ def try_open(
         )
         return False
     stress_conf_min = 0.76 if relax_stress_gates else 0.82
-    if mk_stress >= 0.36 and tier == "good" and conf < stress_conf_min and not entry_relax:
+    if (
+        not llm_only_entry
+        and mk_stress >= 0.36
+        and tier == "good"
+        and conf < stress_conf_min
+        and not entry_relax
+    ):
         log.info(
             "skip %s: good-tier in stress needs conf>=0.82 (have %.2f)",
             symbol.split("/")[0],
@@ -723,7 +733,8 @@ def run_once(
 
     wr, pf, loss_streak = _load_performance_stats(settings.state_dir)
     engine.record_performance(wr, pf, loss_streak)
-    _sync_ml_metrics(engine, ml, tracker)
+    if not getattr(settings, "llm_only_trading", False):
+        _sync_ml_metrics(engine, ml, tracker)
 
     if settings.trade_all_symbols:
         lev = engine.scalp.base_leverage if engine.scalp else engine.doctrine.base_leverage
@@ -801,7 +812,7 @@ def run_once(
                 )
                 return max(6, min(15, int(getattr(settings, "scalp_steward_interval", 6))))
     engine.update_fluid(equity, free_margin, len(open_positions))
-    if settings.markov_regime_enabled:
+    if settings.markov_regime_enabled and not getattr(settings, "llm_only_trading", False):
         anchor = "BTC/USDT:USDT"
         if anchor not in symbols and symbols:
             anchor = symbols[0]
@@ -921,32 +932,34 @@ def run_once(
     held = set(open_positions.keys())
     scan = _scan_symbols_ws(ex, symbols, held, knobs, open_count=len(open_positions))
 
+    llm_only = bool(getattr(settings, "llm_only_trading", False))
     candidates = []
     for sym in scan:
         try:
-            if getattr(settings, "trade_lessons_enabled", True):
-                try:
-                    from trade_lessons import symbol_blocked
+            if not llm_only:
+                if getattr(settings, "trade_lessons_enabled", True):
+                    try:
+                        from trade_lessons import symbol_blocked
 
-                    blocked, reason = symbol_blocked(settings, sym)
-                    if blocked:
-                        log.debug("skip %s: %s", sym.split("/")[0], reason)
-                        continue
-                except Exception:
-                    pass
-            if (
-                quality_store is not None
-                and settings.symbol_quality_enabled
-                and not quality_store.allow(sym, settings.symbol_quality_floor)
-            ):
-                continue
-            if (
-                quality_store is not None
-                and getattr(settings, "runner_filter_enabled", True)
-                and quality_store.skip_choppy_symbol(sym, floor=getattr(settings, "runner_min_score", 0.48))
-            ):
-                log.debug("skip %s: remembered choppy runner score", sym.split("/")[0])
-                continue
+                        blocked, reason = symbol_blocked(settings, sym)
+                        if blocked:
+                            log.debug("skip %s: %s", sym.split("/")[0], reason)
+                            continue
+                    except Exception:
+                        pass
+                if (
+                    quality_store is not None
+                    and settings.symbol_quality_enabled
+                    and not quality_store.allow(sym, settings.symbol_quality_floor)
+                ):
+                    continue
+                if (
+                    quality_store is not None
+                    and getattr(settings, "runner_filter_enabled", True)
+                    and quality_store.skip_choppy_symbol(sym, floor=getattr(settings, "runner_min_score", 0.48))
+                ):
+                    log.debug("skip %s: remembered choppy runner score", sym.split("/")[0])
+                    continue
             scan_min_conf = knobs.min_confidence
             scan_min_score = knobs.min_signal_score
             if fill_mode and equity > 0 and equity < settings.micro_equity_threshold:
@@ -962,7 +975,7 @@ def run_once(
                 ex,
                 settings,
                 sym,
-                ml,
+                None if llm_only else ml,
                 equity=equity,
                 min_confidence=scan_min_conf,
                 min_signal_score=scan_min_score,
@@ -970,7 +983,7 @@ def run_once(
             if d and d.signal != Signal.FLAT and engine.passes_signal_gate(
                 d, knobs, min_confidence=scan_min_conf, min_signal_score=scan_min_score
             ):
-                if quality_store is not None:
+                if not llm_only and quality_store is not None:
                     quality_store.note_run_quality(
                         sym,
                         run_score=float(getattr(d, "run_score", 0.5) or 0.5),
@@ -989,15 +1002,10 @@ def run_once(
                     if settings.symbol_quality_enabled and sq < 0.35:
                         d.score = max(0.0, d.score - (0.35 - sq) * 12.0)
                 candidates.append((sym, d))
-            time.sleep(0.05)
+            time.sleep(0.12 if llm_only else 0.05)
         except Exception:
             log.exception("scan %s", sym)
 
-    ranked = rank_setups(
-        candidates,
-        knobs.path_reliability,
-        mission_scale=engine.mission_scale_conviction,
-    )
     max_open = effective_max_open(settings, equity)
     if max_open >= UNLIMITED_POSITIONS:
         per_tick = knobs.max_opens_per_tick
@@ -1006,6 +1014,86 @@ def run_once(
         per_tick = min(knobs.max_opens_per_tick, open_slots) if open_slots else 0
         if per_tick <= 0:
             return knobs.poll_seconds
+
+    if llm_only:
+        elite = rank_llm_only_opens(candidates, per_tick)
+        ranked = elite
+        if not opens_allowed:
+            return knobs.poll_seconds
+        if not elite:
+            if candidates:
+                log.info("no open: %d scanned, 0 LLM cortex_llm approvals", len(candidates))
+            return knobs.poll_seconds
+        log.info(
+            "LLM-ONLY opens %d/%d | top %s conf=%.2f",
+            len(elite),
+            len(candidates),
+            elite[0].symbol.split("/")[0],
+            elite[0].confidence,
+        )
+        free_margin = ex.fetch_free_equity_usdt()
+        if free_margin < engine.doctrine.min_free_margin_usdt:
+            return knobs.poll_seconds
+        cd_sec = 0 if tpsl_pace else int(
+            effective_cooldown_minutes(settings, optimizer.tuning if optimizer else None) * 60
+        )
+        if optimizer and not tpsl_pace:
+            cooldowns.cooldown_seconds = cd_sec
+        opened = 0
+        for setup in elite:
+            free_margin = ex.fetch_free_equity_usdt()
+            if free_margin < engine.doctrine.min_free_margin_usdt:
+                break
+            margin_frac = margin_fraction_for_conviction(
+                setup.conviction,
+                setup.confidence,
+                base_pct=knobs.margin_deploy_base_pct,
+                max_pct=knobs.margin_deploy_max_pct,
+                action_intensity=knobs.action_intensity,
+                tie_count=1,
+                loss_streak=engine._consecutive_losses,
+            )
+            if equity < settings.micro_equity_threshold:
+                margin_frac = max(margin_frac, min(0.85, settings.micro_max_margin_frac * 3.0))
+            try:
+                if try_open(
+                    ex,
+                    settings,
+                    engine,
+                    knobs,
+                    setup.symbol,
+                    setup.decision,
+                    free_margin,
+                    equity,
+                    journal,
+                    cooldowns,
+                    tracker,
+                    quality_store,
+                    registry,
+                    side_guard,
+                    conviction=setup.conviction,
+                    margin_fraction=margin_frac,
+                    cooldown_seconds=cd_sec,
+                ):
+                    opened += 1
+                    if not tpsl_pace and cd_sec > 0:
+                        cooldowns.block(setup.symbol, seconds=cd_sec)
+                    open_positions[setup.symbol] = {"side": setup.decision.signal.value}
+                    if tpsl_pacer:
+                        tpsl_pacer.note_open(setup.symbol, setup.decision.signal.value)
+            except Exception:
+                log.exception("open %s", setup.symbol)
+        if opened:
+            if not tpsl_pace:
+                pacer.record_entry()
+            log.info("opened %d position(s) (llm_only)", opened)
+        return knobs.poll_seconds
+
+    ranked = rank_setups(
+        candidates,
+        knobs.path_reliability,
+        mission_scale=engine.mission_scale_conviction,
+    )
     entry_press = (
         fill_mode
         or starved
@@ -1243,21 +1331,16 @@ def main() -> None:
             provider = resolve_provider()
             if getattr(settings, "llm_only_trading", False):
                 log.warning(
-                    "LLM-ONLY TRADING: 7B GGUF is the sole entry brain — "
+                    "LLM-ONLY TRADING: local LLM is the sole entry brain — "
                     "no winner/ML/pick gate after policy (steward/TP/SL unchanged)"
                 )
                 if provider == "none":
                     log.error(
-                        "LLM_ONLY_TRADING=true but no GGUF loaded — "
-                        "run scripts\\enable_llm_only_7b.ps1 then restart-fresh"
+                        "LLM_ONLY_TRADING=true but no LLM backend — "
+                        "run scripts\\enable_llm_only_1.5b.ps1 then restart-fresh"
                     )
                 else:
-                    g = gguf_path()
-                    log.warning(
-                        "LLM-ONLY model: %s | provider=%s",
-                        g.name if g else "unknown",
-                        provider,
-                    )
+                    log.warning("LLM-ONLY model: %s | provider=%s", status_line(), provider)
             log.info(
                 "CORTEX TRADING BRAIN on — provider=%s | %s | cache=%.0fs",
                 provider,
@@ -1482,8 +1565,9 @@ def main() -> None:
     )
     steward.start()
 
+    llm_only_mode = bool(getattr(settings, "llm_only_trading", False))
     ml_trainer: ContinuousMlTrainer | None = None
-    if settings.signal_mode == "ml" and settings.ml_continuous_train:
+    if not llm_only_mode and settings.signal_mode == "ml" and settings.ml_continuous_train:
 
         def _on_ml_updated() -> None:
             ml.reload()
@@ -1494,6 +1578,10 @@ def main() -> None:
 
         ml_trainer = ContinuousMlTrainer(ex, settings, on_model_updated=_on_ml_updated)
         ml_trainer.start()
+    elif llm_only_mode:
+        log.warning(
+            "LLM-ONLY: ML continuous train OFF | winner/hourly-3r/markov entry brains disabled"
+        )
 
     from stack_learning import run_startup_learning
 
@@ -1521,7 +1609,7 @@ def main() -> None:
             settings.optimizer_target_max_tph,
             int(settings.optimizer_interval_seconds),
         )
-    if settings.signal_mode == "ml" and not ml.is_ready():
+    if not llm_only_mode and settings.signal_mode == "ml" and not ml.is_ready():
         if ml_trainer:
             log.info(
                 "ML warming up — auto-refit bootstrapping %d symbols (confluence until deploy)",
