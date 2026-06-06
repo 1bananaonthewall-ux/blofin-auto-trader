@@ -85,14 +85,16 @@ def evaluate_winner(
 
     universe = universe_fill_active(settings)
     abundant = universe or getattr(settings, "entries_never_pause", False)
+    h3r = hourly_3r_active(settings)
     if starved or abundant:
-        relax = 0.10 if hourly_3r_active(settings) else (0.08 if universe else 0.06)
+        relax = 0.10 if h3r else (0.08 if universe else 0.06)
+        vol_floor = 0.06 if (starved and h3r) else 0.18
         thr = EffectiveWinnerThresholds(
             min_confluence=max(0.50, thr.min_confluence - relax),
-            min_agreeing=max(3 if (hourly_3r_active(settings) or universe) else 4, thr.min_agreeing - 1),
-            max_opposing=thr.max_opposing + (3 if hourly_3r_active(settings) else 2),
+            min_agreeing=max(3 if (h3r or universe) else 4, thr.min_agreeing - 1),
+            max_opposing=thr.max_opposing + (3 if h3r else 2),
             min_ml_confidence=max(0.52, thr.min_ml_confidence - 0.10),
-            min_volume_ratio=max(0.18, thr.min_volume_ratio - 0.55),
+            min_volume_ratio=max(vol_floor, thr.min_volume_ratio - (0.14 if h3r else 0.55)),
             min_score=max(0.50, thr.min_score - 0.06),
             elite_score=max(0.56, thr.elite_score - 0.08),
             apex_score=max(0.62, thr.apex_score - 0.08),
@@ -105,7 +107,9 @@ def evaluate_winner(
 
     # --- Hard rejects (BloHunter-style: only trade when the book agrees) ---
     if not cf.htf_aligned:
-        return WinnerVerdict(False, "reject", 0.0, "HTF not aligned with 1m direction")
+        htf_bypass = starved and h3r and cf.confluence_score >= thr.min_confluence + 0.03
+        if not htf_bypass:
+            return WinnerVerdict(False, "reject", 0.0, "HTF not aligned with 1m direction")
 
     if len(cf.agreeing) < thr.min_agreeing:
         return WinnerVerdict(
@@ -129,7 +133,8 @@ def evaluate_winner(
         return WinnerVerdict(False, "reject", 0.0, "vote count disagrees with direction")
 
     exp, exp_n = rolling_expectancy(settings.state_dir, window=24)
-    if exp is not None and exp < -0.15 and cf.confluence_score < thr.min_confluence + 0.08:
+    edge_cf_bump = 0.14 if (starved and h3r) else 0.08
+    if exp is not None and exp < -0.15 and cf.confluence_score < thr.min_confluence + edge_cf_bump:
         return WinnerVerdict(
             False,
             "reject",
@@ -169,7 +174,10 @@ def evaluate_winner(
             return WinnerVerdict(False, "reject", 0.0, "ML direction disagrees with confluence")
     elif ml_ready and ml_decision is not None and ml_decision.signal != side:
         ml_c = ml_decision.model_confidence or (ml_decision.score / 100.0)
-        if ml_c >= settings.winner_ml_veto_min_confidence + 0.06:
+        veto_floor = settings.winner_ml_veto_min_confidence + 0.06
+        if starved and h3r:
+            veto_floor += 0.10
+        if ml_c >= veto_floor:
             return WinnerVerdict(
                 False, "reject", 0.0, f"ML strongly disagrees ({ml_decision.signal.value} conf={ml_c:.2f})",
             )

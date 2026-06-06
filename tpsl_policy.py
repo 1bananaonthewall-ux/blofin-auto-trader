@@ -116,10 +116,10 @@ def resolve_tpsl_policy(
     )
 
     if not style:
-        if cf_runner and runner_priority:
-            style = "momentum"
-        elif fast_3r_mode:
+        if fast_3r_mode:
             style = "fast_3r"
+        elif cf_runner and runner_priority:
+            style = "momentum"
         elif cf_runner:
             style = "momentum"
         else:

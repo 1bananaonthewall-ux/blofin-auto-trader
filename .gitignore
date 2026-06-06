@@ -10,6 +10,8 @@ logs/*
 state/*
 !state/.gitkeep
 models/*.gguf
+models/*.gguf.part
+*.gguf.part
 treasury/wallets.json
 treasury/faucets.json
 treasury/acquisition.json

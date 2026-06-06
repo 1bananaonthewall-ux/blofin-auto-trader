@@ -208,11 +208,21 @@ def analyze_symbol(
 ) -> StrategyDecision | None:
     conf_gate = min_confidence if min_confidence is not None else settings.ml_min_confidence
     score_gate = min_signal_score if min_signal_score is not None else settings.min_signal_score
+    if getattr(settings, "llm_overseer_mode", False):
+        from llm_overseer import get_gate_adjustments, symbol_avoided
+
+        cd, sd = get_gate_adjustments(settings.state_dir)
+        conf_gate += cd
+        score_gate += sd
+        if symbol_avoided(symbol, settings.state_dir):
+            return None
     ohlcv_1m = ex.fetch_ohlcv(symbol, "1m", 100)
     ohlcv_5m = ex.fetch_ohlcv(symbol, "5m", 50)
     funding = ex.fetch_funding_rate(symbol)
 
-    if getattr(settings, "llm_only_trading", False):
+    if getattr(settings, "llm_only_trading", False) and not getattr(
+        settings, "llm_overseer_mode", False
+    ):
         return _analyze_llm_only(
             settings, symbol, ohlcv_1m, ohlcv_5m, funding, equity=equity
         )
@@ -343,8 +353,14 @@ def analyze_symbol(
     decision = confluence_to_decision(cf)
     conf = decision.model_confidence
     used_llm = False
-    llm_only = bool(getattr(settings, "llm_only_trading", False))
-    if settings.llm_trading_enabled and (llm_only or not hourly_3r_active(settings)):
+    llm_only = bool(getattr(settings, "llm_only_trading", False)) and not getattr(
+        settings, "llm_overseer_mode", False
+    )
+    if (
+        settings.llm_trading_enabled
+        and not getattr(settings, "llm_overseer_mode", False)
+        and (llm_only or not hourly_3r_active(settings))
+    ):
         pre_conf = 0.0 if llm_only else max(0.40, settings.llm_trading_min_confidence - 0.10)
         pre_score = 0.0 if llm_only else max(40.0, settings.llm_trading_min_score - 10.0)
         fail_open = False if llm_only else settings.llm_trading_fail_open
@@ -499,7 +515,9 @@ def analyze_symbol(
     trade_style = None
     if sp_prof and sp_prof.three_r_mode:
         tp = sp * sp_prof.min_rr
-        if runner_priority and cf_runner:
+        # Hourly/fast 3R mode keeps exchange 3:1 brackets — momentum runner TP (2.5R) fights winner gate.
+        allow_runner_tp = runner_priority and cf_runner and not hourly_3r_active(settings)
+        if allow_runner_tp:
             trade_style = "momentum"
             ext = extended_runner_take_pct(sp, settings=settings, leverage=estimated_lev)
             tp = min(ext, max(tp, sp * float(settings.runner_extend_min_rr)))
@@ -517,7 +535,9 @@ def analyze_symbol(
             from tpsl_policy import resolve_tpsl_policy
 
             pol = resolve_tpsl_policy(settings, decision=decision)
-            trade_style = pol.style
+            trade_style = "fast_3r" if hourly_3r_active(settings) else pol.style
+            if hourly_3r_active(settings):
+                tp = max(tp, sp * sp_prof.min_rr)
     from tpsl_policy import align_stop_take
 
     sp, tp, pol = align_stop_take(

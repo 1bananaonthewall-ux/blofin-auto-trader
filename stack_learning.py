@@ -164,7 +164,9 @@ def run_startup_learning(
     """Called once after bot starts — ML refit + cortex rebuild without user scripts."""
 
     def _work() -> None:
-        if getattr(settings, "llm_only_trading", False):
+        if getattr(settings, "llm_only_trading", False) and not getattr(
+            settings, "llm_overseer_mode", False
+        ):
             log.info("LLM-ONLY: skipping ML startup refit (cortex knowledge still trains)")
         elif settings.signal_mode == "ml" and getattr(settings, "ml_auto_refit_on_startup", True):
             if ml_trainer and tracker:
@@ -187,7 +189,9 @@ def maybe_periodic_learning(
     tracker: "TradeOutcomeTracker | None",
 ) -> None:
     """Lightweight tick hook from main loop (cortex interval + ML drift safety)."""
-    if getattr(settings, "llm_only_trading", False):
+    if getattr(settings, "llm_only_trading", False) and not getattr(
+        settings, "llm_overseer_mode", False
+    ):
         schedule_cortex_train(settings.state_dir, settings, force=False, reason="periodic")
         return
     if ml_trainer and ml_feature_mismatch(ml):

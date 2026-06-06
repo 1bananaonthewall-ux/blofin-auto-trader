@@ -216,7 +216,8 @@ def maybe_apply_autocode(
         trades_last_hour=trades_last_hour,
     )
     code = _llm_generate(snap, mode) or _template(mode)
-    (state_dir / OVERRIDES_FILE).write_text(code, encoding="utf-8")
+    root = state_dir.parent
+    (root / OVERRIDES_FILE).write_text(code, encoding="utf-8")
     st_path.write_text(json.dumps({"mode": mode, "ts": now}, indent=2), encoding="utf-8")
     log.warning("OPTIMIZER AUTOCODE -> %s (rewrote %s)", mode, OVERRIDES_FILE)
     return mode

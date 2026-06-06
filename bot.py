@@ -733,7 +733,8 @@ def run_once(
 
     wr, pf, loss_streak = _load_performance_stats(settings.state_dir)
     engine.record_performance(wr, pf, loss_streak)
-    if not getattr(settings, "llm_only_trading", False):
+    overseer = bool(getattr(settings, "llm_overseer_mode", False))
+    if not getattr(settings, "llm_only_trading", False) or overseer:
         _sync_ml_metrics(engine, ml, tracker)
 
     if settings.trade_all_symbols:
@@ -812,7 +813,9 @@ def run_once(
                 )
                 return max(6, min(15, int(getattr(settings, "scalp_steward_interval", 6))))
     engine.update_fluid(equity, free_margin, len(open_positions))
-    if settings.markov_regime_enabled and not getattr(settings, "llm_only_trading", False):
+    if settings.markov_regime_enabled and (
+        not getattr(settings, "llm_only_trading", False) or overseer
+    ):
         anchor = "BTC/USDT:USDT"
         if anchor not in symbols and symbols:
             anchor = symbols[0]
@@ -930,9 +933,37 @@ def run_once(
     )
 
     held = set(open_positions.keys())
-    scan = _scan_symbols_ws(ex, symbols, held, knobs, open_count=len(open_positions))
+    if overseer and symbols:
+        try:
+            from universe_rater import refresh_ratings
 
-    llm_only = bool(getattr(settings, "llm_only_trading", False))
+            refresh_ratings(ex, symbols, quality_store, settings.state_dir)
+        except Exception:
+            log.debug("universe rating refresh failed", exc_info=True)
+
+    scan = _scan_symbols_ws(ex, symbols, held, knobs, open_count=len(open_positions))
+    if overseer:
+        try:
+            from llm_overseer import load_directives
+            from universe_rater import prioritize_scan
+
+            scan = prioritize_scan(scan, settings.state_dir, load_directives(settings.state_dir).prefer)
+        except Exception:
+            log.debug("overseer scan prioritize failed", exc_info=True)
+
+    try:
+        from llm_overseer import maybe_run_overseer_tick
+
+        maybe_run_overseer_tick(
+            settings,
+            knobs=knobs,
+            ml=ml,
+            opens_allowed=opens_allowed,
+        )
+    except Exception:
+        log.debug("overseer tick failed", exc_info=True)
+
+    llm_only = bool(getattr(settings, "llm_only_trading", False)) and not overseer
     candidates = []
     for sym in scan:
         try:
@@ -1324,12 +1355,20 @@ def main() -> None:
         )
     log.info("AUTONOMOUS ENGINE: %s", engine.doctrine_summary())
 
-    if settings.llm_trading_enabled:
+    if getattr(settings, "llm_overseer_mode", False):
+        log.warning(
+            "LLM OVERSEER: 1.5B supervises ML swarm | optimize every %ds | "
+            "instant universe ratings | autocode + blocker fixes",
+            getattr(settings, "overseer_interval_seconds", 300),
+        )
+    if settings.llm_trading_enabled or getattr(settings, "llm_overseer_mode", False):
         try:
-            from local_llm import gguf_path, resolve_provider, status_line, warmup_provider
+            from local_llm import resolve_provider, status_line, warmup_provider
 
             provider = resolve_provider()
-            if getattr(settings, "llm_only_trading", False):
+            if getattr(settings, "llm_only_trading", False) and not getattr(
+                settings, "llm_overseer_mode", False
+            ):
                 log.warning(
                     "LLM-ONLY TRADING: local LLM is the sole entry brain — "
                     "no winner/ML/pick gate after policy (steward/TP/SL unchanged)"
@@ -1565,7 +1604,9 @@ def main() -> None:
     )
     steward.start()
 
-    llm_only_mode = bool(getattr(settings, "llm_only_trading", False))
+    llm_only_mode = bool(getattr(settings, "llm_only_trading", False)) and not bool(
+        getattr(settings, "llm_overseer_mode", False)
+    )
     ml_trainer: ContinuousMlTrainer | None = None
     if not llm_only_mode and settings.signal_mode == "ml" and settings.ml_continuous_train:
 
@@ -1581,6 +1622,10 @@ def main() -> None:
     elif llm_only_mode:
         log.warning(
             "LLM-ONLY: ML continuous train OFF | winner/hourly-3r/markov entry brains disabled"
+        )
+    elif getattr(settings, "llm_overseer_mode", False):
+        log.warning(
+            "LLM OVERSEER: ML continuous train ON | 5m LLM optimize + instant universe ratings"
         )
 
     from stack_learning import run_startup_learning

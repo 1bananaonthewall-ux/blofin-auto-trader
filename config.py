@@ -217,6 +217,8 @@ class Settings:
     llm_trading_use_cortex: bool
     llm_trading_strict: bool
     llm_only_trading: bool
+    llm_overseer_mode: bool
+    overseer_interval_seconds: int
     llm_policy_cache_sec: float
     momentum_wave_mode: bool
     momentum_wave_target_daily_pct: float
@@ -459,6 +461,8 @@ def load_settings() -> Settings:
         llm_trading_use_cortex=_env_bool("LLM_TRADING_USE_CORTEX", True),
         llm_trading_strict=_env_bool("LLM_TRADING_STRICT", False),
         llm_only_trading=_env_bool("LLM_ONLY_TRADING", False),
+        llm_overseer_mode=_env_bool("LLM_OVERSEER_MODE", False),
+        overseer_interval_seconds=int(os.getenv("OVERSEER_INTERVAL_SECONDS", "300")),
         llm_policy_cache_sec=float(os.getenv("LLM_POLICY_CACHE_SEC", "45")),
         momentum_wave_mode=_env_bool("MOMENTUM_WAVE_MODE", True),
         momentum_wave_target_daily_pct=float(os.getenv("MOMENTUM_WAVE_TARGET_DAILY_PCT", "5.0")),
