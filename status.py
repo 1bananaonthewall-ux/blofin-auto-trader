@@ -15,6 +15,7 @@ def main() -> None:
     engine = create_engine(settings.state_dir)
     engine.bind_settings(settings)
     engine.unrestricted_trading = settings.unrestricted_trading
+    engine.entries_never_pause = settings.entries_never_pause
     ex = BlofinExchange(settings)
     ex.load()
     equity = ex.fetch_equity_usdt()

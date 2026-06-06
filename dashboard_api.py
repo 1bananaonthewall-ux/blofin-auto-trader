@@ -1052,21 +1052,22 @@ def _spawn_fresh_stack_restart() -> None:
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(f"{ts} dashboard_api spawn restart port={port}\n")
 
-    helper_s = str(helper).replace("'", "''")
-    root_s = str(ROOT).replace("'", "''")
-    # Short-lived launcher exits immediately; real work runs in a sibling process.
-    launch_ps = (
-        f"Start-Process -FilePath powershell.exe -WorkingDirectory '{root_s}' "
-        f"-WindowStyle Hidden -ArgumentList @("
-        f"'-NoProfile','-ExecutionPolicy','Bypass','-File','{helper_s}',"
-        f"'-DashboardPort','{port}')"
-    )
-    args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", launch_ps]
+    # Launch helper directly (not as a child job of this process) so restart-fresh
+    # can stop dashboard_api without killing the restart script.
+    args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(helper),
+        "-DashboardPort",
+        str(port),
+    ]
     flags = 0
     if sys.platform == "win32":
         flags = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )

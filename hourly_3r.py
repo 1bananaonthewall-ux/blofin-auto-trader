@@ -29,7 +29,9 @@ def target_min_opens_per_hour(settings: "Settings") -> int:
         from account_guard import universe_fill_active
 
         if universe_fill_active(settings):
-            return 0
+            flow = int(getattr(settings, "optimizer_flow_target_tph", 4))
+            base = int(settings.optimizer_target_min_tph)
+            return max(base, flow, 3)
     except Exception:
         pass
     base = int(settings.optimizer_target_min_tph)

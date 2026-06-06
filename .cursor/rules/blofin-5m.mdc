@@ -1,0 +1,19 @@
+---
+description: When 5-minute God Bot maintenance is due, run blofin-5m skill before other work.
+globs:
+alwaysApply: true
+---
+
+# God Bot 5-minute agent wake
+
+If `.cursor/AGENT_5M_DUE` exists **and** `.cursor/HOURLY_DUE` does **not**:
+
+1. Read `.cursor/skills/blofin-5m/SKILL.md` and execute the checklist.
+2. Delete `.cursor/AGENT_5M_DUE` when finished and mark `state/last_cursor_5m.txt`.
+
+If **both** flags exist, run hourly skill first (`.cursor/skills/blofin-hourly/SKILL.md`), then clear both flags.
+
+On `AGENT_LOOP_TICK_godbot_5m` terminal notifications, run the same blofin-5m checklist unless
+`state/last_cursor_5m.txt` is under 4 minutes old and `state/agent_5m_report.json` shows no anomalies.
+
+Do not skip for generic chat unless the user explicitly says to skip 5m maintenance for this session.

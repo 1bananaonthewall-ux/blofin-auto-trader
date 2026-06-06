@@ -38,6 +38,64 @@ def _gross_pnl_pct(side: str, entry: float, price: float) -> float:
     return (entry - price) / entry
 
 
+def _margin_roe_pct(side: str, entry: float, price: float, leverage: int) -> float:
+    gross = _gross_pnl_pct(side, entry, price)
+    return gross * max(1, leverage) * 100.0
+
+
+def evaluate_roe_harvest(
+    symbol: str,
+    pos: dict,
+    meta: dict | None,
+    last_price: float,
+    market: Market,
+    *,
+    fee_taker: float,
+    fee_maker: float,
+    default_leverage: int,
+    min_roe_pct: float = 50.0,
+    max_roe_pct: float = 60.0,
+    min_hold_seconds: float = MIN_HOLD_SECONDS,
+) -> RotationAction | None:
+    """Harvest winners on margin ROE band — rinse capital before give-back."""
+    entry = float(pos.get("entry_price") or (meta or {}).get("entry_price") or 0)
+    side = pos.get("side") or "long"
+    contracts = float(pos.get("contracts") or 0)
+    if entry <= 0 or contracts <= 0 or last_price <= 0:
+        return None
+    opened_at = float((meta or {}).get("opened_at") or 0)
+    if opened_at and (time.time() - opened_at) < min_hold_seconds:
+        return None
+    lev = int((meta or {}).get("leverage") or default_leverage)
+    stop_pct = float((meta or {}).get("stop_pct") or 0.012)
+    take_pct = float((meta or {}).get("take_pct") or 0.022)
+    roe = _margin_roe_pct(side, entry, last_price, lev)
+    if roe < min_roe_pct:
+        return None
+    gross = _gross_pnl_pct(side, entry, last_price)
+    fee = analyze_trade_fees(
+        entry,
+        contracts,
+        market.contract_size,
+        stop_pct,
+        max(take_pct, gross) if gross > 0 else take_pct,
+        lev,
+        taker_fee=fee_taker,
+        maker_fee=fee_maker,
+    )
+    if not fee.fee_covered or fee.profit_after_fees_usd <= 0:
+        return None
+    band = f"{min_roe_pct:.0f}-{max_roe_pct:.0f}%"
+    if roe > max_roe_pct * 1.35:
+        band = f">{max_roe_pct:.0f}%"
+    return RotationAction(
+        symbol=symbol,
+        action="harvest",
+        reason=f"roe_harvest margin_roe={roe:.1f}% band={band} net=${fee.profit_after_fees_usd:.4f}",
+        pnl_after_fees_usd=fee.profit_after_fees_usd,
+    )
+
+
 def evaluate_harvest(
     symbol: str,
     pos: dict,

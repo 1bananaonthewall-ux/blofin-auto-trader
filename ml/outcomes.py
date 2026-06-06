@@ -496,6 +496,13 @@ class TradeOutcomeTracker:
             outcome = "loss"
             win_flag = 0
 
+        if outcome == "win":
+            r_mult = 3.0 if (roe_pct or 0) >= 40 else max(0.5, (roe_pct or 10.0) / 35.0)
+        elif outcome == "loss":
+            r_mult = -1.0
+        else:
+            r_mult = 0.0
+
         record: dict[str, Any] = {
             "event": "outcome",
             "symbol": symbol,
@@ -503,6 +510,7 @@ class TradeOutcomeTracker:
             "outcome": outcome,
             "label": label,
             "win": win_flag,
+            "r_multiple": round(float(r_mult), 3),
             "entry_price": entry.get("entry_price"),
             "close_price": round(close_price, 8),
             "stop_price": stop_price,
@@ -527,6 +535,13 @@ class TradeOutcomeTracker:
         }
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
+        try:
+            from config import load_settings
+            from trade_lessons import on_trade_close
+
+            on_trade_close(load_settings(), record)
+        except Exception:
+            log.debug("trade lesson hook failed", exc_info=True)
         self._quality.note_outcome(symbol, win=bool(win_flag), roe_pct=roe_pct)
         if entry.get("run_label") == "runner" and win_flag:
             self._quality.note_run_quality(

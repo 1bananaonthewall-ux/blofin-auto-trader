@@ -46,7 +46,10 @@ def conviction_score(decision: StrategyDecision, path_reliability: float) -> flo
     elif tier == "elite" and ps > 0:
         conv = max(conv, ps * 0.92)
     elif tier == "good" and ps > 0:
-        conv = max(conv, ps * 0.78)
+        conv = max(conv, ps * 0.90)
+    ws_only = getattr(decision, "winner_score", 0.0)
+    if tier in ("good", "elite", "apex") and ws_only >= 0.50:
+        conv = max(conv, ws_only * 0.82)
     swarm_c = float(getattr(decision, "swarm_confidence", 0.0) or 0.0)
     if swarm_c > 0:
         conv = min(1.0, conv * (0.90 + 0.10 * swarm_c))
@@ -152,7 +155,7 @@ def select_conviction_ties(
     elif tier == "elite":
         floor = max(floor, 0.46)
     elif tier == "good":
-        floor = max(floor, 0.44)
+        floor = max(floor, 0.40)
     if top < floor:
         return []
 
@@ -175,6 +178,7 @@ def margin_fraction_for_conviction(
     max_pct: float,
     action_intensity: float,
     tie_count: int = 1,
+    loss_streak: int = 0,
 ) -> float:
     """
     Share of *current* free margin for one setup (caller splits when multiple ties).
@@ -182,6 +186,8 @@ def margin_fraction_for_conviction(
     t = conviction * (0.6 + 0.4 * confidence) * action_intensity
     t = max(0.0, min(1.0, t))
     raw = base_pct + (max_pct - base_pct) * t
+    if loss_streak > 0:
+        raw *= max(0.32, 1.0 - loss_streak * 0.11)
     if tie_count > 1:
         # Split deploy budget across tied elites; slight haircut for correlation risk
         return raw / tie_count * 0.92

@@ -207,8 +207,13 @@ def try_open(
             log.info("side guard %s: %s", symbol, why)
             return False
     if cooldowns.is_blocked(symbol):
+        log.info("skip %s: symbol cooldown", symbol.split("/")[0])
         return False
-    if not engine.passes_signal_gate(decision, knobs):
+    ok_gate, gate_reason = engine.passes_signal_gate_with_reason(
+        decision, knobs, rank_conviction=conviction
+    )
+    if not ok_gate:
+        log.info("skip %s: %s", symbol.split("/")[0], gate_reason)
         return False
 
     open_positions = ex.fetch_all_positions()
@@ -225,6 +230,7 @@ def try_open(
 
     market = ex.market_for(symbol)
     if not market:
+        log.info("skip %s: no market metadata", symbol.split("/")[0])
         return False
     if settings.scalp_3r_mode:
         cap = ex.symbol_leverage_cap(symbol)
@@ -277,6 +283,7 @@ def try_open(
         equity=equity,
     )
     if plan is None:
+        log.info("skip %s: margin sizer returned no plan", symbol.split("/")[0])
         return False
 
     from dataclasses import replace
@@ -302,8 +309,9 @@ def try_open(
     from liquidation_guard import achievable_margin_rates, liquidation_distance_pct, open_stop_within_liq_room
 
     tp_tune = get_active_tuning_safe()
-    relax_stress_gates = hourly_3r_active(settings) and (
-        is_wins_starved(settings, tp_tune) or is_opens_starved(settings, tp_tune)
+    relax_stress_gates = getattr(settings, "entries_never_pause", False) or (
+        hourly_3r_active(settings)
+        and (is_wins_starved(settings, tp_tune) or is_opens_starved(settings, tp_tune))
     )
 
     min_mrate_open, _ = achievable_margin_rates(settings, equity)
@@ -343,7 +351,7 @@ def try_open(
     if micro_acct:
         stress_conv_min = 0.48
     elif relax_stress_gates:
-        stress_conv_min = 0.58
+        stress_conv_min = 0.46 if getattr(settings, "entries_never_pause", False) else 0.58
     elif entry_relax:
         stress_conv_min = 0.52
     else:
@@ -366,6 +374,12 @@ def try_open(
         )
         return False
     if plan.margin_usd > free_margin - d.min_free_margin_usdt:
+        log.info(
+            "skip %s: margin $%.2f > budget $%.2f",
+            symbol.split("/")[0],
+            plan.margin_usd,
+            max(0.0, free_margin - d.min_free_margin_usdt),
+        )
         return False
 
     result = ex.open_position(
@@ -392,6 +406,11 @@ def try_open(
                 "exchange position cap %s — blocked 2h (size over coin limit)",
                 symbol.split("/")[0],
             )
+        log.info(
+            "skip %s: order failed%s",
+            symbol.split("/")[0],
+            f" — {err}" if err else "",
+        )
         return False
     if not settings.dry_run and result is not None:
         ex.ensure_leverage(symbol, decision.signal.value, leverage=plan.leverage)
@@ -639,7 +658,12 @@ def _scan_symbols_ws(
     return scan
 
 
-def _count_unprotected_positions(ex: BlofinExchange, positions: dict) -> tuple[int, list[str]]:
+def _count_unprotected_positions(
+    ex: BlofinExchange,
+    positions: dict,
+    *,
+    registry: PositionRegistry | None = None,
+) -> tuple[int, list[str]]:
     missing: list[str] = []
     for key, pos in positions.items():
         symbol = str(pos.get("symbol") or key).split("#", 1)[0]
@@ -649,7 +673,18 @@ def _count_unprotected_positions(ex: BlofinExchange, positions: dict) -> tuple[i
             continue
         if ex._lookup_open_position(symbol, side) is None:
             continue
-        if ex.live_exchange_tpsl(symbol, side, entry, pos=pos) is None:
+        meta = (registry.get(symbol) if registry else None) or {}
+        if (
+            ex.live_exchange_tpsl(
+                symbol,
+                side,
+                entry,
+                pos=pos,
+                registry_meta=meta,
+                allow_registry_fallback=True,
+            )
+            is None
+        ):
             missing.append(symbol)
     return len(missing), missing
 
@@ -730,7 +765,9 @@ def run_once(
             registry,
             api_ok=ex.equity_fetch_ok and ex.positions_fetch_ok,
         )
-    unprotected_n, unprotected_syms = _count_unprotected_positions(ex, open_positions)
+    unprotected_n, unprotected_syms = _count_unprotected_positions(
+        ex, open_positions, registry=registry
+    )
     if unprotected_n > 0 and not settings.dry_run:
         log.error(
             "exchange TP/SL missing on %d open position(s): %s — forcing repair before any new entries",
@@ -739,14 +776,30 @@ def run_once(
         )
         repaired_n = ex.repair_all_open_tpsl(settings, registry=registry)
         open_positions = ex.fetch_all_positions()
-        unprotected_n, _ = _count_unprotected_positions(ex, open_positions)
+        unprotected_n, unprotected_syms = _count_unprotected_positions(
+            ex, open_positions, registry=registry
+        )
         if unprotected_n > 0:
-            log.error(
-                "TP/SL still missing on %d open position(s) after repair (%d repaired) — entries hard-paused",
-                unprotected_n,
-                repaired_n,
-            )
-            return max(6, min(15, int(getattr(settings, "scalp_steward_interval", 6))))
+            api_unreachable = api_backoff.is_paused() or not ex.tpsl_pending_fetch_ok
+            if api_unreachable:
+                log.warning(
+                    "TP/SL unconfirmed on %d position(s) after repair (%d repaired) — "
+                    "API/backoff unreachable; deferring hard-pause (registry trust active)",
+                    unprotected_n,
+                    repaired_n,
+                )
+            elif getattr(settings, "entries_never_pause", False):
+                log.warning(
+                    "TP/SL unconfirmed on %d position(s) — entries_never_pause: scanning continues",
+                    unprotected_n,
+                )
+            else:
+                log.error(
+                    "TP/SL still missing on %d open position(s) after repair (%d repaired) — entries hard-paused",
+                    unprotected_n,
+                    repaired_n,
+                )
+                return max(6, min(15, int(getattr(settings, "scalp_steward_interval", 6))))
     engine.update_fluid(equity, free_margin, len(open_positions))
     if settings.markov_regime_enabled:
         anchor = "BTC/USDT:USDT"
@@ -871,6 +924,16 @@ def run_once(
     candidates = []
     for sym in scan:
         try:
+            if getattr(settings, "trade_lessons_enabled", True):
+                try:
+                    from trade_lessons import symbol_blocked
+
+                    blocked, reason = symbol_blocked(settings, sym)
+                    if blocked:
+                        log.debug("skip %s: %s", sym.split("/")[0], reason)
+                        continue
+                except Exception:
+                    pass
             if (
                 quality_store is not None
                 and settings.symbol_quality_enabled
@@ -890,8 +953,11 @@ def run_once(
                 scan_min_conf = min(scan_min_conf, 0.52)
                 scan_min_score = min(scan_min_score, 52.0)
             elif fill_mode and (starved or opens_starved):
-                scan_min_conf = min(scan_min_conf, 0.54)
-                scan_min_score = min(scan_min_score, 54.0)
+                scan_min_conf = min(scan_min_conf, 0.52)
+                scan_min_score = min(scan_min_score, 50.0)
+            elif getattr(settings, "entries_never_pause", False):
+                scan_min_conf = min(scan_min_conf, 0.52)
+                scan_min_score = min(scan_min_score, 50.0)
             d = analyze_symbol(
                 ex,
                 settings,
@@ -940,22 +1006,30 @@ def run_once(
         per_tick = min(knobs.max_opens_per_tick, open_slots) if open_slots else 0
         if per_tick <= 0:
             return knobs.poll_seconds
-    entry_press = fill_mode or starved or opens_starved or wins_starved
+    entry_press = (
+        fill_mode
+        or starved
+        or opens_starved
+        or wins_starved
+        or (settings.winner_only_mode and getattr(settings, "entries_never_pause", False))
+    )
     mission_floor = knobs.min_confidence
     if settings.llm_trading_enabled:
         mission_floor = min(mission_floor, settings.llm_trading_min_confidence + 0.05)
     if entry_press:
+        if settings.winner_only_mode and getattr(settings, "entries_never_pause", False):
+            mission_floor = min(mission_floor, 0.44)
         if wins_starved and not opens_starved:
             mission_floor = min(
-                max(mission_floor, 0.48, knobs.min_confidence * 0.82),
-                0.56,
+                max(mission_floor, 0.44, knobs.min_confidence * 0.78),
+                0.52,
             )
         else:
             mission_floor = min(
-                max(mission_floor, 0.46, knobs.min_confidence * 0.80),
-                0.52,
+                max(mission_floor, 0.40, knobs.min_confidence * 0.72),
+                0.48,
             )
-    if engine._last_mission is not None and not settings.unrestricted_trading:
+    if engine._last_mission is not None and not settings.unrestricted_trading and not settings.entries_never_pause:
         if not entry_press:
             mission_floor = max(mission_floor, engine._last_mission.min_conviction)
         else:
@@ -976,6 +1050,38 @@ def run_once(
         elite_only=settings.winner_elite_only and not entry_press,
         allow_elite_fallback=allow_apex_fallback,
     )
+    if not elite and ranked and entry_press and settings.winner_only_mode:
+        from scalp_optimizer import micro_tune_for_flow
+
+        top = ranked[0]
+        tuned_floor, tune_note = micro_tune_for_flow(
+            settings.state_dir,
+            settings,
+            ranked_count=len(ranked),
+            top_conviction=top.conviction,
+            top_tier=getattr(top.decision, "winner_tier", "") or "",
+            top_winner_score=float(getattr(top.decision, "winner_score", 0.0) or 0.0),
+            mission_floor=mission_floor,
+        )
+        if tuned_floor < mission_floor:
+            mission_floor = tuned_floor
+            elite = select_conviction_ties(
+                ranked,
+                max_opens=per_tick,
+                min_conviction=mission_floor,
+                apex_preferred=settings.winner_apex_preferred and not entry_press,
+                elite_only=settings.winner_elite_only and not entry_press,
+                allow_elite_fallback=allow_apex_fallback,
+            )
+            if elite and tune_note:
+                log.info(
+                    "flow self-tune: conv floor %.2f -> %.2f (%s) | open %s conv=%.3f",
+                    knobs.min_confidence,
+                    mission_floor,
+                    tune_note,
+                    elite[0].symbol.split("/")[0],
+                    elite[0].conviction,
+                )
     if not opens_allowed:
         return knobs.poll_seconds
 
@@ -1055,6 +1161,7 @@ def run_once(
             max_pct=knobs.margin_deploy_max_pct,
             action_intensity=knobs.action_intensity,
             tie_count=tie_n,
+            loss_streak=engine._consecutive_losses,
         )
         if equity < settings.micro_equity_threshold:
             margin_frac = max(margin_frac, min(0.85, settings.micro_max_margin_frac * 3.0))
@@ -1118,9 +1225,14 @@ def main() -> None:
     engine = create_engine(settings.state_dir)
     engine.bind_settings(settings)
     engine.unrestricted_trading = settings.unrestricted_trading
+    engine.entries_never_pause = settings.entries_never_pause
     if settings.unrestricted_trading:
         log.warning(
             "UNRESTRICTED_TRADING=true — drawdown/mission/fluid entry pauses DISABLED (SL/TP still on)"
+        )
+    elif settings.entries_never_pause:
+        log.warning(
+            "ENTRIES_NEVER_PAUSE=true — mission/fluid/curve entry pauses OFF; optimizers still tune quality"
         )
     log.info("AUTONOMOUS ENGINE: %s", engine.doctrine_summary())
 
@@ -1188,15 +1300,15 @@ def main() -> None:
     if settings.winner_only_mode:
         cap = effective_max_open(settings, eq0)
         cap_msg = "unlimited" if cap >= UNLIMITED_POSITIONS else str(cap)
-        apex_note = (
+        tier_note = (
             f"apex>={settings.winner_apex_score:.2f} preferred"
             if settings.winner_apex_preferred
-            else "elite+"
+            else f"good+ winner score>={settings.winner_min_score:.2f} (endless universe scan)"
         )
         log.warning(
-            "50x 3R THROUGHPUT: %s | elite>=%.2f | target %d–%d opens/hr | lev=%d–%dx | "
+            "WINNERS ONLY: %s | elite>=%.2f | target %d–%d opens/hr | lev=%d–%dx | "
             "max_open=%s | core_brain=on | hold/SL/TP unchanged",
-            apex_note,
+            tier_note,
             settings.winner_elite_score,
             settings.optimizer_target_min_tph,
             settings.optimizer_target_max_tph,
@@ -1311,14 +1423,25 @@ def main() -> None:
     def _harvest_eagerness() -> float:
         c = engine.curve_state
         base = c.harvest_eagerness if c else 1.0
+        boost = 1.0
+        try:
+            from roe_learning import get_roe_store
+
+            _wr, _pf, neg_streak, avg_roe = get_roe_store(settings.state_dir).recent_performance(
+                3600.0, limit=24
+            )
+            if neg_streak >= 2 or avg_roe < -4.0:
+                boost = min(1.45, 1.0 + neg_streak * 0.08)
+        except Exception:
+            pass
         if getattr(settings, "account_curve_maximize", True):
             if c and c.curve_phase in ("vertical", "climbing"):
-                return min(0.52, base * 0.7)
+                return min(0.65, base * 0.82 * boost)
             if c and c.curve_phase == "flat":
-                return min(0.72, base * 0.85)
+                return min(0.82, base * 0.92 * boost)
         if getattr(settings, "stack_winners_mode", True):
-            return min(0.9, base)
-        return base
+            return min(1.15, base * boost)
+        return min(1.5, base * boost)
 
     if cross_migrator is None and settings.mode == "live" and not settings.dry_run:
         from margin_migrator import CrossMarginAutoMigrator

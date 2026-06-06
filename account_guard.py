@@ -43,6 +43,8 @@ def min_free_margin_to_open(settings: "Settings", equity: float) -> float:
     floor = settings.margin_reserve_usdt * 3
     if equity <= 0:
         return floor
+    if getattr(settings, "entries_never_pause", False) or universe_fill_active(settings):
+        return max(floor, 1.0)
     pct_floor = equity * settings.min_free_margin_pct
     return max(floor, pct_floor)
 
@@ -66,11 +68,14 @@ def entry_allowed(
 ) -> tuple[bool, str]:
     _ = peak_equity
     try:
-        from runtime_gates import read_entries_pause
+        from runtime_gates import clear_entries_pause, read_entries_pause
 
-        paused, reason = read_entries_pause(settings.state_dir)
-        if paused:
-            return False, f"runtime pause: {reason}"
+        if getattr(settings, "entries_never_pause", False):
+            clear_entries_pause(settings.state_dir)
+        else:
+            paused, reason = read_entries_pause(settings.state_dir)
+            if paused:
+                return False, f"runtime pause: {reason}"
     except Exception:
         pass
     if settings.entries_paused:

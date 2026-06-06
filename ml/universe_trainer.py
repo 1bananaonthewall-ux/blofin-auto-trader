@@ -47,6 +47,8 @@ class ContinuousMlTrainer:
         self._bootstrapped = False
         self._last_outcome_labels = 0
         self._last_refit_skip_log = 0.0
+        self._last_shard_skip_log = 0.0
+        self._last_forward_refit_log = 0.0
         self._shard_dir = settings.state_dir / "ml_shards"
         self._state_path = settings.state_dir / "ml_trainer_state.json"
         self._markets: list = []
@@ -60,9 +62,13 @@ class ContinuousMlTrainer:
                 self._idx = int(raw.get("idx", 0))
                 self._bootstrapped = bool(raw.get("bootstrapped", False))
                 self._last_refit_ts = float(raw.get("last_refit_ts", 0))
+                self._last_outcome_labels = int(raw.get("last_outcome_labels", 0))
             except Exception:
                 self._idx = 0
-        if self.shard_count() >= max(3, self.settings.ml_bootstrap_symbols // 2):
+        n_shards = self.shard_count()
+        if n_shards == 0:
+            self._bootstrapped = False
+        elif n_shards >= max(3, self.settings.ml_bootstrap_symbols // 2):
             self._bootstrapped = True
 
     def _save_state(self) -> None:
@@ -74,6 +80,7 @@ class ContinuousMlTrainer:
                     "universe_n": len(self._markets),
                     "bootstrapped": self._bootstrapped,
                     "last_refit_ts": self._last_refit_ts,
+                    "last_outcome_labels": self._last_outcome_labels,
                     "updated_at": time.time(),
                 },
                 indent=2,
@@ -120,6 +127,13 @@ class ContinuousMlTrainer:
             return
         n = self.refresh_universe()
         self._maybe_rotate_stale_shards()
+        if self.shard_count() < max(3, self.settings.ml_bootstrap_symbols // 4):
+            self._bootstrapped = False
+            log.warning(
+                "ML shards empty/low (%d) — will re-bootstrap %d symbols",
+                self.shard_count(),
+                self.settings.ml_bootstrap_symbols,
+            )
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="ml-universe-trainer", daemon=True)
         self._thread.start()
@@ -145,13 +159,14 @@ class ContinuousMlTrainer:
             min_new = max(1, min(min_new, 2))
         delta = n - self._last_outcome_labels
         if delta >= min_new and n > 0:
-            self._last_outcome_labels = n
             log.info(
                 "ML outcome feedback: +%d new labels (%d total) — scheduling forward refit",
                 delta,
                 n,
             )
-            self.request_full_refit()
+            self._last_outcome_labels = n
+            self._save_state()
+            self.request_full_refit(force=True)
             try:
                 from stack_learning import schedule_cortex_train
 
@@ -167,12 +182,29 @@ class ContinuousMlTrainer:
     def stop(self) -> None:
         self._stop.set()
 
-    def request_full_refit(self) -> None:
+    def request_full_refit(self, *, force: bool = False) -> None:
         now = time.time()
-        if self._force_fit.is_set() and now - self._last_refit_request_ts < 120:
+        if (
+            not force
+            and self._force_fit.is_set()
+            and now - self._last_refit_request_ts < 120
+        ):
             return
         self._last_refit_request_ts = now
         self._force_fit.set()
+
+    def _feedback_refit_floor(self) -> int:
+        """Min labelled closes to refit from outcomes alone (no shards)."""
+        return max(50, min(100, self.settings.ml_min_deploy_samples // 4))
+
+    def sync_outcome_label_cursor(self, tracker: TradeOutcomeTracker) -> None:
+        """Align forward-refit cursor with disk so restarts do not re-queue all labels."""
+        _, y = tracker.load_labelled_samples(margin_mode=self.settings.margin_mode)
+        n = len(y)
+        if n > 0 and self._last_outcome_labels <= 0:
+            self._last_outcome_labels = n
+            self._save_state()
+            log.info("ML forward cursor synced: %d labelled outcomes on disk", n)
 
     def _loop(self) -> None:
         last_refresh = 0.0
@@ -243,11 +275,23 @@ class ContinuousMlTrainer:
     def _train_one(self, market) -> bool:
         symbol = market.symbol
         try:
-            ohlcv_1m = self.ex.fetch_ohlcv(symbol, "1m", self.settings.ml_history_bars)
+            hist = self.settings.ml_history_bars
+            ohlcv_1m = self.ex.fetch_ohlcv(symbol, "1m", hist, prefer_rest=True)
             ohlcv_5m = self.ex.fetch_ohlcv(
-                symbol, "5m", min(500, self.settings.ml_history_bars // 5)
+                symbol, "5m", min(500, hist // 5), prefer_rest=True
             )
             funding = self.ex.fetch_funding_rate(symbol)
+            if len(ohlcv_1m) < 90 or len(ohlcv_5m) < 22:
+                now = time.time()
+                if now - self._last_shard_skip_log > 120.0:
+                    self._last_shard_skip_log = now
+                    log.warning(
+                        "ml shard skip %s: short OHLCV 1m=%d 5m=%d (need REST depth for training)",
+                        symbol,
+                        len(ohlcv_1m),
+                        len(ohlcv_5m),
+                    )
+                return False
             batch = build_training_matrix(
                 ohlcv_1m,
                 ohlcv_5m,
@@ -256,7 +300,15 @@ class ContinuousMlTrainer:
                 **training_matrix_kwargs(self.settings),
             )
             if batch is None:
-                log.debug("ml shard skip %s (insufficient labels)", symbol)
+                now = time.time()
+                if now - self._last_shard_skip_log > 120.0:
+                    self._last_shard_skip_log = now
+                    log.warning(
+                        "ml shard skip %s: insufficient labels (1m=%d 5m=%d)",
+                        symbol,
+                        len(ohlcv_1m),
+                        len(ohlcv_5m),
+                    )
                 return False
             X, y = batch
             safe = symbol.replace("/", "_").replace(":", "_")
@@ -304,12 +356,13 @@ class ContinuousMlTrainer:
                 margin_mode=self.settings.margin_mode
             )
             if not shards:
-                min_fb = max(80, min(200, self.settings.ml_min_deploy_samples // 2))
+                min_fb = self._feedback_refit_floor()
                 if len(y_fb) >= min_fb:
                     log.info(
-                        "ML refit (%s): no shards — training from %d outcome feedback samples",
+                        "ML forward refit (%s): feedback-only from %d outcome samples (need>=%d)",
                         reason,
                         len(y_fb),
+                        min_fb,
                     )
                     model = SignalModel()
                     metrics = model.fit(
@@ -317,13 +370,23 @@ class ContinuousMlTrainer:
                         y_fb,
                         symbols=1,
                         walk_forward_splits=max(3, self.settings.ml_walk_forward_splits // 2),
-                        min_train_samples=min(120, self.settings.ml_walk_forward_min_train),
+                        min_train_samples=min(80, self.settings.ml_walk_forward_min_train // 2),
+                        min_deploy_samples=min_fb,
                     )
                     model.save(
                         self.settings.state_dir / "signal_model.joblib",
                         self.settings.state_dir / "signal_model_meta.json",
                     )
                     self._last_refit_ts = time.time()
+                    self._save_state()
+                    log.info(
+                        "ML forward refit (%s) feedback=%d samples=%d val_acc=%.1f%% deployed=%s",
+                        reason,
+                        metrics.feedback_samples,
+                        metrics.samples,
+                        metrics.val_accuracy * 100,
+                        metrics.deployed,
+                    )
                     if self.on_model_updated:
                         self.on_model_updated()
                     return
@@ -373,14 +436,88 @@ class ContinuousMlTrainer:
             self._last_refit_ts = time.time()
             self._shards_since_refit = 0
             self._save_state()
+            fb_n = len(y_fb) if len(y_fb) > 0 else 0
             log.info(
-                "ML refit (%s) universe=%d shards=%d samples=%d val_acc=%.1f%% deployed=%s",
+                "ML refit (%s) universe=%d shards=%d samples=%d feedback=%d val_acc=%.1f%% deployed=%s",
                 reason,
                 len(self._markets),
                 len(shards),
                 len(y),
+                fb_n,
                 metrics.val_accuracy * 100,
                 metrics.deployed,
             )
+            if fb_n > 0:
+                now = time.time()
+                if now - self._last_forward_refit_log > 300.0:
+                    self._last_forward_refit_log = now
+                    log.info("ML forward learning active — %d live outcome labels merged", fb_n)
             if self.on_model_updated:
                 self.on_model_updated()
+
+
+def shard_count_for(settings) -> int:
+    shard_dir = settings.state_dir / "ml_shards"
+    if not shard_dir.exists():
+        return 0
+    return len(list(shard_dir.glob("*.npz")))
+
+
+def seed_shards_offline(ex, settings, *, n: int | None = None) -> int:
+    """Save training shards without starting the background trainer thread."""
+    cap = training_symbol_cap(settings)
+    markets = load_training_markets(ex, cap=cap)
+    if not markets:
+        return 0
+    want = min(n or settings.ml_bootstrap_symbols, len(markets))
+    trainer = ContinuousMlTrainer(ex, settings)
+    saved = 0
+    for i in range(want):
+        if trainer._train_one(markets[i]):
+            saved += 1
+    trainer._save_state()
+    return saved
+
+
+def run_offline_refit(settings, ex=None, *, reason: str = "offline") -> dict:
+    """
+    One-shot shard + forward-feedback refit (hourly guard / maintenance scripts).
+    Does not start the background trainer thread.
+    """
+    trainer = ContinuousMlTrainer(ex, settings) if ex is not None else ContinuousMlTrainer(None, settings)
+    if ex is not None:
+        trainer.refresh_universe()
+    shards_before = trainer.shard_count()
+    result: dict = {
+        "reason": reason,
+        "shards_before": shards_before,
+        "ok": False,
+        "deployed": False,
+        "samples": 0,
+        "feedback": 0,
+        "val_accuracy": 0.0,
+    }
+    if shards_before < 3:
+        result["error"] = f"insufficient_shards={shards_before}"
+        return result
+    trainer._aggregate_and_train(reason=reason)
+    meta_path = settings.state_dir / "signal_model_meta.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            result.update(
+                {
+                    "ok": True,
+                    "deployed": bool(meta.get("deployed")),
+                    "samples": int(meta.get("samples", 0)),
+                    "feedback": int(meta.get("feedback_samples", 0)),
+                    "val_accuracy": float(meta.get("val_accuracy", 0)),
+                    "trained_at": meta.get("trained_at"),
+                }
+            )
+        except Exception as exc:
+            result["error"] = str(exc)
+    else:
+        result["error"] = "no_model_meta"
+    result["shards_after"] = trainer.shard_count()
+    return result

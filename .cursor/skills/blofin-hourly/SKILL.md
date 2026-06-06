@@ -13,10 +13,33 @@ Run this checklist on the machine with API access (project root = God Bot repo c
 
 ```powershell
 cd <PROJECT_ROOT>
-python scripts\hourly_health_report.py
+python scripts\hourly_maintain.py
+# or inspect only:
+python hourly_brain.py
 ```
 
-Read `state/hourly_report.json` and `logs/bot.log` (last ~80 lines).
+Read `state/hourly_report.json`, `state/hourly_brain_state.json`, `state/ml_health.json`, `state/throughput_guard.json`, and `logs/bot.log` (last ~80 lines).
+`scripts/hourly_maintain.py` runs **hourly_brain** (learned policy + autocode) which orchestrates throughput_guard, ml_health, optimizer autocode, cortex, and TPSL repair.
+If `opens_60m` is below `target_opens_hr`, throughput_guard should already have nudged tuning — verify `THROUGHPUT GUARD` / `OPTIMIZER` lines in `logs/bot.log`.
+
+## 1b. ML continuous training (required)
+
+Confirm automatic ML is healthy:
+
+- `ML_CONTINUOUS_TRAIN=true`, `SIGNAL_MODE=ml`
+- `state/ml_shards/*.npz` count ≥ 3; recent `ml shard saved` in `logs/bot.log`
+- `state/signal_model_meta.json`: `deployed=true`, `feedback_samples` near labelled outcomes count
+- `state/ml_trainer_state.json`: `last_refit_ts` within ~2h; `last_outcome_labels` synced
+- Log lines: `merging N real-feedback`, `ML refit`, `ML forward learning active`
+
+If unhealthy, hourly_brain action `ml_health` handles it (flags + repair).
+
+## 1c. Hourly brain / autocode (required)
+
+- `HOURLY_BRAIN_ENABLED=true` — sklearn policy in `state/hourly_brain.joblib` learns from `state/hourly_brain_train.jsonl`
+- `HOURLY_AUTOCODE_ENABLED=true` — rewrites `state/hourly_autocode.py` (LLM or template) for `decide(snapshot)` action list
+- Check `state/hourly_brain_state.json` → `last_run.decided` / `last_run.applied`
+- Log line: `HOURLY BRAIN | policy=...` and `HOURLY AUTOCODE -> ...`
 
 ## 2. Positions — true 50x only
 
@@ -45,7 +68,7 @@ python -c "from pathlib import Path; from config import load_settings; from scal
 
 ## 5. Report (required)
 
-Append one line to `state/hourly_agent_log.jsonl` with: timestamp, equity, open count, non-50x closed, optimizer action, anomalies.
+Append one line to `state/hourly_agent_log.jsonl` with: timestamp, equity, open count, non-50x closed, optimizer action, ml_health note, anomalies.
 
 Tell the user in chat: equity, open positions with inst/eff lev, tph, any closes, optimizer note. Keep it under 15 lines.
 

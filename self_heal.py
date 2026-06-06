@@ -96,6 +96,7 @@ class SelfHealer:
     def sync_engine_config(engine: AutonomousGrowthEngine, settings: Settings) -> None:
         """Re-apply .env flags each tick so restart is not required for config changes."""
         engine.unrestricted_trading = settings.unrestricted_trading
+        engine.entries_never_pause = settings.entries_never_pause
 
     @staticmethod
     def reset_peaks(engine: AutonomousGrowthEngine, equity: float) -> None:
@@ -149,6 +150,15 @@ class SelfHealer:
 
         if ml is not None:
             actions.extend(self._heal_ml(settings, ml, ml_trainer))
+
+        try:
+            from throughput_guard import tick as throughput_tick
+
+            tg = throughput_tick(settings, equity=equity, free_margin=free_margin)
+            if tg.get("actions"):
+                actions.extend([f"flow:{a}" for a in tg["actions"][:4]])
+        except Exception:
+            log.debug("throughput_guard tick failed", exc_info=True)
 
         engine.manifold.clear_force_retrain()
 
@@ -232,6 +242,61 @@ class SelfHealer:
             log.warning("SELF-HEAL TPSL: naked positions but repair returned no success")
         return actions
 
+    def _ml_flag_actions(
+        self,
+        settings: Settings,
+        ml: MLPredictor,
+        ml_trainer: ContinuousMlTrainer | None,
+        now: float,
+    ) -> list[str]:
+        actions: list[str] = []
+        state_dir = settings.state_dir
+
+        reload_flag = state_dir / "ml_reload.flag"
+        if reload_flag.is_file():
+            try:
+                reload_flag.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if ml.reload():
+                actions.append("ml_model_reloaded_flag")
+
+        instant_flag = state_dir / "ml_instant_refit.flag"
+        if instant_flag.is_file():
+            try:
+                instant_flag.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if ml_trainer and now - self._state.last_full_refit_request >= 90:
+                ml_trainer.request_full_refit(force=True)
+                self._state.last_full_refit_request = now
+                actions.append("ml_instant_lesson_refit")
+
+        bootstrap_flag = state_dir / "ml_bootstrap_due.flag"
+        if bootstrap_flag.is_file():
+            try:
+                bootstrap_flag.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if ml_trainer:
+                ml_trainer._bootstrapped = False
+                ml_trainer.request_full_refit(force=True)
+                self._state.last_full_refit_request = now
+                actions.append("ml_bootstrap_due")
+
+        flag = state_dir / "ml_force_refit.flag"
+        if flag.is_file():
+            try:
+                flag.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if ml_trainer:
+                ml_trainer.request_full_refit(force=True)
+                self._state.last_full_refit_request = now
+                actions.append("ml_force_refit_flag")
+
+        return actions
+
     def _heal_ml(
         self,
         settings: Settings,
@@ -241,8 +306,14 @@ class SelfHealer:
         if settings.signal_mode != "ml":
             return []
 
-        actions: list[str] = []
+        now = time.time()
+        actions = self._ml_flag_actions(settings, ml, ml_trainer, now)
+
         if ml.is_ready():
+            if ml_trainer and now - self._state.last_full_refit_request >= 600:
+                ml_trainer.request_full_refit()
+                self._state.last_full_refit_request = now
+                actions.append("background_ml_refit")
             return actions
 
         if ml.reload():
@@ -261,23 +332,6 @@ class SelfHealer:
                     backup.unlink()
                 corrupt.rename(backup)
                 actions.append("quarantined_corrupt_model")
-
-        flag = settings.state_dir / "ml_force_refit.flag"
-        if flag.is_file():
-            try:
-                flag.unlink(missing_ok=True)
-            except OSError:
-                pass
-            if ml_trainer:
-                ml_trainer.request_full_refit()
-                self._state.last_full_refit_request = time.time()
-                actions.append("ml_force_refit_flag")
-
-        now = time.time()
-        if ml_trainer and now - self._state.last_full_refit_request >= 600:
-            ml_trainer.request_full_refit()
-            self._state.last_full_refit_request = now
-            actions.append("background_ml_refit")
 
         return actions
 

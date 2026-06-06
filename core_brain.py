@@ -116,8 +116,10 @@ class CoreBrain:
         open_count: int,
         low_leverage_positions: int = 0,
         unrestricted: bool = False,
+        entries_never_pause: bool = False,
         markov: MarkovSnapshot | None = None,
     ) -> CoreDirective:
+        self._entries_never_pause = entries_never_pause
         path_rel = fluid.path_reliability if fluid else 0.5
         survival = fluid.survival if fluid else 0.5
 
@@ -138,6 +140,8 @@ class CoreBrain:
             risk_mult = ms.risk_multiplier
             mission_focus = ms.mission_focus
             behind = ms.behind_schedule
+            if entries_never_pause:
+                entry_ok = equity > 0 and free_margin > 0.01
 
         from account_guard import effective_hourly_tph_cap, universe_fill_active
 
@@ -174,18 +178,26 @@ class CoreBrain:
         wins_starved = hourly_3r_active(settings) and tuning.wins_last_hour < target_wins_per_hour(
             settings
         )
-        if behind and not starved and not wins_starved:
+        if behind and not starved and not wins_starved and not entries_never_pause:
             allow_fallback = False
             min_conv = max(min_conv, settings.winner_elite_score - 0.06)
         elif wins_starved or is_opens_starved(settings, tuning):
             min_conv = min(min_conv, 0.52)
             allow_fallback = True
+        if entries_never_pause and getattr(settings, "winner_only_mode", False):
+            if fill_mode or starved or is_opens_starved(settings, tuning):
+                min_conv = min(min_conv, 0.44)
+                allow_fallback = True
 
         if markov is not None:
             if markov.state == "stress":
-                min_conv = min(0.92, min_conv + 0.06)
-                gap = min(55.0, gap + 8.0)
-                risk_mult *= 0.88
+                if not starved:
+                    min_conv = min(0.92, min_conv + 0.06)
+                    gap = min(55.0, gap + 8.0)
+                    risk_mult *= 0.88
+                else:
+                    min_conv = max(0.46, min_conv - 0.02)
+                    gap = max(6.0, gap - 2.0)
             elif markov.state == "trend" and starved:
                 min_conv = max(0.48, min_conv - 0.02)
                 gap = max(6.0, gap - 2.0)
@@ -194,9 +206,15 @@ class CoreBrain:
             stress_pause = markov.probs[2] > 0.42
             if equity < settings.small_account_threshold:
                 stress_pause = markov.probs[2] > 0.34
-            if stress_pause and not unrestricted and not fill_mode and not (
-                hourly_3r_active(settings)
-                and (is_entry_starved(settings) or is_opens_starved(settings))
+            if (
+                stress_pause
+                and not unrestricted
+                and not entries_never_pause
+                and not fill_mode
+                and not (
+                    hourly_3r_active(settings)
+                    and (is_entry_starved(settings) or is_opens_starved(settings))
+                )
             ):
                 entry_ok = False
                 mission_dir = f"Markov stress {markov.probs[2]:.0%} — entries paused"
@@ -263,12 +281,17 @@ class CoreBrain:
             return False, "core brain not initialized"
         if not d.entry_allowed:
             return False, d.mission_directive
-        if conviction < d.min_conviction:
+        floor = d.min_conviction
+        if getattr(self, "_entries_never_pause", False) and d.starved:
+            floor = min(floor, 0.46)
+        if conviction < floor:
             return (
                 False,
-                f"conviction {conviction:.3f} < core floor {d.min_conviction:.3f}",
+                f"conviction {conviction:.3f} < core floor {floor:.3f}",
             )
-        if d.behind_schedule and conviction < 0.62 and not d.starved:
+        if d.behind_schedule and conviction < 0.62 and not d.starved and not getattr(
+            self, "_entries_never_pause", False
+        ):
             return False, "behind mission — need apex-level edge"
         return True, "core brain: advances mission at target pace"
 

@@ -5,6 +5,10 @@
       {
         "command": "python .cursor/hooks/hourly_session_reminder.py",
         "timeout": 15
+      },
+      {
+        "command": "python .cursor/hooks/agent_5m_session_reminder.py",
+        "timeout": 15
       }
     ]
   }

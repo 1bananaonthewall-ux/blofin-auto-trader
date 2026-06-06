@@ -1,4 +1,4 @@
-# Launched detached from dashboard_api — must survive dashboard process exit.
+# Launched detached from dashboard_api - must survive dashboard process exit.
 param([int]$DashboardPort = 5050)
 
 $ErrorActionPreference = "Continue"
@@ -41,7 +41,7 @@ try {
 } catch { }
 
 if (-not $listening) {
-    Write-Log "dashboard not listening on $DashboardPort — starting run_dashboard.ps1"
+    Write-Log "dashboard not listening on $DashboardPort - starting run_dashboard.ps1"
     Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass",
         "-File", $dashPs1,

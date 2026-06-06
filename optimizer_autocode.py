@@ -41,14 +41,22 @@ def apply_overrides(conf_gate: float, score_gate: float, *, markov_state: str = 
     return conf_gate, score_gate
 """
     if mode == "throughput":
-        # Slightly looser to recover throughput, but still bounded.
+        # Looser when flow is starved; winner gate still owns quality.
         return """from __future__ import annotations
 
 def apply_overrides(conf_gate: float, score_gate: float, *, markov_state: str = "", trades_last_hour: int = 0):
-    conf_gate -= 0.02
-    score_gate -= 1.5
+    if trades_last_hour < 4:
+        conf_gate -= 0.05
+        score_gate -= 3.0
+    elif trades_last_hour < 8:
+        conf_gate -= 0.03
+        score_gate -= 2.0
+    else:
+        conf_gate -= 0.02
+        score_gate -= 1.0
     if markov_state == "stress":
         conf_gate += 0.02
+        score_gate += 1.0
     return conf_gate, score_gate
 """
     return """from __future__ import annotations
@@ -172,9 +180,21 @@ def maybe_apply_autocode(
         return "disabled"
 
     mode = "neutral"
-    if action in {"tighten_quality", "slow_overtrade"} or win_rate < 0.40 or profit_factor < 0.85:
+    flow_actions = {"loosen_throughput", "accelerate_hot", "pace_up_quality"}
+    tighten_actions = {"tighten_quality", "slow_overtrade", "tighten_roe"}
+    opens_starved = trades_last_hour < 4
+    # Winner gate still filters junk — throughput autocode must not fight starved loosening.
+    if action in flow_actions and equity_delta_15m_pct > -3.5:
+        mode = "throughput"
+    elif opens_starved and action not in tighten_actions and equity_delta_15m_pct > -4.0:
+        mode = "throughput"
+    elif action in tighten_actions or (
+        (win_rate < 0.40 or profit_factor < 0.85)
+        and action not in flow_actions
+        and not opens_starved
+    ):
         mode = "quality"
-    elif action in {"loosen_throughput", "accelerate_hot", "pace_up_quality"} and equity_delta_15m_pct > -2.5:
+    elif action in flow_actions and equity_delta_15m_pct > -2.5:
         mode = "throughput"
 
     st_path = state_dir / STATE_FILE

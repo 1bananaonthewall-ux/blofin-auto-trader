@@ -232,7 +232,10 @@ def evaluate_pick_for_symbol(
     opp_ratio = _weighted_opposition_ratio(cf, side)
     hard_opp = settings.winner_max_opposition_ratio + 0.14
     starved_3r = hourly_3r_active(settings) and is_entry_starved(settings)
-    if starved_3r:
+    from account_guard import universe_fill_active
+
+    universe = universe_fill_active(settings)
+    if starved_3r or universe:
         hard_opp += 0.14
     if opp_ratio > hard_opp:
         return PickVerdict(False, winner_score, f"opposition {opp_ratio:.0%} overwhelming")
@@ -263,9 +266,18 @@ def evaluate_pick_for_symbol(
                 )
 
     if _rsi_exhausted(side, decision.rsi):
-        if starved_3r and len(cf.agreeing) >= 5 and len(cf.opposing) <= 2:
-            pass
-        else:
+        rsi_bypass = (
+            winner_tier in ("good", "elite", "apex")
+            and len(cf.opposing) <= 3
+            and (
+                starved_3r
+                or universe
+                or len(cf.agreeing) >= 4
+                or winner_score >= getattr(settings, "winner_min_score", 0.55) - 0.04
+                or winner_tier in ("elite", "apex")
+            )
+        )
+        if not rsi_bypass:
             return PickVerdict(False, winner_score, f"RSI exhausted ({decision.rsi:.0f})")
 
     sym_wr, sym_n = _recent_side_edge(settings.state_dir, symbol, side.value)
@@ -296,11 +308,15 @@ def evaluate_pick_for_symbol(
         from account_guard import universe_fill_active
 
         if universe_fill_active(settings):
-            min_pick = min(min_pick, 0.35)
+            min_pick = min(min_pick, 0.30)
     except Exception:
         pass
+    if getattr(settings, "entries_never_pause", False):
+        min_pick = min(min_pick, 0.28)
     if getattr(decision, "confluence_zone", "") == "llm":
         min_pick = min(min_pick, 0.45)
+    if winner_tier in ("good", "elite", "apex"):
+        min_pick = min(min_pick, max(0.28, getattr(settings, "winner_min_score", 0.55) - 0.14))
     if winner_tier in ("elite", "apex"):
         min_pick = min(min_pick, 0.50)
     if pick < min_pick:

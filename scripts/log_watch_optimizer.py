@@ -153,6 +153,47 @@ def analyze() -> dict:
         except Exception as e:
             opt_note = f"skip:{e}"
 
+    ml_note = ""
+    try:
+        from ml_health_guard import audit as ml_audit, repair as ml_repair
+
+        ml_rep = ml_audit(settings, root=ROOT)
+        ml_rep = ml_repair(settings, ml_rep, ex=None, root=ROOT, hourly=False)
+        if ml_rep.actions:
+            actions.extend([f"ml:{a}" for a in ml_rep.actions])
+            ml_note = f"fixes={len(ml_rep.actions)}"
+        elif not ml_rep.ok:
+            anomalies.extend([f"ml:{i}" for i in ml_rep.issues[:3]])
+            ml_note = "watching"
+        else:
+            ml_note = "ok"
+    except Exception as e:
+        ml_note = f"skip:{e}"
+
+    throughput_note = ""
+    try:
+        from throughput_guard import tick as throughput_tick
+
+        tg = throughput_tick(
+            settings,
+            equity=last_eq,
+            free_margin=0.0,
+            root=ROOT,
+        )
+        if tg.get("actions"):
+            actions.extend([f"throughput:{a}" for a in tg["actions"]])
+            throughput_note = (
+                f"opens={tg.get('opens_60m')}/{tg.get('target_opens_hr')} "
+                f"fixes={len(tg['actions'])}"
+            )
+        elif tg.get("starved") or tg.get("predictive"):
+            anomalies.append(
+                f"throughput_starved opens={tg.get('opens_60m')}/{tg.get('target_opens_hr')}"
+            )
+            throughput_note = "watching"
+    except Exception as e:
+        throughput_note = f"skip:{e}"
+
     report = {
         "ts": now,
         "equity": last_eq,
@@ -166,6 +207,8 @@ def analyze() -> dict:
         "actions": actions,
         "anomalies": anomalies,
         "optimizer": opt_note,
+        "ml_health": ml_note,
+        "throughput_guard": throughput_note,
     }
     STATUS.write_text(json.dumps(report, indent=2), encoding="utf-8")
     if actions:

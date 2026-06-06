@@ -1,20 +1,38 @@
 ---
-description: After code edits in this repo, commit and push to GitHub automatically
+description: Always commit and push meaningful code changes to GitHub after finishing tasks
 alwaysApply: true
 ---
 
-# Auto-publish to GitHub
+# Auto-publish to GitHub (required after tasks)
 
-When you **finish a task that changed tracked project files** in `blofin-auto-trader`:
+When you **finish any task** that changed tracked project files in `blofin-auto-trader`, **commit and push** to `origin/main` unless the user explicitly says "do not push this session."
 
-1. Run `git status` and `git diff` — do **not** stage `.env`, `state/`, `logs/`, `__pycache__/`, `*.gguf`, or other gitignored secrets.
-2. If there are meaningful changes, **commit** with a clear message and **push** to `origin` (default branch `main`):
+## Git safety protocol
+
+- NEVER update git config
+- NEVER run destructive git commands (push --force, hard reset) unless explicitly requested
+- NEVER skip hooks (--no-verify) unless explicitly requested
+- NEVER force-push to main/master
+- Avoid `git commit --amend` unless all amend conditions in user rules are met
+- NEVER commit `.env`, credentials, `state/`, `logs/`, `__pycache__/`, `*.gguf`, `dashboard/node_modules/`, or other gitignored secrets
+
+## After every task with code changes
+
+1. Run `git status` and `git diff` in parallel with `git log -3 --oneline`
+2. Stage relevant tracked/untracked **code** files only (`git add` specific paths or `git add -A` then verify status)
+3. Draft a concise commit message focused on **why**
+4. Commit and **push** to `origin main`:
    ```powershell
-   git add -A
-   git status   # verify no secrets
-   git commit -m "your message"
    git push origin main
    ```
-3. If `gh` / push fails (auth, network), report the error and leave changes committed locally if commit succeeded.
+5. Run `git status` after push to confirm clean or report what's left
 
-Skip push only when the user explicitly says not to push this session, or when there are no code changes to publish.
+## When to skip
+
+- Question-only / review-only tasks with **zero** file changes
+- User explicitly says not to commit or push this session
+- Push fails (auth/network) — report error; leave local commit if commit succeeded
+
+## Scope
+
+Applies to **all** tasks in this repo: features, fixes, scripts, dashboard, Cursor skills/rules, docs. One task may be one commit or a few logical commits; always end with push when possible.

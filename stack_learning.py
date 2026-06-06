@@ -165,6 +165,8 @@ def run_startup_learning(
 
     def _work() -> None:
         if settings.signal_mode == "ml" and getattr(settings, "ml_auto_refit_on_startup", True):
+            if ml_trainer and tracker:
+                ml_trainer.sync_outcome_label_cursor(tracker)
             schedule_ml_startup_refit(ml_trainer, ml, reason="startup", force=True)
             if ml_trainer and tracker and getattr(settings, "ml_continuous_train", True):
                 ml_trainer.maybe_refit_from_outcomes(tracker)

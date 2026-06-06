@@ -203,11 +203,18 @@ def analyze_symbol(
                     stress_score *= 0.5
                 conf_gate = min(0.96, conf_gate + stress_conf)
                 score_gate = min(99.0, score_gate + stress_score)
+    tph = 0
+    try:
+        from scalp_optimizer import get_active_tuning
+
+        tph = int(getattr(get_active_tuning(), "trades_last_hour", 0) or 0)
+    except Exception:
+        pass
     conf_gate, score_gate = _apply_optimizer_overrides(
         conf_gate,
         score_gate,
         markov_state=(mk_snap.state if mk_snap else ""),
-        trades_last_hour=0,
+        trades_last_hour=tph,
     )
 
     decision = confluence_to_decision(cf)
@@ -263,14 +270,17 @@ def analyze_symbol(
     try:
         from account_guard import universe_fill_active
 
-        if universe_fill_active(settings):
+        if universe_fill_active(settings) or getattr(settings, "entries_never_pause", False):
             micro = equity is not None and equity > 0 and equity < settings.micro_equity_threshold
             if micro:
                 post_conf_gate = min(post_conf_gate, 0.52)
                 post_score_gate = min(post_score_gate, 52.0)
             elif hourly_3r_active(settings) and is_opens_starved(settings):
-                post_conf_gate = min(post_conf_gate, 0.54)
-                post_score_gate = min(post_score_gate, 54.0)
+                post_conf_gate = min(post_conf_gate, 0.52)
+                post_score_gate = min(post_score_gate, 52.0)
+            elif getattr(settings, "entries_never_pause", False):
+                post_conf_gate = min(post_conf_gate, 0.52)
+                post_score_gate = min(post_score_gate, 50.0)
     except Exception:
         pass
 
@@ -392,6 +402,7 @@ def analyze_symbol(
         decision,
         cf,
         settings,
+        symbol=symbol,
         ml_decision=ml_decision,
         ml_ready=ml_ready,
         ml_ctx=ml_ctx,

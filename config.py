@@ -95,6 +95,7 @@ class Settings:
     stop_loss_pct: float              # Stop loss percentage
     liquidation_buffer_pct: float     # Buffer from liquidation price (%)
     unrestricted_trading: bool        # skip drawdown/mission/fluid entry pauses
+    entries_never_pause: bool       # always allow new entries when margin ok; optimizers still tune quality
     account_curve_maximize: bool      # steer entries/harvest to steepen dashboard account curve
     runner_filter_enabled: bool       # favor steady directional runners, skip choppy up/down
     runner_min_score: float           # minimum runner_score to enter (when filter on)
@@ -201,6 +202,10 @@ class Settings:
     exec_slippage_penalty_enabled: bool
     exec_slippage_warn_bps: float
     optimizer_autocode_enabled: bool
+    hourly_brain_enabled: bool
+    hourly_autocode_enabled: bool
+    trade_lessons_enabled: bool
+    trade_lesson_ml_refit_every: int
     optimizer_autocode_cooldown_seconds: int
     llm_trading_enabled: bool
     llm_trading_min_confidence: float
@@ -314,6 +319,7 @@ def load_settings() -> Settings:
         stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "8.0")),  # 8% stop loss
         liquidation_buffer_pct=float(os.getenv("LIQUIDATION_BUFFER_PCT", "10.0")),
         unrestricted_trading=_env_bool("UNRESTRICTED_TRADING", False),
+        entries_never_pause=_env_bool("ENTRIES_NEVER_PAUSE", True),
         account_curve_maximize=(
             _env_bool("ACCOUNT_CURVE_MAXIMIZE", True)
             if os.getenv("ACCOUNT_CURVE_MAXIMIZE") is not None
@@ -437,6 +443,10 @@ def load_settings() -> Settings:
         exec_slippage_penalty_enabled=_env_bool("EXEC_SLIPPAGE_PENALTY_ENABLED", True),
         exec_slippage_warn_bps=float(os.getenv("EXEC_SLIPPAGE_WARN_BPS", "12")),
         optimizer_autocode_enabled=_env_bool("OPTIMIZER_AUTOCODE_ENABLED", True),
+        hourly_brain_enabled=_env_bool("HOURLY_BRAIN_ENABLED", True),
+        hourly_autocode_enabled=_env_bool("HOURLY_AUTOCODE_ENABLED", True),
+        trade_lessons_enabled=_env_bool("TRADE_LESSONS_ENABLED", True),
+        trade_lesson_ml_refit_every=int(os.getenv("TRADE_LESSON_ML_REFIT_EVERY", "2")),
         optimizer_autocode_cooldown_seconds=int(os.getenv("OPTIMIZER_AUTOCODE_COOLDOWN_SECONDS", "900")),
         llm_trading_enabled=_env_bool("LLM_TRADING_ENABLED", True),
         llm_trading_min_confidence=float(os.getenv("LLM_TRADING_MIN_CONFIDENCE", "0.58")),

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from markets import symbol_to_inst_id
 from position_registry import PositionRegistry
-from position_rotator import evaluate_harvest, execute_rotation
+from position_rotator import evaluate_harvest, evaluate_roe_harvest, execute_rotation
 from liquidation_guard import (
     is_sl_reached,
     is_sl_trigger_hit,
@@ -522,7 +522,21 @@ def harvest_all_mature(
             settings, "early_harvest_enabled", False
         )
         action = None
-        if not skip_discretionary:
+        if getattr(settings, "scalp_roe_harvest_enabled", False):
+            action = evaluate_roe_harvest(
+                sym,
+                pos,
+                registry.get(sym),
+                last,
+                market,
+                fee_taker=settings.fee_est_taker_pct,
+                fee_maker=settings.fee_est_maker_pct,
+                default_leverage=settings.scalp_leverage if settings.scalp_mode else settings.leverage,
+                min_roe_pct=float(getattr(settings, "scalp_roe_harvest_min_pct", 50.0)),
+                max_roe_pct=float(getattr(settings, "scalp_roe_harvest_max_pct", 60.0)),
+                min_hold_seconds=min_hold,
+            )
+        if not action and not skip_discretionary:
             action = evaluate_harvest(
                 sym,
                 pos,

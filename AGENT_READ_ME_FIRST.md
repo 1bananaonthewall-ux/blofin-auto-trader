@@ -33,6 +33,11 @@ powershell -ExecutionPolicy Bypass -File ".\God Bot.ps1" -Action ensure
 
 Do not `git commit` unless the user asks.
 
+## 5-minute maintain (if `.cursor/AGENT_5M_DUE` exists)
+
+Read `.cursor/skills/blofin-5m/SKILL.md`, run `python scripts\agent_5m_maintain.py`, delete `AGENT_5M_DUE`, write `state/last_cursor_5m.txt`.
+Install: `powershell -File scripts\install_cursor_agent_5m_loop.ps1`. IDE loop: `scripts\cursor_agent_5m_loop.ps1`.
+
 ## Hourly (if `.cursor/HOURLY_DUE` exists)
 
 Read `.cursor/skills/blofin-hourly/SKILL.md`, run checklist, delete `HOURLY_DUE`, write `state/last_cursor_hourly.txt`.

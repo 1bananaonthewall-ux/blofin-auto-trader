@@ -213,6 +213,19 @@ class EffectiveWinnerThresholds:
     apex_score: float
 
 
+def _abundant_flow(settings: "Settings") -> bool:
+    if not getattr(settings, "winner_only_mode", False):
+        return False
+    if getattr(settings, "entries_never_pause", False):
+        return True
+    try:
+        from account_guard import universe_fill_active
+
+        return universe_fill_active(settings)
+    except Exception:
+        return False
+
+
 def effective_winner_thresholds(settings: "Settings", tuning: ScalpTuning | None = None) -> EffectiveWinnerThresholds:
     t = tuning or get_active_tuning()
     base_cf = settings.winner_min_confluence
@@ -223,16 +236,24 @@ def effective_winner_thresholds(settings: "Settings", tuning: ScalpTuning | None
     base_elite = settings.winner_elite_score
     base_apex = settings.winner_apex_score
     quality_first = getattr(settings, "optimizer_quality_first", True)
+    if getattr(settings, "hourly_3r_winner_mode", False):
+        quality_first = False
     cf_d = t.confluence_delta if not quality_first else max(0.0, t.confluence_delta)
     agree_d = t.agreeing_delta if not quality_first else max(0, t.agreeing_delta)
     ml_d = t.ml_conf_delta if not quality_first else max(0.0, t.ml_conf_delta)
     score_d = t.min_score_delta if not quality_first else max(0.0, t.min_score_delta)
 
-    cf = max(0.52, min(0.72, base_cf + cf_d))
-    agree = max(4, min(9, base_agree + agree_d))
-    ml = max(0.68, min(0.88, base_ml + ml_d))
-    vol = max(0.95, min(1.8, base_vol + t.volume_delta))
-    score = max(0.48, min(0.72, base_score + score_d))
+    abundant = _abundant_flow(settings)
+    cf_floor = 0.48 if abundant else 0.52
+    agree_floor = 3 if abundant else 4
+    ml_floor = 0.60 if abundant else 0.68
+    score_floor = 0.44 if abundant else 0.48
+
+    cf = max(cf_floor, min(0.72, base_cf + cf_d))
+    agree = max(agree_floor, min(9, base_agree + agree_d))
+    ml = max(ml_floor, min(0.88, base_ml + ml_d))
+    vol = max(0.18 if abundant else 0.95, min(1.8, base_vol + t.volume_delta))
+    score = max(score_floor, min(0.72, base_score + score_d))
     elite = max(score + 0.08, min(0.82, base_elite + score_d * 0.5))
     apex = max(elite + 0.05, min(0.88, base_apex + score_d * 0.35))
 
@@ -394,7 +415,10 @@ class ScalpOptimizer:
         force: bool = False,
     ) -> OptimizerReport | None:
         now = time.time()
-        if not force and (now - self._last_run) < self.interval:
+        interval = self.interval
+        if self.tuning.trades_last_hour < max(3, self.target_min_tph):
+            interval = min(interval, 300.0)
+        if not force and (now - self._last_run) < interval:
             return None
         if not getattr(self.settings, "optimizer_enabled", True):
             return None
@@ -450,6 +474,10 @@ class ScalpOptimizer:
 
         # Throughput: starved but not bleeding → pace up (quality-first never loosens gates)
         pace_only = hourly or getattr(self.settings, "tpsl_only_pacing", False)
+        roe_tighten = neg_streak >= 4 or avg_roe <= -10.0
+        if roe_tighten and starved and _abundant_flow(self.settings):
+            roe_tighten = neg_streak >= 7 or avg_roe <= -18.0
+
         if starved and eq15 > -2.5:
             if not pace_only:
                 gap = (t.entry_gap_seconds or base_gap) - 4.0
@@ -470,8 +498,8 @@ class ScalpOptimizer:
                 if opens_starved:
                     notes.append(f"opens<{min_opens}/hr ({opens_60m})")
 
-        # ROE bleed → tighten (margin pain even if $ PnL looks small)
-        elif neg_streak >= 4 or avg_roe <= -10.0:
+        # ROE bleed → tighten (winner-flow starvation keeps loosening priority)
+        elif roe_tighten:
             t.confluence_delta = min(0.10, t.confluence_delta + 0.025)
             t.agreeing_delta = min(2, t.agreeing_delta + 1)
             t.ml_conf_delta = min(0.08, t.ml_conf_delta + 0.02)
@@ -565,6 +593,53 @@ class ScalpOptimizer:
             effective_entry_gap(self.settings, t),
         )
         return report
+
+
+_micro_last_nudge = 0.0
+
+
+def micro_tune_for_flow(
+    state_dir: Path,
+    settings: "Settings",
+    *,
+    ranked_count: int,
+    top_conviction: float,
+    top_tier: str,
+    top_winner_score: float,
+    mission_floor: float,
+    cooldown_sec: float = 90.0,
+) -> tuple[float, str]:
+    """
+    Fast in-cycle nudge when winner-passed setups exist but conviction blocks open.
+    Returns (adjusted_mission_floor, note).
+    """
+    global _micro_last_nudge, _active
+    if ranked_count <= 0 or top_tier not in {"good", "elite", "apex"}:
+        return mission_floor, ""
+    if top_winner_score < 0.48:
+        return mission_floor, ""
+
+    now = time.time()
+    if top_conviction >= mission_floor - 0.005:
+        return mission_floor, ""
+
+    opt = ScalpOptimizer(state_dir, settings)
+    t = opt.tuning
+    note = ""
+    if now - _micro_last_nudge >= cooldown_sec:
+        _micro_last_nudge = now
+        t.confluence_delta = max(-0.12, t.confluence_delta - 0.006)
+        t.agreeing_delta = max(-3, t.agreeing_delta - 1 if ranked_count >= 8 else 0)
+        t.ml_conf_delta = max(-0.10, t.ml_conf_delta - 0.004)
+        t.min_score_delta = max(-0.10, t.min_score_delta - 0.006)
+        t.notes = (t.notes + "; micro_flow").strip("; ")
+        opt._save()
+        note = "micro_tune"
+
+    adaptive = max(0.38, min(mission_floor, top_conviction + 0.008))
+    if adaptive < mission_floor:
+        return adaptive, note or "adaptive_conv"
+    return mission_floor, note
 
 
 def run_standalone() -> int:

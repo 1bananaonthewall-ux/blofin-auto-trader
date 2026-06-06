@@ -300,6 +300,7 @@ def _apply_runtime(ctx: RuntimeCtx) -> None:
     s = ctx.settings
     ctx.engine.bind_settings(s)
     ctx.engine.unrestricted_trading = s.unrestricted_trading
+    ctx.engine.entries_never_pause = s.entries_never_pause
     ctx.steward.settings = s
     ctx.optimizer.settings = s
     if ctx.ml_trainer is not None:

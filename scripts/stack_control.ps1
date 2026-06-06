@@ -132,8 +132,6 @@ function Wait-ForSingleBot {
 function Restart-FreshStack {
     Write-Host "=== Fresh stack restart (kill all bots + dashboard, start clean) ===" -ForegroundColor Cyan
     Ensure-TaskDisabled $BotTask
-    Ensure-TaskDisabled $HourlyTask
-    Ensure-TaskDisabled $StackGuardTask
     $n = Stop-AllBots
     Write-Host "Stopped $n bot process(es)"
     Write-Host "Bot worker: $BotPython"
@@ -249,9 +247,9 @@ function Keep-SingleBot {
 }
 
 function Ensure-SingleInstance {
+    # Only disable BlofinLiveBot — it can spawn a second bot.py.
+    # StackGuard + HourlyMaintain are safe (ensure + maintain scripts, not duplicate bots).
     Ensure-TaskDisabled $BotTask
-    Ensure-TaskDisabled $HourlyTask
-    Ensure-TaskDisabled $StackGuardTask
     if ((Get-BotProcesses).Count -gt 1) {
         Stop-DuplicateBots | Out-Null
         Start-Sleep -Seconds 1
@@ -307,15 +305,11 @@ function Show-Status {
 switch ($Action) {
     "stop" {
         Ensure-TaskDisabled $BotTask
-        Ensure-TaskDisabled $HourlyTask
-        Ensure-TaskDisabled $StackGuardTask
         Stop-Bot
         Show-Status
     }
     "start" {
         Ensure-TaskDisabled $BotTask
-        Ensure-TaskDisabled $HourlyTask
-        Ensure-TaskDisabled $StackGuardTask
         Start-Bot | Out-Null
         if ($RunHourlyNow -and (Test-Path $HourlyPs1)) {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HourlyPs1

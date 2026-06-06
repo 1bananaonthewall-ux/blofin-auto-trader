@@ -118,6 +118,7 @@ class AutonomousGrowthEngine:
         self._last_markov: MarkovSnapshot | None = None
         self._last_retrain_ts = 0.0
         self.unrestricted_trading = False
+        self.entries_never_pause = False
         self.recovery_active = False
         self.recovery_until = 0.0
         self._last_report_hour = -1
@@ -135,13 +136,17 @@ class AutonomousGrowthEngine:
         self.scalp = profile_for(settings)
         if self.scalp:
             self.unrestricted_trading = settings.unrestricted_trading
+            self.entries_never_pause = settings.entries_never_pause
+
+    def _no_entry_pause(self) -> bool:
+        return self.unrestricted_trading or self.entries_never_pause
 
     def _account_curve_maximize(self) -> bool:
         st = self.settings
         return bool(
             st
             and getattr(st, "account_curve_maximize", True)
-            and not self.unrestricted_trading
+            and not self._no_entry_pause()
         )
 
     def set_ml_metrics(
@@ -181,7 +186,7 @@ class AutonomousGrowthEngine:
         self._last_curve = self.pnl.update(
             equity,
             metrics.required_daily_return_pct,
-            unrestricted=self.unrestricted_trading,
+            unrestricted=self._no_entry_pause(),
             account_curve_maximize=self._account_curve_maximize(),
             opens_starved=opens_starved,
         )
@@ -291,7 +296,7 @@ class AutonomousGrowthEngine:
         )
         self._last_fluid = self.manifold.tick(
             ctx,
-            unrestricted=self.unrestricted_trading,
+            unrestricted=self._no_entry_pause(),
             account_curve_maximize=self._account_curve_maximize(),
         )
         metrics = self.growth.get_growth_metrics(equity)
@@ -357,6 +362,7 @@ class AutonomousGrowthEngine:
             open_count=open_count,
             low_leverage_positions=low_leverage_positions,
             unrestricted=self.unrestricted_trading,
+            entries_never_pause=self.entries_never_pause,
             markov=markov,
         )
         self._last_core = directive
@@ -435,7 +441,16 @@ class AutonomousGrowthEngine:
                 min_conf = _blend(min_conf, d.min_confidence_strict, 0.35)
             elif acm and curve.curve_phase in ("flat", "climbing"):
                 min_conf = min(min_conf, mission.min_conviction + 0.02)
-            min_conf = max(min_conf, mission.min_conviction)
+            st_flow = self.settings
+            flow_mode = (
+                self.entries_never_pause
+                and st_flow is not None
+                and getattr(st_flow, "winner_only_mode", False)
+            )
+            if flow_mode:
+                min_conf = min(min_conf, mission.min_conviction, 0.52)
+            else:
+                min_conf = max(min_conf, mission.min_conviction)
             min_score = _blend(52.0, 72.0, 1.0 - rel * 0.7)
             min_score = _blend(min_score, d.min_signal_score_default, ai * 0.4)
             risk_pct = (
@@ -522,7 +537,7 @@ class AutonomousGrowthEngine:
 
             max_opens = effective_max_opens_per_tick(st, equity, max_opens)
 
-        if self.unrestricted_trading or recovery:
+        if self._no_entry_pause() or recovery:
             allow_entries = equity > 0 and free_margin > d.min_free_margin_usdt and risk_pct > 0.001
         elif st_pace is not None and tpsl_pace_only:
             allow_entries = equity > 0 and free_margin > d.min_free_margin_usdt and risk_pct > 0.001
@@ -670,18 +685,19 @@ class AutonomousGrowthEngine:
                 f"{self.manifold.parameter_count_estimate:,}",
             )
 
-    def passes_signal_gate(
+    def passes_signal_gate_with_reason(
         self,
         decision,
         knobs: RuntimeKnobs,
         *,
         min_confidence: float | None = None,
         min_signal_score: float | None = None,
-    ) -> bool:
+        rank_conviction: float | None = None,
+    ) -> tuple[bool, str]:
         from strategy import Signal
 
         if decision is None or decision.signal == Signal.FLAT:
-            return False
+            return False, "flat signal"
         conf = getattr(decision, "model_confidence", 0.0) or (decision.score / 100.0)
         min_c = knobs.min_confidence if min_confidence is None else min_confidence
         min_s = knobs.min_signal_score if min_signal_score is None else min_signal_score
@@ -690,21 +706,48 @@ class AutonomousGrowthEngine:
             min_c = min(min_c, self.settings.llm_trading_min_confidence)
             min_s = min(min_s, self.settings.llm_trading_min_score)
         if conf < min_c:
-            return False
+            return False, f"conf {conf:.2f} < {min_c:.2f}"
         if decision.score < min_s:
-            return False
-        # Extra fluid gate: signal must clear path reliability bar
+            return False, f"score {decision.score:.0f} < {min_s:.0f}"
         margin = abs(conf - 0.5) * 2
-        if margin * knobs.path_reliability < 0.08:
-            return False
+        if not self._no_entry_pause() and margin * knobs.path_reliability < 0.08:
+            return False, "path reliability gate"
         conv = getattr(decision, "model_confidence", 0.0) or (decision.score / 100.0)
         cf = getattr(decision, "confluence_score", None) or conv
+        mission_conv = float(rank_conviction if rank_conviction is not None else cf)
+        if rank_conviction is not None:
+            mission_conv = max(mission_conv, float(cf))
         if self.unrestricted_trading:
-            return True
+            return True, "unrestricted"
+        if self.entries_never_pause:
+            if self.core.last:
+                ok, reason = self.core.permits_trade(mission_conv)
+                if ok:
+                    return True, "entries never pause"
+                if self.core.last.starved and mission_conv >= min(0.46, self.core.last.min_conviction):
+                    return True, "entries never pause (starved)"
+                return ok, reason
+            return True, "entries never pause"
         if self.core.last:
-            ok, _reason = self.core.permits_trade(float(cf))
-            return ok
-        ok, _reason = self.mission.permits_trade(float(cf), self._last_mission)
+            return self.core.permits_trade(mission_conv)
+        return self.mission.permits_trade(mission_conv, self._last_mission)
+
+    def passes_signal_gate(
+        self,
+        decision,
+        knobs: RuntimeKnobs,
+        *,
+        min_confidence: float | None = None,
+        min_signal_score: float | None = None,
+        rank_conviction: float | None = None,
+    ) -> bool:
+        ok, _reason = self.passes_signal_gate_with_reason(
+            decision,
+            knobs,
+            min_confidence=min_confidence,
+            min_signal_score=min_signal_score,
+            rank_conviction=rank_conviction,
+        )
         return ok
 
     def doctrine_summary(self) -> str:

@@ -47,6 +47,7 @@ def evaluate_winner(
     cf: "ConfluenceResult",
     settings: "Settings",
     *,
+    symbol: str = "",
     ml_decision: StrategyDecision | None = None,
     ml_ready: bool = False,
     ml_ctx: MLContext | None = None,
@@ -59,22 +60,42 @@ def evaluate_winner(
     if side == Signal.FLAT:
         return WinnerVerdict(False, "reject", 0.0, "flat")
 
+    if symbol:
+        try:
+            from trade_lessons import entry_blocked_by_lessons
+
+            blocked, reason = entry_blocked_by_lessons(
+                settings,
+                symbol,
+                side.value if hasattr(side, "value") else str(side),
+                run_label=str(getattr(cf, "run_label", "") or ""),
+                is_choppy=bool(getattr(cf, "is_choppy", False)),
+            )
+            if blocked:
+                return WinnerVerdict(False, "reject", 0.0, reason)
+        except Exception:
+            pass
+
     reasons: list[str] = []
     score = 0.0
     thr = effective_winner_thresholds(settings)
     tuning = get_active_tuning()
     starved = is_entry_starved(settings, tuning)
-    if starved:
-        relax = 0.10 if hourly_3r_active(settings) else 0.06
+    from account_guard import universe_fill_active
+
+    universe = universe_fill_active(settings)
+    abundant = universe or getattr(settings, "entries_never_pause", False)
+    if starved or abundant:
+        relax = 0.10 if hourly_3r_active(settings) else (0.08 if universe else 0.06)
         thr = EffectiveWinnerThresholds(
-            min_confluence=max(0.48, thr.min_confluence - relax),
-            min_agreeing=max(3 if hourly_3r_active(settings) else 4, thr.min_agreeing - 1),
+            min_confluence=max(0.50, thr.min_confluence - relax),
+            min_agreeing=max(3 if (hourly_3r_active(settings) or universe) else 4, thr.min_agreeing - 1),
             max_opposing=thr.max_opposing + (3 if hourly_3r_active(settings) else 2),
-            min_ml_confidence=max(0.50, thr.min_ml_confidence - 0.12),
-            min_volume_ratio=max(0.30, thr.min_volume_ratio - 0.50),
-            min_score=max(0.42, thr.min_score - 0.08),
-            elite_score=max(0.54, thr.elite_score - 0.10),
-            apex_score=max(0.60, thr.apex_score - 0.10),
+            min_ml_confidence=max(0.52, thr.min_ml_confidence - 0.10),
+            min_volume_ratio=max(0.18, thr.min_volume_ratio - 0.55),
+            min_score=max(0.50, thr.min_score - 0.06),
+            elite_score=max(0.56, thr.elite_score - 0.08),
+            apex_score=max(0.62, thr.apex_score - 0.08),
         )
 
     llm_zone = getattr(decision, "confluence_zone", "") == "llm"
@@ -177,7 +198,9 @@ def evaluate_winner(
             cf.chop_index >= getattr(settings, "runner_max_chop", 0.56)
             and cf.path_efficiency < getattr(settings, "runner_min_path_eff", 0.26) + 0.04
         )
-        if is_choppy:
+        min_run = getattr(settings, "runner_min_score", 0.48)
+        is_runner = getattr(cf, "is_runner", False) or getattr(cf, "run_score", 0.5) >= min_run
+        if is_choppy and not is_runner:
             return WinnerVerdict(
                 False,
                 "reject",

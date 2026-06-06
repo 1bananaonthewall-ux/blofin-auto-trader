@@ -82,6 +82,8 @@ HEDGE_MODE_CACHE_FILE = "hedge_mode.json"
 MARGIN_MODE_CACHE_FILE = "margin_mode.json"
 MIN_TPSL_REPAIR_SEC = 15.0
 TPSL_VERIFIED_TTL_SEC = 600.0
+# Entry gate: trust registry/cache longer when REST pending is unreachable (DNS/WAF).
+TPSL_GATE_TRUST_TTL_SEC = 86400.0
 _TPSL_PRICE_FAULT_CODES = ("103005", "102132", "102134")
 
 
@@ -168,6 +170,7 @@ class BlofinExchange:
         self._cached_free: float = 0.0
         self._last_equity_ok: bool = True
         self._last_positions_ok: bool = True
+        self._last_tpsl_pending_ok: bool = True
         self._margin_top_up_supported: bool | None = None
         self._account_margin_mode = normalize_margin_mode(settings.margin_mode)
         eq, free = _seed_equity_from_state(settings.state_dir)
@@ -183,6 +186,10 @@ class BlofinExchange:
     @property
     def positions_fetch_ok(self) -> bool:
         return self._last_positions_ok
+
+    @property
+    def tpsl_pending_fetch_ok(self) -> bool:
+        return self._last_tpsl_pending_ok
 
     def attach_stream(self, stream: BlofinMarketStream) -> None:
         self.stream = stream
@@ -340,15 +347,26 @@ class BlofinExchange:
         """Safely list all tickers with retry logic."""
         return self._safe_request(self.http.list_tickers) or []
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str = "1m", limit: int = 100) -> list[list[float]]:
-        """OHLCV from WebSocket cache when fresh, else REST."""
-        if self.stream:
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        limit: int = 100,
+        *,
+        prefer_rest: bool = False,
+    ) -> list[list[float]]:
+        """OHLCV from WebSocket cache when fresh, else REST.
+
+        prefer_rest=True (or limit > 200) bypasses the ~120-bar WS deque — required for ML shards.
+        """
+        use_rest = prefer_rest or limit > 200
+        if not use_rest and self.stream:
             cached = self.stream.get_ohlcv(symbol, timeframe, min_bars=min(40, limit // 2))
             if cached and len(cached) >= min(40, limit // 2):
                 return cached[-limit:]
-            self.stream.bootstrap_candles(symbol, bar=timeframe, limit=limit)
+            self.stream.bootstrap_candles(symbol, bar=timeframe, limit=min(limit, 120))
             cached = self.stream.get_ohlcv(symbol, timeframe, min_bars=30)
-            if cached:
+            if cached and len(cached) >= min(limit, len(cached)):
                 return cached[-limit:]
 
         inst_id = symbol_to_inst_id(symbol)
@@ -1021,12 +1039,14 @@ class BlofinExchange:
         entry: float,
         *,
         registry_meta: dict[str, Any] | None = None,
+        trust_ttl_sec: float = TPSL_VERIFIED_TTL_SEC,
     ) -> PendingTpsl | None:
         """Use recent verify cache or registry SL/TP when REST pending is empty."""
         base = self._canonical_symbol(symbol)
         now = time.time()
+        ttl = max(TPSL_VERIFIED_TTL_SEC, float(trust_ttl_sec))
         verified_at = self._tpsl_verified_at.get(base, 0.0)
-        if verified_at > 0 and now - verified_at <= TPSL_VERIFIED_TTL_SEC:
+        if verified_at > 0 and now - verified_at <= ttl:
             prices = self._tpsl_verified_prices.get(base)
             if prices:
                 pending = pending_from_registry_prices(
@@ -1038,7 +1058,7 @@ class BlofinExchange:
         reg_sl = float(meta.get("sl_price") or 0)
         reg_tp = float(meta.get("tp_price") or 0)
         reg_at = float(meta.get("tpsl_verified_at") or meta.get("opened_at") or 0)
-        if reg_sl > 0 and reg_tp > 0 and reg_at > 0 and now - reg_at <= TPSL_VERIFIED_TTL_SEC:
+        if reg_sl > 0 and reg_tp > 0 and reg_at > 0 and now - reg_at <= ttl:
             pending = pending_from_registry_prices(side, entry, reg_sl, reg_tp)
             if pending and pending_is_adequate(side, entry, pending):
                 return pending
@@ -1086,8 +1106,10 @@ class BlofinExchange:
         entry: float,
         *,
         pos: dict[str, Any] | None = None,
+        registry_meta: dict[str, Any] | None = None,
+        allow_registry_fallback: bool = False,
     ) -> PendingTpsl | None:
-        """True only when Blofin pending API shows both SL+TP live for this position."""
+        """True when Blofin pending API (or trusted registry cache) shows SL+TP live."""
         pos = pos or self._lookup_open_position(symbol, side)
         if not pos or entry <= 0:
             return None
@@ -1104,6 +1126,16 @@ class BlofinExchange:
             and pending_is_adequate(side, entry, pending)
         ):
             return pending
+        if allow_registry_fallback:
+            trusted = self._trusted_pending(
+                symbol,
+                side,
+                entry,
+                registry_meta=registry_meta,
+                trust_ttl_sec=TPSL_GATE_TRUST_TTL_SEC,
+            )
+            if trusted:
+                return trusted
         return None
 
     @staticmethod
@@ -1230,11 +1262,13 @@ class BlofinExchange:
     ) -> list[dict]:
         """Fetch live TPSL rows; never treat a single empty response as authoritative."""
         rows: list[dict] = []
+        saw_error = False
         for attempt in range(max(1, retries)):
             try:
                 chunk = self.http.get_pending_tpsl(inst_id) or []
             except Exception:
                 chunk = []
+                saw_error = True
             if chunk:
                 rows = chunk
                 break
@@ -1246,6 +1280,8 @@ class BlofinExchange:
                 rows = [r for r in all_rows if str(r.get("instId") or "") == inst_id]
             except Exception:
                 rows = []
+                saw_error = True
+        self._last_tpsl_pending_ok = bool(rows) or not saw_error
         return rows
 
     def _cancel_pending_tpsl(self, inst_id: str) -> int:
