@@ -36,6 +36,29 @@ function Resolve-BotPython {
 }
 
 $BotPython = Resolve-BotPython
+$BotPidFile = Join-Path $Root "state\bot.pid"
+
+function Write-BotPidFile {
+    param([int]$ProcessId)
+    New-Item -ItemType Directory -Force -Path (Split-Path $BotPidFile) | Out-Null
+    "$ProcessId" | Out-File $BotPidFile -Encoding ascii -NoNewline
+}
+
+function Clear-BotPidFile {
+    if (Test-Path $BotPidFile) {
+        Remove-Item $BotPidFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-PidFileBotProcess {
+    if (-not (Test-Path $BotPidFile)) { return $null }
+    $savedPid = 0
+    try { $savedPid = [int](Get-Content $BotPidFile -ErrorAction Stop | Select-Object -First 1) } catch { return $null }
+    if ($savedPid -le 0) { return $null }
+    $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.ProcessName -ne "python") { return $null }
+    return Get-CimInstance Win32_Process -Filter "ProcessId=$savedPid" -ErrorAction SilentlyContinue
+}
 
 function Test-IsOurBotProcess {
     param([string]$CommandLine)
@@ -47,19 +70,34 @@ function Test-IsOurBotProcess {
     $rootNorm = $Root.Replace('/', '\')
     if ($norm -like "*$rootNorm*") { return $true }
     # Stray system-python "python.exe bot.py" started from project cwd (no root in WMI cmdline).
-    if ($norm -match 'python\.exe"\s+bot\.py\s*$') { return $true }
+    if ($norm -match 'python\.exe"?\s+bot\.py(\s|$)') { return $true }
     return $false
 }
 
 function Get-AllBotPyProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
+    $found = @{}
+    foreach ($b in @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
         Test-IsOurBotProcess $_.CommandLine
-    })
+    })) {
+        $found[$b.ProcessId] = $b
+    }
+    $pidBot = Get-PidFileBotProcess
+    if ($pidBot -and -not $found.ContainsKey($pidBot.ProcessId)) {
+        $found[$pidBot.ProcessId] = $pidBot
+    }
+    @($found.Values)
 }
 
 function Stop-AllBots {
     param([int]$MaxWaitSec = 20)
     $stopped = 0
+    $pidBot = Get-PidFileBotProcess
+    if ($pidBot) {
+        Stop-Process -Id $pidBot.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "Stopped bot pid $($pidBot.ProcessId) (pid file)"
+        $stopped++
+    }
+    Clear-BotPidFile
     for ($round = 0; $round -lt 6; $round++) {
         $bots = @(Get-AllBotPyProcesses)
         if ($bots.Count -eq 0) { break }
@@ -150,15 +188,27 @@ function Wait-ForSingleBot {
             Write-Host "Started bot pid $($bots[0].ProcessId) (detected after ${i}s)"
             return $bots[0].ProcessId
         }
-        if ($i -ge 20 -and (Test-BotLogAlive)) {
+        if ($i -ge 15 -and (Test-BotLogAlive)) {
             $bots = @(Get-BotProcesses)
             if ($bots.Count -ge 1) {
                 Write-Host "Started bot pid $($bots[0].ProcessId) (log activity after ${i}s)"
                 return $bots[0].ProcessId
             }
+            $pidBot = Get-PidFileBotProcess
+            if ($pidBot) {
+                Write-Host "Started bot pid $($pidBot.ProcessId) (pid file + log after ${i}s)"
+                return $pidBot.ProcessId
+            }
         }
     }
     return $null
+}
+
+function Start-BotProcess {
+    $env:PYTHONUNBUFFERED = "1"
+    $proc = Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+    Write-BotPidFile $proc.Id
+    return $proc.Id
 }
 
 function Restart-FreshStack {
@@ -171,14 +221,13 @@ function Restart-FreshStack {
     Stop-DashboardApi -ListenPort $DashboardPort
     Start-Sleep -Seconds 5
     Stop-AllBots | Out-Null
-    $env:PYTHONUNBUFFERED = "1"
-    Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden | Out-Null
+    Start-BotProcess | Out-Null
     $botPid = Wait-ForSingleBot -MaxSec 120
     if (-not $botPid) {
         Write-Warning "First bot start not detected after 120s - retrying once"
         Stop-AllBots | Out-Null
         Start-Sleep -Seconds 3
-        Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden | Out-Null
+        Start-BotProcess | Out-Null
         $botPid = Wait-ForSingleBot -MaxSec 90
     }
     if (-not $botPid) {
@@ -219,29 +268,19 @@ function Stop-Bot {
 function Start-Bot {
     $bots = @(Get-BotProcesses)
     if ($bots.Count -gt 1) {
-        Stop-AllBots | Out-Null
-        Start-Sleep -Seconds 2
+        Stop-DuplicateBots | Out-Null
+        Start-Sleep -Seconds 1
         $bots = @(Get-BotProcesses)
     }
     if ($bots.Count -ge 1) {
         Write-Host "Bot already running pid $($bots[0].ProcessId)"
+        Write-BotPidFile $bots[0].ProcessId
         return $true
     }
-    $env:PYTHONUNBUFFERED = "1"
-    Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden
-    for ($i = 0; $i -lt 12; $i++) {
-        Start-Sleep -Seconds 1
-        $started = @(Get-BotProcesses)
-        if ($started.Count -ge 1) {
-            if ($started.Count -gt 1) {
-                Stop-DuplicateBots | Out-Null
-                $started = @(Get-BotProcesses)
-            }
-            if ($started.Count -ge 1) {
-                Write-Host "Started bot pid $($started[0].ProcessId)"
-                return $true
-            }
-        }
+    Start-BotProcess | Out-Null
+    $botPid = Wait-ForSingleBot -MaxSec 120
+    if ($botPid) {
+        return $true
     }
     Write-Warning "Bot start requested, but process was not detected."
     return $false
@@ -281,32 +320,46 @@ function Keep-SingleBot {
 }
 
 function Ensure-SingleInstance {
-    # Only disable BlofinLiveBot — it can spawn a second bot.py.
-    # StackGuard + HourlyMaintain are safe (ensure + maintain scripts, not duplicate bots).
+    # Disable tasks that can spawn a second bot.py during ensure/restart.
     Ensure-TaskDisabled $BotTask
-    if ((Get-BotProcesses).Count -gt 1) {
-        Stop-DuplicateBots | Out-Null
-        Start-Sleep -Seconds 1
-    }
-    $bots = @(Get-BotProcesses)
-    if ($bots.Count -eq 1) {
-        Write-Host "Single bot ok pid $($bots[0].ProcessId)"
-        return
-    }
-    if ($bots.Count -gt 1) {
-        Stop-DuplicateBots | Out-Null
-        Start-Sleep -Seconds 1
+    Ensure-TaskDisabled $StackGuardTask
+    try {
+        if ((Get-BotProcesses).Count -gt 1) {
+            Stop-DuplicateBots | Out-Null
+            Start-Sleep -Seconds 1
+        }
         $bots = @(Get-BotProcesses)
         if ($bots.Count -eq 1) {
+            Write-BotPidFile $bots[0].ProcessId
             Write-Host "Single bot ok pid $($bots[0].ProcessId)"
             return
         }
-    }
-    Write-Host "No bot running - starting one instance"
-    if (-not (Start-Bot)) {
-        Write-Warning "Start failed - retrying once"
-        Start-Sleep -Seconds 3
-        Start-Bot | Out-Null
+        if ($bots.Count -gt 1) {
+            Stop-DuplicateBots | Out-Null
+            Start-Sleep -Seconds 1
+            $bots = @(Get-BotProcesses)
+            if ($bots.Count -eq 1) {
+                Write-BotPidFile $bots[0].ProcessId
+                Write-Host "Single bot ok pid $($bots[0].ProcessId)"
+                return
+            }
+        }
+        if ((Test-BotLogAlive) -or (Get-PidFileBotProcess)) {
+            $bots = @(Get-BotProcesses)
+            if ($bots.Count -ge 1) {
+                Write-BotPidFile $bots[0].ProcessId
+                Write-Host "Single bot ok pid $($bots[0].ProcessId) (warmup)"
+                return
+            }
+        }
+        Write-Host "No bot running - starting one instance"
+        if (-not (Start-Bot)) {
+            Write-Warning "Start failed - retrying once"
+            Start-Sleep -Seconds 5
+            Start-Bot | Out-Null
+        }
+    } finally {
+        Ensure-TaskEnabled $StackGuardTask
     }
 }
 
