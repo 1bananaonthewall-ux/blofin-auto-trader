@@ -40,17 +40,28 @@ $BotPython = Resolve-BotPython
 function Test-IsOurBotProcess {
     param([string]$CommandLine)
     if (-not $CommandLine -or $CommandLine -notmatch "bot\.py") { return $false }
-    if ($CommandLine -match "hourly_maintain|dashboard_api|test_dashboard|godbot_audit|cortex_smoke|dashboard_copilot") {
+    if ($CommandLine -match "hourly_maintain|dashboard_api|test_dashboard|godbot_audit|cortex_smoke|dashboard_copilot|stack_status") {
         return $false
     }
-    return $CommandLine -like "*$Root*"
+    $norm = $CommandLine.Replace('/', '\')
+    $rootNorm = $Root.Replace('/', '\')
+    if ($norm -like "*$rootNorm*") { return $true }
+    # Stray system-python "python.exe bot.py" started from project cwd (no root in WMI cmdline).
+    if ($norm -match 'python\.exe"\s+bot\.py\s*$') { return $true }
+    return $false
+}
+
+function Get-AllBotPyProcesses {
+    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
+        Test-IsOurBotProcess $_.CommandLine
+    })
 }
 
 function Stop-AllBots {
     param([int]$MaxWaitSec = 20)
     $stopped = 0
     for ($round = 0; $round -lt 6; $round++) {
-        $bots = @(Get-BotProcesses)
+        $bots = @(Get-AllBotPyProcesses)
         if ($bots.Count -eq 0) { break }
         foreach ($b in $bots) {
             Stop-Process -Id $b.ProcessId -Force -ErrorAction SilentlyContinue
@@ -59,7 +70,7 @@ function Stop-AllBots {
         }
         Start-Sleep -Seconds 1
     }
-    $left = @(Get-BotProcesses)
+    $left = @(Get-AllBotPyProcesses)
     if ($left.Count -gt 0) {
         Write-Warning "Still $($left.Count) bot process(es) after stop - retrying"
         foreach ($b in $left) {
@@ -116,18 +127,35 @@ function Start-DashboardApi {
     return $false
 }
 
+function Test-BotLogAlive {
+    param([int]$MaxAgeSec = 180)
+    $log = Join-Path $Root "logs\bot.log"
+    if (-not (Test-Path $log)) { return $false }
+    if (((Get-Date) - (Get-Item $log).LastWriteTime).TotalSeconds -gt $MaxAgeSec) { return $false }
+    $tail = Get-Content $log -Tail 40 -ErrorAction SilentlyContinue
+    return ($tail -match "AUTONOMOUS ENGINE|equity=\$|LLM OVERSEER")
+}
+
 function Wait-ForSingleBot {
-    param([int]$MaxSec = 25)
+    # HF local LLM warmup can take 60-120s before bot.py shows in WMI CommandLine.
+    param([int]$MaxSec = 120)
     for ($i = 0; $i -lt $MaxSec; $i++) {
         Start-Sleep -Seconds 1
         $bots = @(Get-BotProcesses)
-        if ($bots.Count -gt 1) {
-            Keep-SingleBot | Out-Null
+        if ($bots.Count -gt 1 -and $i -ge 45) {
+            Stop-DuplicateBots | Out-Null
             $bots = @(Get-BotProcesses)
         }
         if ($bots.Count -ge 1) {
-            Write-Host "Started bot pid $($bots[0].ProcessId)"
+            Write-Host "Started bot pid $($bots[0].ProcessId) (detected after ${i}s)"
             return $bots[0].ProcessId
+        }
+        if ($i -ge 20 -and (Test-BotLogAlive)) {
+            $bots = @(Get-BotProcesses)
+            if ($bots.Count -ge 1) {
+                Write-Host "Started bot pid $($bots[0].ProcessId) (log activity after ${i}s)"
+                return $bots[0].ProcessId
+            }
         }
     }
     return $null
@@ -136,6 +164,7 @@ function Wait-ForSingleBot {
 function Restart-FreshStack {
     Write-Host "=== Fresh stack restart (kill all bots + dashboard, start clean) ===" -ForegroundColor Cyan
     Ensure-TaskDisabled $BotTask
+    Ensure-TaskDisabled $StackGuardTask
     $n = Stop-AllBots
     Write-Host "Stopped $n bot process(es)"
     Write-Host "Bot worker: $BotPython"
@@ -144,20 +173,23 @@ function Restart-FreshStack {
     Stop-AllBots | Out-Null
     $env:PYTHONUNBUFFERED = "1"
     Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden | Out-Null
-    $botPid = Wait-ForSingleBot
+    $botPid = Wait-ForSingleBot -MaxSec 120
     if (-not $botPid) {
-        Write-Warning "First bot start not detected - retrying"
+        Write-Warning "First bot start not detected after 120s - retrying once"
         Stop-AllBots | Out-Null
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 3
         Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden | Out-Null
-        $botPid = Wait-ForSingleBot
+        $botPid = Wait-ForSingleBot -MaxSec 90
     }
     if (-not $botPid) {
         Write-Warning "Bot start requested, but process was not detected."
     }
     Start-DashboardApi -ListenPort $DashboardPort | Out-Null
-    Start-Sleep -Seconds 2
-    Keep-SingleBot | Out-Null
+    Start-Sleep -Seconds 3
+    if ((Get-BotProcesses).Count -gt 1) {
+        Stop-DuplicateBots | Out-Null
+    }
+    Ensure-TaskEnabled $StackGuardTask
     if ($RunHourlyNow -and (Test-Path $HourlyPs1)) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HourlyPs1
     }
@@ -166,9 +198,7 @@ function Restart-FreshStack {
 }
 
 function Get-BotProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
-        Test-IsOurBotProcess $_.CommandLine
-    })
+    Get-AllBotPyProcesses
 }
 
 function Ensure-TaskEnabled([string]$TaskName) {
@@ -220,9 +250,9 @@ function Start-Bot {
 function Select-BotProcessToKeep {
     param([array]$Bots)
     if ($Bots.Count -eq 0) { return $null }
-    $worker = @($Bots | Where-Object { $_.CommandLine -notmatch '\\\.venv\\Scripts\\python\.exe"' })
-    if ($worker.Count -ge 1) {
-        return $worker | Sort-Object ProcessId -Descending | Select-Object -First 1
+    $venv = @($Bots | Where-Object { $_.CommandLine -like "*\.venv\Scripts\python.exe*" })
+    if ($venv.Count -ge 1) {
+        return $venv | Sort-Object ProcessId -Descending | Select-Object -First 1
     }
     return $Bots | Sort-Object ProcessId -Descending | Select-Object -First 1
 }
