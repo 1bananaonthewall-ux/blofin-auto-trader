@@ -343,6 +343,11 @@ function Start-Bot {
 function Select-BotProcessToKeep {
     param([array]$Bots)
     if ($Bots.Count -eq 0) { return $null }
+    $pidBot = Get-PidFileBotProcess
+    if ($pidBot) {
+        $match = @($Bots | Where-Object { $_.ProcessId -eq $pidBot.ProcessId })
+        if ($match.Count -ge 1) { return $match[0] }
+    }
     $venv = @($Bots | Where-Object { $_.CommandLine -like "*\.venv\Scripts\python.exe*" })
     if ($venv.Count -ge 1) {
         return $venv | Sort-Object ProcessId -Descending | Select-Object -First 1
@@ -493,8 +498,7 @@ switch ($Action) {
         Show-Status
     }
     "start" {
-        Ensure-TaskDisabled $BotTask
-        Start-Bot | Out-Null
+        Ensure-SingleInstance
         if ($RunHourlyNow -and (Test-Path $HourlyPs1)) {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $HourlyPs1
         }
