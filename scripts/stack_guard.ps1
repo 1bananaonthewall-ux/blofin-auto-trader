@@ -7,7 +7,7 @@ $Log = Join-Path $LogDir "stack_guard.log"
 $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 "$ts guard tick" | Out-File $Log -Append -Encoding utf8
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "scripts\stack_control.ps1") -Action ensure 2>&1 |
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File (Join-Path $Root "scripts\stack_control.ps1") -Action ensure 2>&1 |
     Out-File $Log -Append -Encoding utf8
 
 $port = 5050

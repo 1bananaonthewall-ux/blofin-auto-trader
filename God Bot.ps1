@@ -18,9 +18,9 @@ if ($Action -in @("start", "restart", "ensure")) {
     if ($RunHourlyNow) {
         $stackArgs += "-RunHourlyNow"
     }
-    powershell.exe @stackArgs
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden @stackArgs
 } else {
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\stack_control.ps1" -Action $Action
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ".\scripts\stack_control.ps1" -Action $Action
 }
 
 if ($Action -in @("start", "restart", "ensure")) {

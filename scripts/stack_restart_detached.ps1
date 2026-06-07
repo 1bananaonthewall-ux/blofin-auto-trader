@@ -19,7 +19,7 @@ $control = Join-Path $Root "scripts\stack_control.ps1"
 $dashPs1 = Join-Path $Root "scripts\run_dashboard.ps1"
 
 try {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $control -Action restart-fresh -DashboardPort $DashboardPort 2>&1 |
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $control -Action restart-fresh -DashboardPort $DashboardPort 2>&1 |
         ForEach-Object { Write-Log $_.ToString() }
     Write-Log "restart-fresh finished exit=$LASTEXITCODE"
 } catch {
@@ -29,7 +29,7 @@ try {
 Start-Sleep -Seconds 2
 
 try {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $control -Action ensure 2>&1 |
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $control -Action ensure 2>&1 |
         ForEach-Object { Write-Log "ensure: $($_.ToString())" }
 } catch {
     Write-Log "ensure exception: $_"

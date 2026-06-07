@@ -37,6 +37,7 @@ function Resolve-BotPython {
 
 $BotPython = Resolve-BotPython
 $BotPidFile = Join-Path $Root "state\bot.pid"
+$EnsureLockFile = Join-Path $Root "state\stack_ensure.lock"
 
 function Write-BotPidFile {
     param([int]$ProcessId)
@@ -58,6 +59,33 @@ function Get-PidFileBotProcess {
     $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
     if (-not $proc -or $proc.ProcessName -ne "python") { return $null }
     return Get-CimInstance Win32_Process -Filter "ProcessId=$savedPid" -ErrorAction SilentlyContinue
+}
+
+function Test-BotProcessAlive {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $false }
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    return ($null -ne $proc -and $proc.ProcessName -eq "python")
+}
+
+function Enter-EnsureLock {
+    New-Item -ItemType Directory -Force -Path (Split-Path $EnsureLockFile) | Out-Null
+    if (Test-Path $EnsureLockFile) {
+        $age = ((Get-Date) - (Get-Item $EnsureLockFile).LastWriteTime).TotalSeconds
+        if ($age -lt 180) {
+            Write-Host "Ensure lock active (${age}s) - skipping concurrent ensure"
+            return $false
+        }
+        Remove-Item $EnsureLockFile -Force -ErrorAction SilentlyContinue
+    }
+    (Get-Date).ToString("o") | Out-File $EnsureLockFile -Encoding ascii
+    return $true
+}
+
+function Exit-EnsureLock {
+    if (Test-Path $EnsureLockFile) {
+        Remove-Item $EnsureLockFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-IsOurBotProcess {
@@ -86,6 +114,17 @@ function Get-AllBotPyProcesses {
         $found[$pidBot.ProcessId] = $pidBot
     }
     @($found.Values)
+}
+
+function Stop-ConcurrentStackScripts {
+    $myPid = $PID
+    @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+        $_.ProcessId -ne $myPid -and $_.CommandLine -match "stack_guard\.ps1|stack_control\.ps1|run_god_bot_stack\.ps1"
+    }) | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host "Stopped concurrent stack script pid $($_.ProcessId)"
+    }
+    Start-Sleep -Seconds 1
 }
 
 function Stop-AllBots {
@@ -166,12 +205,14 @@ function Start-DashboardApi {
 }
 
 function Test-BotLogAlive {
-    param([int]$MaxAgeSec = 180)
+    param([int]$MaxAgeSec = 45)
+    $pidBot = Get-PidFileBotProcess
+    if ($pidBot) { return $true }
     $log = Join-Path $Root "logs\bot.log"
     if (-not (Test-Path $log)) { return $false }
     if (((Get-Date) - (Get-Item $log).LastWriteTime).TotalSeconds -gt $MaxAgeSec) { return $false }
     $tail = Get-Content $log -Tail 40 -ErrorAction SilentlyContinue
-    return ($tail -match "AUTONOMOUS ENGINE|equity=\$|LLM OVERSEER")
+    return ($tail -match "AUTONOMOUS ENGINE|equity=\$|LLM OVERSEER|seeded equity cache")
 }
 
 function Wait-ForSingleBot {
@@ -205,6 +246,10 @@ function Wait-ForSingleBot {
 }
 
 function Start-BotProcess {
+    if ((Get-AllBotPyProcesses).Count -gt 0) {
+        Stop-AllBots | Out-Null
+        Start-Sleep -Seconds 2
+    }
     $env:PYTHONUNBUFFERED = "1"
     $proc = Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     Write-BotPidFile $proc.Id
@@ -234,13 +279,17 @@ function Restart-FreshStack {
         Write-Warning "Bot start requested, but process was not detected."
     }
     Start-DashboardApi -ListenPort $DashboardPort | Out-Null
-    Start-Sleep -Seconds 3
-    if ((Get-BotProcesses).Count -gt 1) {
-        Stop-DuplicateBots | Out-Null
+    Start-Sleep -Seconds 8
+    $pidBot = Get-PidFileBotProcess
+    if (-not $pidBot -and -not (Test-BotLogAlive)) {
+        Write-Warning "Bot not healthy after dashboard start - running ensure"
+        Ensure-SingleInstance
     }
+    Start-Sleep -Seconds 2
     Ensure-TaskEnabled $StackGuardTask
+    Ensure-TaskEnabled $HourlyTask
     if ($RunHourlyNow -and (Test-Path $HourlyPs1)) {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HourlyPs1
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $HourlyPs1
     }
     Show-Status
     Write-Host "Dashboard: http://127.0.0.1:$DashboardPort" -ForegroundColor Green
@@ -266,6 +315,11 @@ function Stop-Bot {
 }
 
 function Start-Bot {
+    $pidBot = Get-PidFileBotProcess
+    if ($pidBot) {
+        Write-Host "Bot already running pid $($pidBot.ProcessId) (pid file)"
+        return $true
+    }
     $bots = @(Get-BotProcesses)
     if ($bots.Count -gt 1) {
         Stop-DuplicateBots | Out-Null
@@ -309,6 +363,12 @@ function Stop-DuplicateBots {
         }
     }
     Write-Host "Single bot kept pid $($keep.ProcessId)"
+    Write-BotPidFile $keep.ProcessId
+    Start-Sleep -Seconds 1
+    if (Test-BotProcessAlive $keep.ProcessId) {
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($keep.ProcessId)" -ErrorAction SilentlyContinue
+        if ($cim) { return @($cim) }
+    }
     return @(Get-BotProcesses)
 }
 
@@ -320,13 +380,23 @@ function Keep-SingleBot {
 }
 
 function Ensure-SingleInstance {
+    if (-not (Enter-EnsureLock)) {
+        Show-Status
+        return
+    }
     # Disable tasks that can spawn a second bot.py during ensure/restart.
     Ensure-TaskDisabled $BotTask
     Ensure-TaskDisabled $StackGuardTask
+    Stop-ConcurrentStackScripts
     try {
         if ((Get-BotProcesses).Count -gt 1) {
             Stop-DuplicateBots | Out-Null
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
+        }
+        $pidBot = Get-PidFileBotProcess
+        if ($pidBot) {
+            Write-Host "Single bot ok pid $($pidBot.ProcessId) (pid file)"
+            return
         }
         $bots = @(Get-BotProcesses)
         if ($bots.Count -eq 1) {
@@ -336,7 +406,12 @@ function Ensure-SingleInstance {
         }
         if ($bots.Count -gt 1) {
             Stop-DuplicateBots | Out-Null
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
+            $pidBot = Get-PidFileBotProcess
+            if ($pidBot) {
+                Write-Host "Single bot ok pid $($pidBot.ProcessId) (pid file)"
+                return
+            }
             $bots = @(Get-BotProcesses)
             if ($bots.Count -eq 1) {
                 Write-BotPidFile $bots[0].ProcessId
@@ -344,7 +419,12 @@ function Ensure-SingleInstance {
                 return
             }
         }
-        if ((Test-BotLogAlive) -or (Get-PidFileBotProcess)) {
+        if (Test-BotLogAlive) {
+            $pidBot = Get-PidFileBotProcess
+            if ($pidBot) {
+                Write-Host "Single bot ok pid $($pidBot.ProcessId) (warmup)"
+                return
+            }
             $bots = @(Get-BotProcesses)
             if ($bots.Count -ge 1) {
                 Write-BotPidFile $bots[0].ProcessId
@@ -358,15 +438,32 @@ function Ensure-SingleInstance {
             Start-Sleep -Seconds 5
             Start-Bot | Out-Null
         }
+        if ((Get-BotProcesses).Count -gt 1) {
+            Stop-DuplicateBots | Out-Null
+            Start-Sleep -Seconds 2
+        }
+        $pidBot = Get-PidFileBotProcess
+        if ($pidBot) {
+            Write-Host "Single bot ok pid $($pidBot.ProcessId)"
+        }
     } finally {
+        Start-Sleep -Seconds 2
         Ensure-TaskEnabled $StackGuardTask
+        Ensure-TaskEnabled $HourlyTask
+        Exit-EnsureLock
     }
 }
 
 function Show-Status {
     Write-Host "=== Bot ==="
-    $bots = Get-BotProcesses
+    $bots = @(Get-BotProcesses)
     if ($bots.Count -eq 0) {
+        $pidBot = Get-PidFileBotProcess
+        if ($pidBot) { $bots = @($pidBot) }
+    }
+    if ($bots.Count -eq 0 -and (Test-BotLogAlive)) {
+        Write-Host "bot.py: WARMUP (log active, pid pending)"
+    } elseif ($bots.Count -eq 0) {
         Write-Host "bot.py: NOT RUNNING"
     } else {
         foreach ($b in $bots) {
@@ -399,7 +496,7 @@ switch ($Action) {
         Ensure-TaskDisabled $BotTask
         Start-Bot | Out-Null
         if ($RunHourlyNow -and (Test-Path $HourlyPs1)) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $HourlyPs1
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $HourlyPs1
         }
         Show-Status
     }

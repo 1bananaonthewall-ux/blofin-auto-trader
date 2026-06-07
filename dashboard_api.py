@@ -1033,6 +1033,16 @@ def api_chat():
         return jsonify({"error": str(exc)}), 500
 
 
+def _win_subprocess_flags() -> int:
+    if sys.platform != "win32":
+        return 0
+    return (
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    )
+
+
 def _spawn_fresh_stack_restart() -> None:
     """
     Detached restart: kill every bot.py + dashboard, then start one clean stack.
@@ -1066,11 +1076,7 @@ def _spawn_fresh_stack_restart() -> None:
     ]
     flags = 0
     if sys.platform == "win32":
-        flags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-            | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        )
+        flags = _win_subprocess_flags()
     subprocess.Popen(
         args,
         cwd=str(ROOT),
@@ -1113,6 +1119,7 @@ def api_stack(action: str):
             timeout=timeout,
             cwd=str(ROOT),
             stderr=subprocess.STDOUT,
+            creationflags=_win_subprocess_flags(),
         )
         text = (out or "").strip()
         running = _bot_running()

@@ -7,7 +7,7 @@ Set-Location $Root
 
 Write-Host "=== God Bot Stack ===" -ForegroundColor Cyan
 
-$ensureArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $Root "scripts\stack_control.ps1"), "-Action", "ensure")
+$ensureArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", (Join-Path $Root "scripts\stack_control.ps1"), "-Action", "ensure")
 if ($RunHourlyNow) { $ensureArgs += "-RunHourlyNow" }
 & powershell.exe @ensureArgs
 
@@ -29,7 +29,7 @@ if (-not $listening) {
     Write-Host "Dashboard already listening on $port" -ForegroundColor Green
 }
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "scripts\stack_control.ps1") -Action status
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File (Join-Path $Root "scripts\stack_control.ps1") -Action status
 
 Write-Host ""
 Write-Host "Dashboard: http://127.0.0.1:$port" -ForegroundColor Green

@@ -707,11 +707,15 @@ def apply_action(
     if action == "stack_ensure":
         ps1 = root / "scripts" / "stack_control.ps1"
         if ps1.is_file():
+            flags = 0
+            if sys.platform == "win32":
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             subprocess.run(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-Action", "ensure"],
                 cwd=str(root),
                 check=False,
                 timeout=90,
+                creationflags=flags,
             )
             return "stack_ensure_ran"
         return "stack_ensure_skip"
