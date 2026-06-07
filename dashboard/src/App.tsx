@@ -116,7 +116,7 @@ function DashboardView({
 
       <section className="trades-stack">
         <h2 className="section-title">Live Trades</h2>
-        <p className="disclaimer">Live Blofin positions · ROE % on margin (exchange-style)</p>
+        <p className="disclaimer">Live Blofin positions · exchange + snapshot · auto-streamed every 2.5s</p>
         <div className="trades-grid">
           {filterPos.length === 0 && (
             <div className="trade-card"><span>No open positions</span></div>
@@ -192,6 +192,7 @@ function DashboardView({
       <div className="grid-2">
         <div>
           <h2 className="section-title">Active Setups</h2>
+          <p className="disclaimer">Top scan picks from bot.log · excludes open positions · auto-streamed every 2.5s</p>
           <div className="cards-row">
             {activeSignals.length === 0 && (
               <div className="signal-card">No recent scan picks — start God Bot or wait for next cycle.</div>
@@ -207,7 +208,7 @@ function DashboardView({
           </div>
 
           <h2 className="section-title" style={{ marginTop: "1.25rem" }}>Developing Setups</h2>
-          <p className="disclaimer">Next-tier scan candidates (not in top 6 active) · pick + confluence rank</p>
+          <p className="disclaimer">Next-tier scan candidates (not in top 6 active) · pick + confluence · auto-streamed every 2.5s</p>
           <div className="cards-row">
             {developing.length === 0 && (
               <div className="signal-card">

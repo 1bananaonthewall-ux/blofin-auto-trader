@@ -395,6 +395,115 @@ def trades_stream_version() -> float:
     return max(mtimes) if mtimes else 0.0
 
 
+def positions_stream_version() -> float:
+    """Bump when open-book snapshot files change."""
+    mtimes: list[float] = []
+    for name in ("account_snapshot.json", "live_positions.json", "position_registry.json"):
+        path = _state_dir / name
+        if path.is_file():
+            mtimes.append(path.stat().st_mtime)
+    return max(mtimes) if mtimes else 0.0
+
+
+def signals_stream_version() -> float:
+    """Bump when scan/setup inputs change."""
+    mtimes: list[float] = []
+    for name in ("position_registry.json", "markets_cache.json", "hourly_report.json"):
+        path = _state_dir / name
+        if path.is_file():
+            mtimes.append(path.stat().st_mtime)
+    if _log_file and _log_file.is_file():
+        mtimes.append(_log_file.stat().st_mtime)
+    return max(mtimes) if mtimes else 0.0
+
+
+def _log_lines_for_parse(log_lines: list[str] | None = None) -> list[str]:
+    if log_lines and len(log_lines) >= _LOG_PARSE_MIN:
+        return list(log_lines)
+    if _tail_log_lines:
+        lines, _ = _tail_log_lines(_LOG_PARSE_MIN)
+        if lines:
+            return lines
+    return list(log_lines or [])
+
+
+def build_live_positions(
+    *,
+    exchange_positions: dict[str, dict] | None = None,
+    exchange_positions_ts: float = 0.0,
+    now: float | None = None,
+) -> list[dict]:
+    """Fresh open positions — exchange book preferred, snapshot+registry fallback."""
+    now = now or time.time()
+    registry = _read_json(_state_dir / "position_registry.json", {}) or {}
+    exchange_fresh = bool(
+        exchange_positions and (now - exchange_positions_ts) < 120.0
+    )
+    exchange_syms: set[str] | None = None
+    if exchange_fresh and exchange_positions:
+        exchange_syms = {
+            str(p.get("symbol") or k.split("#")[0])
+            for k, p in exchange_positions.items()
+        }
+        return _position_rows(exchange_positions, registry)
+
+    bot_book = _load_bot_positions()
+    if bot_book is not None:
+        positions, _, _meta = bot_book
+        refreshed: list[dict] = []
+        for p in positions:
+            side = str(p.get("side", "long")).lower()
+            entry = float(p.get("entry") or 0)
+            mark = float(p.get("mark") or entry)
+            lev = int(p.get("leverage") or 0)
+            margin = float(p.get("margin_usdt") or 0)
+            roe, pnl, notional, eff = BlofinExchange.position_display_metrics(
+                side=side,
+                entry=entry,
+                mark=mark,
+                margin_usdt=margin,
+                leverage=lev,
+                unrealized_usd=float(p.get("pnl_usd")) if p.get("pnl_usd") is not None else None,
+                contracts=float(p.get("contracts") or 0),
+            )
+            row = dict(p)
+            row["pnl_pct"] = roe
+            row["pnl_usd"] = pnl
+            row["notional_usdt"] = notional
+            row["effective_leverage"] = round(eff, 1) if eff else lev
+            refreshed.append(row)
+        positions = _prune_stale_position_rows(
+            refreshed, registry=registry, exchange_syms=exchange_syms
+        )
+        if exchange_positions:
+            positions = _enrich_rows_from_exchange(positions, exchange_positions)
+        return positions
+
+    if exchange_positions:
+        positions = _position_rows(exchange_positions, registry)
+        live_syms = {p["symbol"] for p in positions}
+        if len(positions) < len(registry):
+            positions = positions + _registry_fallback_rows(registry, live_syms)
+            positions.sort(key=lambda x: x["symbol"])
+        return positions
+    return []
+
+
+def build_signals_feed(
+    *,
+    positions: list[dict] | None = None,
+    log_lines: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fresh active + developing setups from bot.log scan feed."""
+    registry = _read_json(_state_dir / "position_registry.json", {}) or {}
+    lines = _log_lines_for_parse(log_lines)
+    if positions is None:
+        positions = build_live_positions()
+    live_syms = {p.get("symbol") for p in positions if p.get("symbol")}
+    held = live_syms | set(registry.keys())
+    return _signals_from_log(lines, held)
+
+
 def _append_dashboard_close(row: dict[str, Any]) -> None:
     """Persist exchange-detected closes for dashboard when bot misses a label pass."""
     path = _state_dir / "dashboard_closes.jsonl"
@@ -829,6 +938,29 @@ class LiveDataHub:
         with self._lock:
             return json.loads(json.dumps(self._snapshot))
 
+    def get_fresh_positions(self) -> tuple[list[dict], dict[str, str]]:
+        with self._lock:
+            now = time.time()
+            if now - self._exchange_positions_ts >= 10.0 or not self._positions:
+                self._refresh_exchange(now)
+            rows = build_live_positions(
+                exchange_positions=self._positions,
+                exchange_positions_ts=self._exchange_positions_ts,
+                now=now,
+            )
+            errors: dict[str, str] = {}
+            if self._positions_err:
+                errors["positions"] = self._positions_err
+            return rows, errors
+
+    def get_fresh_signals(
+        self, positions: list[dict] | None = None
+    ) -> dict[str, Any]:
+        with self._lock:
+            if positions is None:
+                positions, _ = self.get_fresh_positions()
+            return build_signals_feed(positions=positions, log_lines=self._lines_for_parse())
+
     def _get_closed_trades(self) -> list[dict]:
         ver = trades_stream_version()
         if self._closed_cache is not None and ver == self._closed_cache_ver:
@@ -1068,72 +1200,19 @@ class LiveDataHub:
 
     def _compose(self, now: float, log_delta: list[str]) -> dict[str, Any]:
         settings = load_settings()
-        registry = _read_json(_state_dir / "position_registry.json", {}) or {}
         lines = self._lines_for_parse()
         picks, scan_plan = _parse_scan_feed(lines)
         account_meta: dict[str, Any] = {}
-
-        exchange_fresh = bool(
-            self._positions and (now - self._exchange_positions_ts) < 120.0
-        )
-        exchange_syms: set[str] | None = None
-        if exchange_fresh:
-            exchange_syms = {
-                str(p.get("symbol") or k.split("#")[0])
-                for k, p in self._positions.items()
-            }
-
         bot_book = _load_bot_positions()
         if bot_book is not None:
             _, _, account_meta = bot_book
-        if exchange_fresh:
-            positions = _position_rows(self._positions, registry)
-        elif bot_book is not None:
-            positions, bot_ts, account_meta = bot_book
-            refreshed: list[dict] = []
-            for p in positions:
-                side = str(p.get("side", "long")).lower()
-                entry = float(p.get("entry") or 0)
-                mark = float(p.get("mark") or entry)
-                lev = int(p.get("leverage") or 0)
-                margin = float(p.get("margin_usdt") or 0)
-                roe, pnl, notional, eff = BlofinExchange.position_display_metrics(
-                    side=side,
-                    entry=entry,
-                    mark=mark,
-                    margin_usdt=margin,
-                    leverage=lev,
-                    unrealized_usd=float(p.get("pnl_usd")) if p.get("pnl_usd") is not None else None,
-                    contracts=float(p.get("contracts") or 0),
-                )
-                row = dict(p)
-                row["pnl_pct"] = roe
-                row["pnl_usd"] = pnl
-                row["notional_usdt"] = notional
-                row["effective_leverage"] = round(eff, 1) if eff else lev
-                refreshed.append(row)
-            positions = _prune_stale_position_rows(
-                refreshed, registry=registry, exchange_syms=exchange_syms
-            )
-            if self._positions:
-                positions = _enrich_rows_from_exchange(positions, self._positions)
-            eq = float(account_meta.get("equity") or 0)
-            fr = float(account_meta.get("free_margin") or 0)
-            if eq > 0:
-                equity = eq
-                free = fr if fr > 0 else eq * 0.85
-            elif not account_meta.get("api_ok", True):
-                equity, free = _last_known_equity()
-        else:
-            positions = _position_rows(self._positions, registry)
-            live_syms = {p["symbol"] for p in positions}
-            if len(positions) < len(registry):
-                positions = positions + _registry_fallback_rows(registry, live_syms)
-                positions.sort(key=lambda x: x["symbol"])
 
-        live_syms = {p.get("symbol") for p in positions if p.get("symbol")}
-        held = live_syms | set(registry.keys())
-        signals = _signals_from_log(lines, held)
+        positions = build_live_positions(
+            exchange_positions=self._positions,
+            exchange_positions_ts=self._exchange_positions_ts,
+            now=now,
+        )
+        signals = build_signals_feed(positions=positions, log_lines=lines)
         exposure = sum(float(p.get("notional_usdt") or 0) for p in positions)
         unrealized = sum(float(p.get("pnl_usd") or 0) for p in positions)
         equity = self._equity
@@ -1215,6 +1294,8 @@ class LiveDataHub:
             "closed": self._get_closed_trades(),
             "closed_updated_at": datetime.now(timezone.utc).isoformat(),
             "trades_version": self._closed_cache_ver,
+            "positions_version": positions_stream_version(),
+            "signals_version": signals_stream_version(),
             "scanner": {
                 "picks": picks[:64],
                 "count": len(picks),

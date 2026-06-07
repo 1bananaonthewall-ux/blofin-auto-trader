@@ -32,6 +32,8 @@ from dashboard_live import (
     closed_trades_list,
     get_live_hub,
     parse_ts,
+    positions_stream_version,
+    signals_stream_version,
     trades_stream_version,
 )
 from exchange_client import BlofinExchange
@@ -741,6 +743,25 @@ def _snapshot_fingerprint(snap: dict[str, Any]) -> str:
     body["trades_version"] = snap.get("trades_version") or trades_stream_version()
     body["trades_tail"] = trades_tail
     body["closed_count"] = len(closed)
+    positions = snap.get("positions") or []
+    body["positions_version"] = snap.get("positions_version") or positions_stream_version()
+    body["positions_tail"] = [
+        {
+            "symbol": p.get("symbol"),
+            "pnl_usd": p.get("pnl_usd"),
+            "pnl_pct": p.get("pnl_pct"),
+        }
+        for p in positions[:6]
+    ]
+    body["positions_count"] = len(positions)
+    active = snap.get("active_setups") or []
+    developing = snap.get("developing_setups") or []
+    body["signals_version"] = snap.get("signals_version") or signals_stream_version()
+    body["signals_tail"] = [
+        {"symbol": s.get("symbol"), "side": s.get("side"), "score": s.get("score")}
+        for s in (active[:3] + developing[:2])
+    ]
+    body["signals_count"] = len(active) + len(developing)
     return json.dumps(body, sort_keys=True, default=str)
 
 
@@ -754,14 +775,20 @@ def api_live_snapshot():
 @app.route("/api/positions")
 def api_positions():
     try:
-        snap = get_live_hub().get_snapshot()
-        rows = snap.get("positions") or []
+        hub = get_live_hub()
+        snap = hub.get_snapshot()
+        rows, pos_errors = hub.get_fresh_positions()
+        errors = dict(snap.get("errors") or {})
+        errors.update(pos_errors)
         return jsonify(
             {
                 "positions": rows,
                 "count": len(rows),
+                "source": "exchange+account_snapshot+registry",
+                "positions_version": positions_stream_version(),
                 "stream_ts": snap.get("stream_ts"),
-                "errors": snap.get("errors"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "errors": errors or None,
             }
         )
     except Exception as exc:
@@ -771,15 +798,22 @@ def api_positions():
 @app.route("/api/signals")
 def api_signals():
     try:
-        snap = get_live_hub().get_snapshot()
-        active = snap.get("active_setups") or []
-        developing = snap.get("developing_setups") or []
+        hub = get_live_hub()
+        snap = hub.get_snapshot()
+        positions, _ = hub.get_fresh_positions()
+        signals = hub.get_fresh_signals(positions)
+        active = signals.get("active_setups") or []
+        developing = signals.get("developing_setups") or []
         return jsonify(
             {
                 "active_setups": active,
                 "developing_setups": developing,
-                "recent_scan_count": len(active) + len(developing),
+                "recent_scan_count": signals.get("recent_scan_count")
+                or (len(active) + len(developing)),
+                "source": "bot.log+registry",
+                "signals_version": signals_stream_version(),
                 "stream_ts": snap.get("stream_ts"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
     except Exception as exc:

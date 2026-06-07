@@ -45,6 +45,8 @@ export function useLiveStream() {
   const logOffsetRef = useRef(0);
   const tradesVersionRef = useRef(0);
   const tradesSigRef = useRef("");
+  const positionsSigRef = useRef("");
+  const signalsSigRef = useRef("");
   const wsRef = useRef<WebSocket | null>(null);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
@@ -132,6 +134,60 @@ export function useLiveStream() {
       retryRef.current = setTimeout(connect, 5000);
     }
   }, [applySnapshot]);
+
+  useEffect(() => {
+    const pollPositions = () => {
+      fetch("/api/positions?_=" + Date.now())
+        .then((r) => (r.ok ? r.json() : null))
+        .then(
+          (data: {
+            positions?: Position[];
+            positions_version?: number;
+            updated_at?: string;
+            count?: number;
+          } | null) => {
+            if (!mountedRef.current || !data?.positions) return;
+            const sig = `${data.positions_version ?? 0}|${data.updated_at ?? ""}|${data.count ?? 0}|${data.positions[0]?.symbol_short ?? ""}|${data.positions[0]?.pnl_usd ?? 0}`;
+            if (sig === positionsSigRef.current) return;
+            positionsSigRef.current = sig;
+            setPositions(data.positions);
+          }
+        )
+        .catch(() => {});
+    };
+    pollPositions();
+    const posTimer = setInterval(pollPositions, 2500);
+    return () => clearInterval(posTimer);
+  }, []);
+
+  useEffect(() => {
+    const pollSignals = () => {
+      fetch("/api/signals?_=" + Date.now())
+        .then((r) => (r.ok ? r.json() : null))
+        .then(
+          (data: {
+            active_setups?: Signal[];
+            developing_setups?: Signal[];
+            signals_version?: number;
+            updated_at?: string;
+            recent_scan_count?: number;
+          } | null) => {
+            if (!mountedRef.current || !data) return;
+            const active = data.active_setups ?? [];
+            const developing = data.developing_setups ?? [];
+            const sig = `${data.signals_version ?? 0}|${data.updated_at ?? ""}|${data.recent_scan_count ?? 0}|${active[0]?.symbol ?? ""}|${developing[0]?.symbol ?? ""}`;
+            if (sig === signalsSigRef.current) return;
+            signalsSigRef.current = sig;
+            setActiveSignals(active);
+            setDeveloping(developing);
+          }
+        )
+        .catch(() => {});
+    };
+    pollSignals();
+    const sigTimer = setInterval(pollSignals, 2500);
+    return () => clearInterval(sigTimer);
+  }, []);
 
   useEffect(() => {
     const pollTrades = () => {
