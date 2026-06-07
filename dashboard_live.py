@@ -382,11 +382,40 @@ def _journal_margin_before(symbol: str, close_ts: float) -> float:
 def trades_stream_version() -> float:
     """Bump when any trade journal file changes (for WS dedup + cache invalidation)."""
     mtimes: list[float] = []
-    for name in ("profitability.json", "trade_outcomes.jsonl", "trades.jsonl"):
+    for name in (
+        "profitability.json",
+        "trade_outcomes.jsonl",
+        "trades.jsonl",
+        "roe_learning.json",
+        "dashboard_closes.jsonl",
+    ):
         path = _state_dir / name
         if path.is_file():
             mtimes.append(path.stat().st_mtime)
     return max(mtimes) if mtimes else 0.0
+
+
+def _append_dashboard_close(row: dict[str, Any]) -> None:
+    """Persist exchange-detected closes for dashboard when bot misses a label pass."""
+    path = _state_dir / "dashboard_closes.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sym = str(row.get("symbol") or "")
+    ts = float(row.get("ts") or 0)
+    if sym and ts > 0 and path.is_file():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines()[-80:]:
+                if not line.strip():
+                    continue
+                prev = json.loads(line)
+                if (
+                    str(prev.get("symbol") or "") == sym
+                    and abs(float(prev.get("ts") or 0) - ts) < 120
+                ):
+                    return
+        except Exception:
+            pass
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
 
 
 from roe_learning import default_close_leverage as _default_close_leverage
@@ -536,7 +565,112 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
             )
         )
 
+    roe_state = _read_json(_state_dir / "roe_learning.json", {}) or {}
+    for raw in reversed(list((roe_state.get("global") or {}).get("recent") or [])):
+        sym = str(raw.get("symbol") or "?")
+        ts = parse_ts(raw.get("ts"))
+        if cutoff and ts and ts < cutoff:
+            continue
+        if any(
+            r.get("symbol") == sym and abs(float(r.get("ts") or 0) - ts) < 300
+            for r in rows
+        ):
+            continue
+        rows.append(
+            _format_closed_row(
+                symbol=sym,
+                side=str(raw.get("side") or "long"),
+                pnl_usd=float(raw.get("pnl_usd") or 0),
+                roe_pct=float(raw.get("roe_pct") or 0) if raw.get("roe_pct") is not None else None,
+                ts=ts,
+                event=str(raw.get("event") or "close"),
+                source="roe_learning",
+            )
+        )
+
     if _read_jsonl is not None:
+        journal_path = _state_dir / "trades.jsonl"
+        for raw in _read_jsonl(journal_path, limit=max(limit * 4, 200)):
+            if str(raw.get("event") or "").lower() != "close":
+                continue
+            sym = str(raw.get("symbol") or "?")
+            ts = parse_ts(raw.get("ts"))
+            entry = float(raw.get("entry") or 0)
+            exit_px = float(raw.get("exit") or raw.get("exit_px") or 0)
+            if cutoff and ts and ts < cutoff:
+                continue
+            if any(
+                r.get("symbol") == sym and abs(float(r.get("ts") or 0) - ts) < 300
+                for r in rows
+            ):
+                continue
+            margin = float(raw.get("margin") or raw.get("margin_usdt") or 0)
+            lev = int(raw.get("leverage") or 0) or _default_close_leverage()
+            contracts = float(raw.get("contracts") or 0)
+            pnl = float(raw.get("pnl_usd") or 0)
+            roe = raw.get("roe_pct")
+            if roe is not None:
+                try:
+                    roe = float(roe)
+                except (TypeError, ValueError):
+                    roe = None
+            if entry > 0 and exit_px > 0:
+                pnl_v, roe_v = _resolve_close_pnl_roe(
+                    side=str(raw.get("side") or "long"),
+                    entry=entry,
+                    exit_px=exit_px,
+                    prof_pnl=pnl if pnl else None,
+                    margin_usdt=margin if margin > 0 else None,
+                    leverage=lev,
+                    contracts=contracts if contracts > 0 else None,
+                    contract_size=_contract_size_for(sym),
+                )
+                pnl = pnl_v
+                roe = roe_v if roe is None else roe
+            rows.append(
+                _format_closed_row(
+                    symbol=sym,
+                    side=str(raw.get("side") or "long"),
+                    pnl_usd=pnl,
+                    roe_pct=roe,
+                    ts=ts,
+                    event=str(raw.get("reason") or raw.get("event") or "close"),
+                    entry=entry if entry > 0 else None,
+                    exit_px=exit_px if exit_px > 0 else None,
+                    leverage=lev if lev > 0 else None,
+                    margin_usdt=margin if margin > 0 else None,
+                    source="journal",
+                )
+            )
+
+        dash_path = _state_dir / "dashboard_closes.jsonl"
+        for raw in _read_jsonl(dash_path, limit=max(limit * 4, 120)):
+            sym = str(raw.get("symbol") or "?")
+            ts = parse_ts(raw.get("ts") or raw.get("close_ts"))
+            entry = float(raw.get("entry") or raw.get("entry_price") or 0)
+            exit_px = float(raw.get("exit") or raw.get("close_price") or 0)
+            if cutoff and ts and ts < cutoff:
+                continue
+            if any(
+                r.get("symbol") == sym and abs(float(r.get("ts") or 0) - ts) < 300
+                for r in rows
+            ):
+                continue
+            _append_row(
+                sym=sym,
+                side=str(raw.get("side") or "long"),
+                ts=ts,
+                entry=entry,
+                exit_px=exit_px,
+                event=str(raw.get("reason") or raw.get("event") or "exchange_close"),
+                source="dashboard",
+                fill_pnl=float(raw.get("fill_pnl")) if raw.get("fill_pnl") is not None else None,
+                prof_pnl=None,
+                margin=float(raw.get("margin_usdt") or 0),
+                contracts=float(raw.get("contracts") or 0),
+                lev=int(raw.get("leverage") or 0) or _default_close_leverage(),
+            )
+
         outcomes_path = _state_dir / "trade_outcomes.jsonl"
         for raw in _read_jsonl(outcomes_path, limit=max(limit * 4, 160)):
             if str(raw.get("event") or "").lower() != "outcome":
@@ -663,6 +797,9 @@ class LiveDataHub:
         self._profitability_mtime = 0.0
         self._trades_journal_mtime = 0.0
         self._trades_outcomes_mtime = 0.0
+        self._roe_learning_mtime = 0.0
+        self._dashboard_closes_mtime = 0.0
+        self._prev_open_syms: set[str] = set()
         self._closed_cache: list[dict] | None = None
         self._closed_cache_ver = 0.0
 
@@ -670,6 +807,12 @@ class LiveDataHub:
         if self._running:
             return
         self._running = True
+        try:
+            from position_registry import PositionRegistry
+
+            self._prev_open_syms = set(PositionRegistry(_state_dir).keys())
+        except Exception:
+            self._prev_open_syms = set()
         try:
             now = time.time()
             self._refresh_exchange(now)
@@ -744,6 +887,7 @@ class LiveDataHub:
             try:
                 fresh = ex.fetch_all_positions()
                 if fresh:
+                    self._detect_closed_positions(fresh, ex)
                     self._positions = fresh
                     self._exchange_positions_ts = now
                     self._positions_ts = now
@@ -781,6 +925,88 @@ class LiveDataHub:
                 if "429" in msg:
                     self._exchange_backoff_until = time.time() + 60.0
                 log.debug("live equity refresh failed: %s", exc)
+
+    def _detect_closed_positions(
+        self, positions: dict[str, dict], ex: BlofinExchange
+    ) -> None:
+        """When a symbol vanishes from the exchange book, record a dashboard close row."""
+        new_syms = {
+            str(p.get("symbol") or k.split("#")[0]) for k, p in positions.items()
+        }
+        if not self._prev_open_syms:
+            self._prev_open_syms = new_syms
+            return
+        vanished = self._prev_open_syms - new_syms
+        self._prev_open_syms = new_syms
+        if not vanished:
+            return
+        try:
+            from position_registry import PositionRegistry
+
+            registry = PositionRegistry(_state_dir)
+        except Exception:
+            return
+        for sym in vanished:
+            meta = registry.get(sym) or {}
+            side = str(meta.get("side") or "long")
+            entry = float(meta.get("entry_price") or 0)
+            opened_at = float(meta.get("opened_at") or 0) or None
+            lev = int(meta.get("leverage") or 0) or _default_close_leverage()
+            margin = float(meta.get("margin_usdt") or 0)
+            contracts = float(meta.get("contracts") or 0)
+            close_px = 0.0
+            fill_pnl: float | None = None
+            reason = "exchange_close"
+            try:
+                fill = ex.fetch_recent_close_fill(sym, side, opened_at=opened_at)
+            except Exception:
+                fill = None
+            if fill and float(fill.get("fill_price") or 0) > 0:
+                close_px = float(fill["fill_price"])
+                raw_pnl = fill.get("fill_pnl")
+                if raw_pnl is not None:
+                    try:
+                        fill_pnl = float(raw_pnl)
+                    except (TypeError, ValueError):
+                        fill_pnl = None
+                reason = str(fill.get("reason") or "exchange_close")
+            if close_px <= 0 and entry > 0:
+                if getattr(ex, "stream", None):
+                    close_px = float(ex.stream.get_last_price(sym) or 0)
+            if close_px <= 0:
+                close_px = entry
+            ts = time.time()
+            pnl_usd = fill_pnl
+            roe_pct = None
+            if pnl_usd is None and entry > 0 and close_px > 0:
+                pnl_usd, roe_pct = _resolve_close_pnl_roe(
+                    side=side,
+                    entry=entry,
+                    exit_px=close_px,
+                    margin_usdt=margin if margin > 0 else None,
+                    leverage=lev,
+                    contracts=contracts if contracts > 0 else None,
+                    contract_size=_contract_size_for(sym),
+                )
+            _append_dashboard_close(
+                {
+                    "symbol": sym,
+                    "side": side,
+                    "entry": entry,
+                    "exit": close_px,
+                    "close_price": close_px,
+                    "ts": ts,
+                    "reason": reason,
+                    "fill_pnl": fill_pnl,
+                    "pnl_usd": pnl_usd,
+                    "roe_pct": roe_pct,
+                    "leverage": lev,
+                    "margin_usdt": margin,
+                    "contracts": contracts,
+                }
+            )
+            self._closed_cache = None
+            log.info("dashboard recorded exchange close %s %s", sym, side)
 
     def _reconcile_positions_file(self, positions: dict[str, dict]) -> None:
         """Rewrite account_snapshot + registry when exchange book differs from disk."""
@@ -1033,6 +1259,18 @@ class LiveDataHub:
                     om = outcomes.stat().st_mtime
                     if om != self._trades_outcomes_mtime:
                         self._trades_outcomes_mtime = om
+                        self._closed_cache = None
+                roe_path = _state_dir / "roe_learning.json"
+                if roe_path.is_file():
+                    rm = roe_path.stat().st_mtime
+                    if rm != self._roe_learning_mtime:
+                        self._roe_learning_mtime = rm
+                        self._closed_cache = None
+                dash_closes = _state_dir / "dashboard_closes.jsonl"
+                if dash_closes.is_file():
+                    dm = dash_closes.stat().st_mtime
+                    if dm != self._dashboard_closes_mtime:
+                        self._dashboard_closes_mtime = dm
                         self._closed_cache = None
                 self._refresh_exchange(now)
                 log_delta = self._refresh_logs()

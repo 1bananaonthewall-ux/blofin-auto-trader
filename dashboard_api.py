@@ -836,20 +836,18 @@ def api_closed_trades():
     hours = min(max(int(request.args.get("hours", 0)), 0), 720)
     limit = min(max(int(request.args.get("limit", 80)), 1), 200)
     snap = get_live_hub().get_snapshot()
-    if hours > 0:
-        closed = closed_trades_list(limit=limit, hours=float(hours))
-    else:
-        closed = snap.get("closed") or closed_trades_list(limit=limit)
+    closed = closed_trades_list(limit=limit, hours=float(hours) if hours > 0 else 0.0)
+    ver = trades_stream_version()
     return jsonify(
         {
             "trades": closed,
             "count": len(closed),
             "hours": hours or None,
             "limit": limit,
-            "source": "profitability.json+trade_outcomes.jsonl",
-            "trades_version": trades_stream_version(),
+            "source": "profitability+outcomes+journal+roe+dashboard",
+            "trades_version": ver,
             "stream_ts": snap.get("stream_ts"),
-            "updated_at": snap.get("closed_updated_at"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     )
 

@@ -261,6 +261,25 @@ class AutonomousGrowthEngine:
             margin_usdt=margin_usdt,
             contracts=contracts,
         )
+        try:
+            from journal import TradeJournal
+
+            journal = TradeJournal(self.pnl.state_dir / "trades.jsonl")
+            journal.append(
+                "close",
+                symbol=symbol,
+                side=side or "long",
+                pnl_usd=round(float(net_pnl_usd), 6),
+                entry=entry,
+                exit=exit_px,
+                leverage=leverage,
+                margin=margin_usdt,
+                contracts=contracts,
+                roe_pct=roe_pct,
+                reason=event,
+            )
+        except Exception:
+            pass
         if self._tpsl_pacer is not None:
             kind = self._tpsl_pacer.record_exit(event, net_pnl_usd)
             if kind == "sl" and self._exit_cooldowns is not None:

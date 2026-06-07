@@ -44,6 +44,7 @@ export function useLiveStream() {
   const [streamError, setStreamError] = useState<string | null>(null);
   const logOffsetRef = useRef(0);
   const tradesVersionRef = useRef(0);
+  const tradesSigRef = useRef("");
   const wsRef = useRef<WebSocket | null>(null);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
@@ -134,26 +135,27 @@ export function useLiveStream() {
 
   useEffect(() => {
     const pollTrades = () => {
-      fetch("/api/trades/closed?limit=24")
+      fetch("/api/trades/closed?limit=24&_=" + Date.now())
         .then((r) => (r.ok ? r.json() : null))
         .then(
           (data: {
             trades?: ClosedTrade[];
             trades_version?: number;
+            updated_at?: string;
           } | null) => {
             if (!mountedRef.current || !data?.trades) return;
             const ver = data.trades_version ?? 0;
-            if (ver > 0) {
-              if (ver === tradesVersionRef.current) return;
-              tradesVersionRef.current = ver;
-            }
+            const sig = `${ver}|${data.updated_at ?? ""}|${data.trades.length}|${data.trades[0]?.ts ?? 0}`;
+            if (sig === tradesSigRef.current) return;
+            tradesSigRef.current = sig;
+            if (ver > 0) tradesVersionRef.current = ver;
             setClosed(data.trades);
           }
         )
         .catch(() => {});
     };
     pollTrades();
-    const tradesTimer = setInterval(pollTrades, 4000);
+    const tradesTimer = setInterval(pollTrades, 2500);
     return () => clearInterval(tradesTimer);
   }, []);
 
