@@ -234,6 +234,8 @@ def run_all_analyses(
     *,
     funding_rate: float | None = None,
     ml_decision: StrategyDecision | None = None,
+    min_confluence_score: float | None = None,
+    min_agreeing_votes: int | None = None,
 ) -> ConfluenceResult | None:
     """Evaluate every TA layer and compute weighted confluence."""
     if len(ohlcv_1m) < 35:
@@ -310,9 +312,11 @@ def run_all_analyses(
     votes_long = sum(1 for v in votes if v.signal == Signal.LONG and v.strength >= 0.25)
     votes_short = sum(1 for v in votes if v.signal == Signal.SHORT and v.strength >= 0.25)
 
-    if confluence_score < MIN_CONFLUENCE_SCORE:
+    min_cs = MIN_CONFLUENCE_SCORE if min_confluence_score is None else min_confluence_score
+    min_av = MIN_AGREEING_VOTES if min_agreeing_votes is None else min_agreeing_votes
+    if confluence_score < min_cs:
         return None
-    if len(agreeing) < MIN_AGREEING_VOTES:
+    if len(agreeing) < min_av:
         return None
     if len(opposing) >= len(agreeing):
         return None

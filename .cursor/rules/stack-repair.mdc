@@ -1,0 +1,15 @@
+---
+description: When stack repair is due, bring bot + dashboard online before other work.
+globs:
+alwaysApply: true
+---
+
+# Stack repair priority
+
+If `.cursor/STACK_REPAIR_DUE` exists in this project, your **first priority** is:
+
+1. Read `.cursor/skills/stack-repair/SKILL.md` and execute the full checklist.
+2. Keep working (fix code, rerun stack scripts) until `python scripts/stack_repair_check.py` succeeds.
+3. Delete `.cursor/STACK_REPAIR_DUE` when finished and ensure `state/stack_repair.json` has `"status": "done"`.
+
+Do not stop after a single failed ensure — loop diagnose/fix/verify until the stack is online.

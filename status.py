@@ -1,102 +1,46 @@
 #!/usr/bin/env python3
-"""Account, fluid manifold, and ML snapshot."""
+import json, time, uuid, hashlib, hmac, base64, requests
+from pathlib import Path
+from urllib.parse import urlencode
 
-from autonomous_engine import create_engine
-from config import load_settings
-from exchange_client import BlofinExchange
-from ml.outcomes import TradeOutcomeTracker
-from ml.predictor import MLPredictor
-from self_heal import SelfHealer
-from universe import load_tradeable_markets, load_training_markets, training_symbol_cap
+env = {}
+for line in Path("C:/Users/mknig/blofin-auto-trader/.env").read_text().splitlines():
+    l = line.strip()
+    if l and not l.startswith('#') and '=' in l:
+        k, _, v = l.partition('='); env[k.strip()] = v.strip()
 
+KEY=env['BLOFIN_API_KEY']; SECRET=env['BLOFIN_API_SECRET']; PASS=env['BLOFIN_API_PASSPHRASE']
 
-def main() -> None:
-    settings = load_settings()
-    engine = create_engine(settings.state_dir)
-    engine.bind_settings(settings)
-    engine.unrestricted_trading = settings.unrestricted_trading
-    engine.entries_never_pause = settings.entries_never_pause
-    ex = BlofinExchange(settings)
-    ex.load()
-    equity = ex.fetch_equity_usdt()
-    free = ex.fetch_free_equity_usdt()
-    positions = ex.fetch_all_positions()
-    ml = MLPredictor(settings.state_dir, min_confidence=engine.doctrine.min_confidence_floor)
-    tracker = TradeOutcomeTracker(settings.state_dir)
+def sign(m,p,b=''):
+    ts=str(int(time.time()*1000));n=str(uuid.uuid4())
+    ph=f'{p}{m.upper()}{ts}{n}{b}'
+    h=hmac.new(SECRET.encode(),ph.encode(),hashlib.sha256).hexdigest()
+    return base64.b64encode(h.encode()).decode(),ts,n
 
-    val_acc, long_p, short_p, fb = 0.55, 0.5, 0.5, 0
-    if ml.is_ready() and ml.model and ml.model.metrics:
-        m = ml.model.metrics
-        val_acc, long_p, short_p, fb = m.val_accuracy, m.val_long_precision, m.val_short_precision, m.feedback_samples
-    X, y = tracker.load_labelled_samples(200)
-    fb = max(fb, len(y))
-    engine.set_ml_metrics(val_acc, long_p, short_p, fb)
-    engine.update_fluid(equity, free, len(positions))
-    knobs = engine.compute_knobs(equity, free, len(positions))
-    curve = engine.curve_state
-
-    if settings.trade_all_symbols:
-        mkts = load_tradeable_markets(ex, equity, engine.doctrine.base_leverage, 0.95, 9999)
-        affordable = len(mkts)
-    else:
-        affordable = 1
-
-    print(engine.doctrine_summary())
-    print(f"~{engine.manifold.parameter_count_estimate:,} decision dimensions (manifold + ML ensemble)")
-    healer = SelfHealer(settings.state_dir, enabled=settings.self_heal_enabled)
-    heal = healer.summary()
-    print(
-        f"mode={settings.mode} dry_run={settings.dry_run} "
-        f"unrestricted={settings.unrestricted_trading} self_heal={settings.self_heal_enabled} "
-        f"scalp={settings.scalp_mode}"
-    )
-    if settings.scalp_mode:
-        line = (
-            f"scalp: {settings.scalp_leverage}-{settings.scalp_leverage_max}x "
-            f"poll={settings.scalp_poll_seconds}s hold>={settings.scalp_min_hold_seconds:.0f}s "
-            f"tp>={settings.scalp_min_take_profit_pct:.2%}"
-        )
-        if settings.scalp_3r_mode:
-            line += (
-                f" | 3R profile min_rr={settings.scalp_3r_min_rr:.1f} "
-                f"harvest>={settings.scalp_3r_harvest_min_r:.1f}R "
-                f"score+={settings.scalp_3r_min_score_bump:.0f} conf+={settings.scalp_3r_min_confidence_bump:.2f}"
-            )
-        print(line)
-    if heal.get("recent_actions"):
-        print(f"self_heal: pause_streak={heal['pause_streak']} last={heal['recent_actions']}")
-    if engine.recovery_active:
-        print("self_heal: recovery_mode ACTIVE")
-    print(
-        f"fluid: intensity={knobs.action_intensity:.0%} reliability={knobs.path_reliability:.0%} "
-        f"survival={knobs.survival:.0%} edge={knobs.edge:.0%} entries={'yes' if knobs.allow_new_entries else 'paused'}"
-    )
-    print(
-        f"knobs: conf>={knobs.min_confidence:.0%} score>={knobs.min_signal_score:.0f} "
-        f"risk={knobs.risk_per_trade_pct:.1%} max_lev={knobs.max_leverage} poll={knobs.poll_seconds}s"
-    )
-    print(f"need {knobs.required_daily_return_pct:.2f}%/day | {knobs.days_remaining} days to target")
-    train_cap = training_symbol_cap(settings)
+s=requests.Session()
+def call(m,p,params=None,body=None):
+    time.sleep(0.5)
+    q=urlencode({k:str(v) for k,v in params.items()}) if params else ''
+    sp=p+('?'+q if q else '')
+    bs=json.dumps(body,separators=(',',':')) if body else ''
+    sig,ts,n=sign(m,sp,bs)
+    h={'ACCESS-KEY':KEY,'ACCESS-SIGN':sig,'ACCESS-TIMESTAMP':ts,'ACCESS-NONCE':n,'ACCESS-PASSPHRASE':PASS,'Content-Type':'application/json','User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64)','Accept':'application/json','Origin':'https://blofin.com','Referer':'https://blofin.com/'}
+    u='https://openapi.blofin.com'+sp
     try:
-        train_n = len(load_training_markets(ex, cap=train_cap))
-    except Exception:
-        train_n = 0
-    print(
-        f"ml={'ready' if ml.is_ready() else 'not ready'} | {ml.metrics_summary()} | "
-        f"train_universe={train_n} ({'all exchange' if train_cap <= 0 else f'cap {train_cap}'})"
-    )
-    print(f"equity=${equity:.4f} free_margin=${free:.4f} dd={knobs.drawdown_pct:.1f}% affordable={affordable}")
-    if curve:
-        print(engine.pnl.format_report(curve, equity))
-        print(
-            f"curve: phase={curve.curve_phase} verticality={curve.verticality:.0%} "
-            f"harvest_eagerness={curve.harvest_eagerness:.2f}x entry_scale={curve.entry_scale:.2f}x "
-            f"preserve={'yes' if curve.preserve_capital else 'no'}"
-        )
-    print(f"open_positions={len(positions)}")
-    if knobs.drivers:
-        print("drivers:", " ".join(knobs.drivers))
+        r=(s.get(u,headers=h,timeout=12) if m=='GET' else s.post(u,headers=h,data=bs or None,timeout=12))
+        if r.status_code==200 and r.text: return r.json()
+    except: pass
+    return None
 
+j=call('GET','/api/v1/account/balance',{'accountType':'futures'})
+eq=float(j['data']['totalEquity']) if j and j.get('data') else 0
+det=j.get('data',{}).get('details',[]) if j and j.get('data') else []
+av=float(det[0].get('available',0)) if det else eq
+print(f'[{time.strftime("%H:%M:%S")}] EQ: ${eq:.2f} FREE: ${av:.2f}')
 
-if __name__ == "__main__":
-    main()
+j2=call('GET','/api/v1/account/positions',{'accountType':'futures'})
+opens=[p for p in (j2.get('data') or []) if float(p.get('positions',0) or 0)!=0] if j2 else []
+for p in opens:
+    avg=float(p.get('averagePrice',0)); mark=float(p.get('markPrice',0)); upl=float(p.get('upl',0))
+    roe=(mark/avg-1)*100 if avg>0 else 0
+    print(f"  {p['instId']:20s} {p.get('positionSide'):>5s} sz={str(p.get('positions')):>4} avg={avg:.6f} mark={mark:.6f} roe={roe:+.2f}% upl={upl:+.4f}")

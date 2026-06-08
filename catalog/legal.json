@@ -1,0 +1,36 @@
+{
+  "operator": "Matthew Anthony Knight",
+  "brand": "Bob's Bots",
+  "short_disclaimer": "Bob's Bots is operated by Matthew Anthony Knight. Not financial, investment, tax, or legal advice. Trading involves substantial risk of loss.",
+  "footer_line": "© 2026 Bob's Bots — Matthew Anthony Knight. All rights reserved.",
+  "sections": [
+    {
+      "title": "Not financial advice",
+      "body": "Nothing on this website, in our bots, backtests, dashboards, concierge chat, or marketing materials constitutes financial advice, investment advice, trading advice, tax advice, or legal advice. Matthew Anthony Knight and Bob's Bots are not registered investment advisers, broker-dealers, or financial planners. You are solely responsible for your trading decisions."
+    },
+    {
+      "title": "Risk disclosure",
+      "body": "Cryptocurrency and leveraged derivatives trading involves substantial risk of loss and is not suitable for every investor. You may lose some or all of your capital. Past performance — including backtests, simulated results, rankings, and benchmarks — does not guarantee future results. Hypothetical performance has inherent limitations and may not reflect actual liquidity, slippage, fees, or emotional decision-making."
+    },
+    {
+      "title": "Backtests & rankings",
+      "body": "Backtest Lab and leaderboard figures are generated from historical Blofin OHLCV data using our confluence engine. They are educational and illustrative. They are not proof of live profitability. Date range, starting pot, asset selection, and market conditions materially change outcomes. Always verify on your own timeframe before risking real funds."
+    },
+    {
+      "title": "Software only",
+      "body": "Bob's Bots sells automation software and documentation. We do not custody funds, execute trades on your behalf without your API keys on your machine, or guarantee uptime, fills, or exchange availability. You connect your own exchange account and control demo vs live mode."
+    },
+    {
+      "title": "No guarantees",
+      "body": "We do not guarantee profits, win rates, drawdown limits, or compatibility with every account size or jurisdiction. Refunds and concierge resolutions are goodwill policies — not an admission of investment failure or liability for trading losses."
+    },
+    {
+      "title": "Jurisdiction",
+      "body": "You are responsible for ensuring automated trading is permitted where you live and on your chosen exchange. Bob's Bots may not be available in all regions."
+    },
+    {
+      "title": "Contact",
+      "body": "Operator: Matthew Anthony Knight — Bob's Bots. For support use the Concierge or the refunds section on this site."
+    }
+  ]
+}

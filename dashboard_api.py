@@ -591,6 +591,70 @@ def _exchange() -> BlofinExchange:
     return ex
 
 
+_BOOT_ENSURE_TS = 0.0
+STACK_REPAIR_FLAG = ROOT / ".cursor" / "STACK_REPAIR_DUE"
+STACK_REPAIR_STATE = STATE_DIR / "stack_repair.json"
+
+
+def _read_stack_repair_state() -> dict[str, Any]:
+    if not STACK_REPAIR_STATE.is_file():
+        return {"status": "idle"}
+    try:
+        return json.loads(STACK_REPAIR_STATE.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {"status": "unknown"}
+
+
+def _spawn_detached_ps1(script_name: str) -> None:
+    ps1 = ROOT / "scripts" / script_name
+    if not ps1.is_file():
+        raise FileNotFoundError(f"missing {ps1}")
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            str(ps1),
+        ],
+        cwd=str(ROOT),
+        creationflags=_win_subprocess_flags(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+
+
+def _spawn_stack_ensure() -> None:
+    """Detached ensure: single bot + dashboard (safe if dashboard is already up)."""
+    boot_ps1 = ROOT / "scripts" / "boot_god_bot_stack.ps1"
+    if not boot_ps1.is_file():
+        raise FileNotFoundError(f"missing {boot_ps1}")
+    args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        str(boot_ps1),
+    ]
+    subprocess.Popen(
+        args,
+        cwd=str(ROOT),
+        creationflags=_win_subprocess_flags(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+
+
 @app.route("/api/health")
 def api_health():
     routes_ok = {
@@ -598,6 +662,7 @@ def api_health():
         "logs": True,
         "pnl_curve": True,
     }
+    bot_running = _bot_running()
     return jsonify(
         {
             "ok": True,
@@ -606,12 +671,54 @@ def api_health():
             "state_dir": str(STATE_DIR),
             "log_file": str(LOG_FILE),
             "log_exists": LOG_FILE.is_file(),
-            "bot_running": _bot_running(),
+            "bot_running": bot_running,
+            "stack_ready": bot_running,
+            "dashboard_port": int(__import__("os").environ.get("DASHBOARD_PORT", "5050")),
             "features": ["pnl-curve", "status", "positions", "signals", "scanner", "tickers", "logs", "websocket"],
             "routes": routes_ok,
             "copilot_llm": _copilot_llm_health(),
         }
     )
+
+
+@app.route("/api/boot", methods=["GET", "POST"])
+def api_boot():
+    """Idempotent stack warmup — used on dashboard load after reboot."""
+    global _BOOT_ENSURE_TS
+    bot_running = _bot_running()
+    if bot_running:
+        return jsonify(
+            {
+                "ok": True,
+                "bot_running": True,
+                "warming": False,
+                "status": "ready",
+            }
+        )
+    now = time.time()
+    if now - _BOOT_ENSURE_TS < 30.0:
+        return jsonify(
+            {
+                "ok": True,
+                "bot_running": False,
+                "warming": True,
+                "status": "already_triggered",
+            }
+        )
+    _BOOT_ENSURE_TS = now
+    try:
+        _spawn_stack_ensure()
+        return jsonify(
+            {
+                "ok": True,
+                "bot_running": False,
+                "warming": True,
+                "status": "boot_triggered",
+                "hint": "HF model warmup may take 60–120s after reboot",
+            }
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 def _copilot_llm_health() -> dict[str, Any]:
@@ -1120,10 +1227,146 @@ def _spawn_fresh_stack_restart() -> None:
     )
 
 
+@app.route("/api/stack/stop-stack", methods=["POST"])
+def api_stop_stack():
+    """Stop bot + dashboard. Detached so the API can respond before shutdown."""
+    try:
+        _spawn_detached_ps1("stop_god_bot_stack.ps1")
+        return jsonify(
+            {
+                "ok": True,
+                "stopping": True,
+                "message": "Stopping bot and dashboard…",
+            }
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/stack/agent-repair", methods=["POST"])
+def api_stack_agent_repair():
+    """Queue persistent stack repair + cue Cursor coding agent."""
+    repair_lock = STATE_DIR / "stack_repair.lock"
+    state = _read_stack_repair_state()
+    if repair_lock.is_file() and state.get("status") == "running":
+        return jsonify(
+            {
+                "ok": True,
+                "repair_started": False,
+                "already_running": True,
+                "status": state,
+                "message": "Stack repair already in progress",
+            }
+        )
+    STACK_REPAIR_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    STACK_REPAIR_FLAG.write_text(
+        f"triggered_at={datetime.now(timezone.utc).isoformat()}\n"
+        "source=dashboard_ctrl_f7\n"
+        "instruction=Bring God Bot stack online. Do not stop until accomplished.\n",
+        encoding="utf-8",
+    )
+    STACK_REPAIR_STATE.parent.mkdir(parents=True, exist_ok=True)
+    STACK_REPAIR_STATE.write_text(
+        json.dumps(
+            {
+                "status": "queued",
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+                "source": "dashboard_ctrl_f7",
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        _spawn_detached_ps1("stack_agent_repair.ps1")
+        return jsonify(
+            {
+                "ok": True,
+                "repair_started": True,
+                "agent_cued": True,
+                "message": (
+                    "Coding agent repair queued — working until bot + dashboard are online. "
+                    "Open Cursor in this repo if the IDE is not already focused."
+                ),
+            }
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/stack/repair-status", methods=["GET"])
+def api_stack_repair_status():
+    state = _read_stack_repair_state()
+    bot_running = _bot_running()
+    return jsonify(
+        {
+            "ok": True,
+            "bot_running": bot_running,
+            "stack_ready": bot_running,
+            "repair_flag": STACK_REPAIR_FLAG.is_file(),
+            "repair": state,
+        }
+    )
+
+
 @app.route("/api/stack/<action>", methods=["POST"])
 def api_stack(action: str):
-    if action not in {"start", "stop", "restart", "restart-fresh", "status"}:
+    if action not in {"start", "stop", "restart", "restart-fresh", "status", "ensure"}:
         return jsonify({"error": "invalid action"}), 400
+    if action in ("start", "ensure"):
+        action = "ensure"
+        ps1 = ROOT / "scripts" / "stack_control.ps1"
+        dash_ps1 = ROOT / "scripts" / "start_dashboard_quiet.ps1"
+        timeout = 200
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-Action", "ensure"],
+                text=True,
+                timeout=timeout,
+                cwd=str(ROOT),
+                stderr=subprocess.STDOUT,
+                creationflags=_win_subprocess_flags(),
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(dash_ps1), "-Port", "5050"],
+                text=True,
+                timeout=45,
+                cwd=str(ROOT),
+                stderr=subprocess.STDOUT,
+                creationflags=_win_subprocess_flags(),
+                check=False,
+            )
+            text = (out or "").strip()
+            running = _bot_running()
+            ok = running or "Started bot" in text or "Single bot ok" in text or "WARMUP" in text
+            return jsonify(
+                {
+                    "action": action,
+                    "ok": ok,
+                    "bot_running": running,
+                    "output": text,
+                }
+            )
+        except subprocess.TimeoutExpired:
+            return jsonify(
+                {
+                    "action": action,
+                    "ok": _bot_running(),
+                    "bot_running": _bot_running(),
+                    "warming": True,
+                    "error": f"stack ensure still running after {timeout}s (HF warmup)",
+                }
+            ), 202
+        except subprocess.CalledProcessError as exc:
+            text = (exc.output or str(exc))[:500]
+            return jsonify(
+                {
+                    "action": action,
+                    "ok": _bot_running(),
+                    "bot_running": _bot_running(),
+                    "error": text,
+                    "output": text,
+                }
+            ), 500
     if action in ("restart", "restart-fresh"):
         try:
             _spawn_fresh_stack_restart()

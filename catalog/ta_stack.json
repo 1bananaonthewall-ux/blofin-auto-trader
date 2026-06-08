@@ -1,0 +1,32 @@
+{
+  "brand": "Bob's Bots",
+  "summary": "All Bob's Bots tiers share the same entry TA core. Tiers differ by risk tuning, throughput, and intelligence add-ons — not a different indicator stack.",
+  "core_ta": {
+    "label": "Shared entry brain (every tier)",
+    "timeframes": ["1m primary", "5m HTF bias"],
+    "methods": [
+      "EMA fast/slow (1m + 5m trend)",
+      "RSI momentum",
+      "MACD",
+      "Bollinger bands",
+      "VWAP distance",
+      "ADX trend strength",
+      "MFI / CMF money flow",
+      "Volume ratio",
+      "Market structure / wick rejection",
+      "Funding rate bias",
+      "Runner filter (path efficiency + chop index)",
+      "Regime detection (trending / ranging / volatile)"
+    ],
+    "confluence": "15+ weighted votes; need ~52% agreement and 5+ agreeing methods before a direction counts",
+    "exit_ta": "Exchange-native TP/SL (3R fast lane: ~1% stop / ~3% take) — exits are price brackets, not separate indicator sells"
+  },
+  "tier_extras": {
+    "god-bot-scalper-pro": ["Full steward loop", "Hourly optimizer", "Fluid manifold + mission brain", "ML ensemble gate", "Dashboard"],
+    "god-bot-3r-fast": ["TPSL-only pacing", "Hourly 3R winner mode", "Lighter ML boot", "Higher throughput targets"],
+    "god-bot-ml-cortex": ["Trade lessons + auto ML refit", "Local cortex knowledge", "Optional LLM policy overlay on same confluence baseline"],
+    "god-bot-conservative": ["Tighter stop/take", "Micro-account caps", "6% session drawdown pause", "Stricter runner filter threshold"],
+    "universe-scanner": ["Symbol ratings only — momentum + quality composite tiers", "Does not change entry TA; ranks which coins to scan"]
+  },
+  "backtest_lab_note": "Backtest Lab runs bobs_bots/ engine: full ta_confluence.py on Blofin 5m+1H with per-bot gate profiles and 3R bracket simulation."
+}

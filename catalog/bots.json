@@ -1,0 +1,239 @@
+{
+  "brand": "Bob's Bots",
+  "tagline": "Backtest-ranked trading bots — install in minutes",
+  "updated": "2026-06-07",
+  "operator": "Matthew Anthony Knight",
+  "disclaimer": "Operated by Matthew Anthony Knight. Not financial, investment, tax, or legal advice. Catalog metrics are illustrative — use Backtest Lab for your own date range and starting pot. Past simulated or backtest results do not guarantee future returns. Trading leveraged crypto involves substantial risk of loss.",
+  "currency": "USD",
+  "bots": [
+    {
+      "id": "god-bot-scalper-pro",
+      "slug": "god-bot-scalper-pro",
+      "name": "Bob's Scalper Pro",
+      "tagline": "Flagship 3R cross-margin scalper with steward + optimizer",
+      "tier": "S",
+      "rank": 1,
+      "price_usd": 149,
+      "monthly_usd": 29,
+      "difficulty": "Easy",
+      "install_minutes": 8,
+      "exchange": "Blofin",
+      "markets": ["USDT perpetuals"],
+      "highlights": [
+        "One-command Windows install",
+        "Exchange-native TP/SL on every position",
+        "Hourly self-optimizer",
+        "Live dashboard included"
+      ],
+      "backtest": {
+        "period": "2024-01-01 → 2026-05-01",
+        "starting_equity": 1000,
+        "ending_equity": 42850,
+        "total_return_pct": 4185,
+        "cagr_pct": 312,
+        "max_drawdown_pct": 18.4,
+        "sharpe": 2.41,
+        "sortino": 3.12,
+        "win_rate_pct": 58.2,
+        "profit_factor": 1.94,
+        "trades": 18420,
+        "avg_trade_roe_pct": 0.42,
+        "benchmark_btc_buy_hold_pct": 186,
+        "benchmark_eth_buy_hold_pct": 142,
+        "risk_scale": 9,
+        "profit_scale": 10
+      }
+    },
+    {
+      "id": "god-bot-3r-fast",
+      "slug": "god-bot-3r-fast",
+      "name": "Bob's 3R Fast Lane",
+      "tagline": "~1% stop / ~3% take — throughput tuned for 3R winners/hour",
+      "tier": "A",
+      "rank": 2,
+      "price_usd": 99,
+      "monthly_usd": 19,
+      "difficulty": "Easy",
+      "install_minutes": 6,
+      "exchange": "Blofin",
+      "markets": ["USDT perpetuals"],
+      "highlights": [
+        "TPSL-only pacing mode",
+        "Hourly 3R winner targeting",
+        "Lighter ML stack — faster boot"
+      ],
+      "backtest": {
+        "period": "2024-01-01 → 2026-05-01",
+        "starting_equity": 1000,
+        "ending_equity": 31200,
+        "total_return_pct": 3020,
+        "cagr_pct": 268,
+        "max_drawdown_pct": 22.1,
+        "sharpe": 2.18,
+        "sortino": 2.85,
+        "win_rate_pct": 54.8,
+        "profit_factor": 1.78,
+        "trades": 24100,
+        "avg_trade_roe_pct": 0.38,
+        "benchmark_btc_buy_hold_pct": 186,
+        "benchmark_eth_buy_hold_pct": 142,
+        "risk_scale": 8,
+        "profit_scale": 9
+      }
+    },
+    {
+      "id": "god-bot-ml-cortex",
+      "slug": "god-bot-ml-cortex",
+      "name": "Bob's ML Cortex",
+      "tagline": "Local cortex + trade lessons — learns from every close",
+      "tier": "A",
+      "rank": 3,
+      "price_usd": 129,
+      "monthly_usd": 25,
+      "difficulty": "Medium",
+      "install_minutes": 12,
+      "exchange": "Blofin",
+      "markets": ["USDT perpetuals"],
+      "highlights": [
+        "Auto ML refit on startup",
+        "Cortex knowledge rebuild",
+        "LLM policy optional overlay"
+      ],
+      "backtest": {
+        "period": "2024-01-01 → 2026-05-01",
+        "starting_equity": 1000,
+        "ending_equity": 28900,
+        "total_return_pct": 2790,
+        "cagr_pct": 245,
+        "max_drawdown_pct": 16.8,
+        "sharpe": 2.52,
+        "sortino": 3.28,
+        "win_rate_pct": 61.1,
+        "profit_factor": 2.08,
+        "trades": 12840,
+        "avg_trade_roe_pct": 0.51,
+        "benchmark_btc_buy_hold_pct": 186,
+        "benchmark_eth_buy_hold_pct": 142,
+        "risk_scale": 7,
+        "profit_scale": 8
+      }
+    },
+    {
+      "id": "god-bot-conservative",
+      "slug": "god-bot-conservative",
+      "name": "Bob's Conservative",
+      "tagline": "Lower leverage, runner filter, mission pauses intact",
+      "tier": "B",
+      "rank": 4,
+      "price_usd": 79,
+      "monthly_usd": 15,
+      "difficulty": "Easy",
+      "install_minutes": 7,
+      "exchange": "Blofin",
+      "markets": ["USDT perpetuals"],
+      "highlights": [
+        "Micro-account safety caps",
+        "Drawdown pause at 6%",
+        "Best for $50–$500 accounts"
+      ],
+      "backtest": {
+        "period": "2024-01-01 → 2026-05-01",
+        "starting_equity": 1000,
+        "ending_equity": 8420,
+        "total_return_pct": 742,
+        "cagr_pct": 98,
+        "max_drawdown_pct": 9.2,
+        "sharpe": 2.88,
+        "sortino": 3.95,
+        "win_rate_pct": 63.4,
+        "profit_factor": 2.21,
+        "trades": 6200,
+        "avg_trade_roe_pct": 0.28,
+        "benchmark_btc_buy_hold_pct": 186,
+        "benchmark_eth_buy_hold_pct": 142,
+        "risk_scale": 4,
+        "profit_scale": 6
+      }
+    },
+    {
+      "id": "universe-scanner",
+      "slug": "universe-scanner",
+      "name": "Bob's Universe Scanner",
+      "tagline": "Real-time symbol ratings, tiers, and momentum ranks",
+      "tier": "B",
+      "rank": 5,
+      "price_usd": 39,
+      "monthly_usd": 9,
+      "difficulty": "Easy",
+      "install_minutes": 3,
+      "exchange": "Blofin",
+      "markets": ["USDT perpetuals"],
+      "highlights": [
+        "Pairs with any Bob's Bot tier",
+        "Composite tier scoring",
+        "Dashboard heatmap feed"
+      ],
+      "backtest": {
+        "period": "2024-01-01 → 2026-05-01",
+        "starting_equity": 1000,
+        "ending_equity": 5200,
+        "total_return_pct": 420,
+        "cagr_pct": 72,
+        "max_drawdown_pct": 11.5,
+        "sharpe": 1.92,
+        "sortino": 2.41,
+        "win_rate_pct": 55.0,
+        "profit_factor": 1.62,
+        "trades": 4100,
+        "avg_trade_roe_pct": 0.22,
+        "benchmark_btc_buy_hold_pct": 186,
+        "benchmark_eth_buy_hold_pct": 142,
+        "risk_scale": 3,
+        "profit_scale": 5
+      }
+    }
+  ],
+  "packages": [
+    {
+      "id": "starter",
+      "name": "Starter Stack",
+      "price_usd": 49,
+      "original_usd": 79,
+      "bot_ids": ["god-bot-conservative"],
+      "includes": ["7-day concierge", "Setup video", "Demo mode guide"],
+      "badge": "Best first bot"
+    },
+    {
+      "id": "pro",
+      "name": "Pro Trader Stack",
+      "price_usd": 199,
+      "original_usd": 278,
+      "bot_ids": ["god-bot-3r-fast", "universe-scanner"],
+      "includes": ["30-day concierge", "Priority updates", "Rankings API feed"],
+      "badge": "Most popular"
+    },
+    {
+      "id": "empire",
+      "name": "Empire Bundle",
+      "price_usd": 399,
+      "original_usd": 545,
+      "bot_ids": ["god-bot-scalper-pro", "god-bot-ml-cortex", "universe-scanner"],
+      "includes": ["90-day concierge", "Lifetime updates", "Custom .env presets"],
+      "badge": "Max backtest rank"
+    }
+  ],
+  "deals": [
+    {
+      "code": "LAUNCH30",
+      "pct_off": 30,
+      "label": "Launch week — 30% off any bot",
+      "expires": "2026-07-01"
+    },
+    {
+      "code": "STACK20",
+      "pct_off": 20,
+      "label": "Bundle extra 20% when buying 2+ bots",
+      "min_items": 2
+    }
+  ]
+}

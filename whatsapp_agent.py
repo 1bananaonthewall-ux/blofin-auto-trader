@@ -61,7 +61,7 @@ def is_bot_running() -> bool:
             cwd=str(ROOT),
             stderr=subprocess.STDOUT,
         )
-        return "bot.py: RUNNING" in out
+        return "bot.py: RUNNING" in out or "WARMUP" in out
     except Exception:
         return False
 

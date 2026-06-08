@@ -295,10 +295,24 @@ def analyze_symbol(
     else:
         run_all_analyses._scalp_ctx = None
 
-    cf = run_all_analyses(ohlcv_1m, ohlcv_5m, funding_rate=funding, ml_decision=ml_decision)
+    opens_starved = hourly_3r_active(settings) and is_opens_starved(settings)
+    entry_starved = hourly_3r_active(settings) and is_entry_starved(settings)
+    throughput_relax = opens_starved or entry_starved
+    min_confluence = 0.48 if throughput_relax else 0.52
+    min_agreeing = 4 if throughput_relax else 5
+
+    cf = run_all_analyses(
+        ohlcv_1m,
+        ohlcv_5m,
+        funding_rate=funding,
+        ml_decision=ml_decision,
+        min_confluence_score=min_confluence,
+        min_agreeing_votes=min_agreeing,
+    )
     if cf is None:
         return None
 
+    rq = None
     if getattr(settings, "runner_filter_enabled", True):
         from run_quality import measure_run_quality
 
@@ -318,6 +332,13 @@ def analyze_symbol(
             cf.is_choppy = rq.is_choppy
             if rq.is_runner and cf.regime == "ranging":
                 cf.regime = "trending"
+            if cf.is_choppy and not throughput_relax:
+                return None
+            if not cf.is_runner and not throughput_relax:
+                return None
+            elite_floor = getattr(settings, "runner_min_score", 0.48) + (0.0 if throughput_relax else 0.02)
+            if rq.runner_score < elite_floor and not throughput_relax:
+                return None
 
     mk_snap = None
     if settings.markov_regime_enabled:
@@ -351,6 +372,16 @@ def analyze_symbol(
     )
 
     decision = confluence_to_decision(cf)
+    if not throughput_relax:
+        try:
+            from bobs_bots.regime import htf_ema_bias
+
+            closes_5m = [float(row[4]) for row in ohlcv_5m]
+            hb = htf_ema_bias(closes_5m)
+            if hb and decision.signal.value != hb:
+                return None
+        except Exception:
+            pass
     conf = decision.model_confidence
     used_llm = False
     llm_only = bool(getattr(settings, "llm_only_trading", False)) and not getattr(

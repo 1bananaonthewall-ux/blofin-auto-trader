@@ -1,6 +1,8 @@
-# God Bot web dashboard (extends whatsapp stack)
+# God Bot web dashboard + Bob's Bots storefront (extends whatsapp stack)
 flask>=3.0.0
 flask-sock>=0.7.0
 simple-websocket>=1.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
+# Optional: STOREFRONT_STRIPE_WEBHOOK_SECRET verification
+# stripe>=8.0.0

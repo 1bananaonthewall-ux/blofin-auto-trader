@@ -20,7 +20,7 @@ if (-not $listening) {
     "$ts RESTART dashboard :$port" | Out-File $Log -Append -Encoding utf8
     Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", (Join-Path $Root "scripts\run_dashboard.ps1"),
+        "-File", (Join-Path $Root "scripts\start_dashboard_quiet.ps1"),
         "-Port", "$port"
     )
 }

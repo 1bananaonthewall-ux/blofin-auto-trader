@@ -633,7 +633,143 @@ export default function App() {
   const [stackMsg, setStackMsg] = useState<string | null>(null);
   const live = useLiveStream();
 
-  const runStack = async (action: "start" | "stop" | "restart") => {
+  useEffect(() => {
+    let cancelled = false;
+    const warmStackAfterReboot = async () => {
+      try {
+        const health = await fetch("/api/health");
+        if (!health.ok) return;
+        const data = (await health.json()) as { bot_running?: boolean };
+        if (data.bot_running) return;
+        if (cancelled) return;
+        setStackMsg("Starting God Bot after reboot…");
+        await fetch("/api/boot", { method: "POST" });
+        const deadline = Date.now() + 120_000;
+        while (!cancelled && Date.now() < deadline) {
+          await new Promise((resolve) => window.setTimeout(resolve, 3000));
+          try {
+            const h = await fetch("/api/health");
+            if (!h.ok) continue;
+            const j = (await h.json()) as { bot_running?: boolean };
+            if (j.bot_running) {
+              setStackMsg("God Bot live — streaming market data");
+              window.setTimeout(() => setStackMsg(null), 5000);
+              return;
+            }
+          } catch {
+            /* still warming */
+          }
+        }
+        if (!cancelled) {
+          setStackMsg("Bot warming up (local LLM load). Refresh again in ~1 min.");
+        }
+      } catch {
+        /* health unavailable */
+      }
+    };
+    void warmStackAfterReboot();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const stopFullStack = async () => {
+    setStackBusy(true);
+    setStackMsg("Ctrl+F6 — stopping bot and dashboard…");
+    try {
+      const r = await api.stopStack();
+      setStackMsg(r.message || "Stack stopping — this page will go offline.");
+    } catch (e) {
+      setStackMsg(e instanceof Error ? e.message : "Stop failed");
+      setStackBusy(false);
+    }
+  };
+
+  const cueAgentRepair = async () => {
+    setStackBusy(true);
+    setStackMsg("Ctrl+F7 — coding agent repair queued…");
+    try {
+      const r = await api.agentRepair();
+      setStackMsg(
+        r.message ||
+          (r.already_running
+            ? "Repair already running — will not stop until stack is online."
+            : "Agent repair started.")
+      );
+      const deadline = Date.now() + 600_000;
+      const poll = async () => {
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => window.setTimeout(resolve, 5000));
+          try {
+            const st = await api.repairStatus();
+            if (st.repair?.status === "done" || st.stack_ready) {
+              setStackMsg("Stack online — repair complete. Reloading…");
+              window.setTimeout(() => window.location.reload(), 1500);
+              return;
+            }
+            const attempt = st.repair?.attempt;
+            const err = st.repair?.last_error;
+            setStackMsg(
+              `Agent repair running${attempt != null ? ` (attempt ${attempt})` : ""}` +
+                (err ? ` — ${err}` : " — will not stop until online")
+            );
+          } catch {
+            /* dashboard may be down mid-repair */
+          }
+        }
+        setStackMsg(
+          "Repair still running in background. Reopen http://127.0.0.1:5050 when ready."
+        );
+        setStackBusy(false);
+      };
+      void poll();
+    } catch (e) {
+      setStackMsg(e instanceof Error ? e.message : "Agent repair failed");
+      setStackBusy(false);
+    }
+  };
+
+  const bootStack = async () => {
+    setStackMsg("Ctrl+F5 — booting stack…");
+    try {
+      await fetch("/api/boot", { method: "POST" });
+      const deadline = Date.now() + 120_000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 3000));
+        const h = await fetch("/api/health");
+        if (!h.ok) continue;
+        const j = (await h.json()) as { bot_running?: boolean };
+        if (j.bot_running) {
+          setStackMsg("Stack booted — live");
+          window.setTimeout(() => setStackMsg(null), 4000);
+          return;
+        }
+      }
+      setStackMsg("Boot triggered — HF warmup may take up to 2 min.");
+    } catch {
+      setStackMsg("Boot request failed");
+    }
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.repeat) return;
+      if (e.key === "F5") {
+        e.preventDefault();
+        void bootStack();
+      } else if (e.key === "F6") {
+        e.preventDefault();
+        void stopFullStack();
+      } else if (e.key === "F7") {
+        e.preventDefault();
+        void cueAgentRepair();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const runStack = async (action: "start" | "stop" | "restart" | "ensure") => {
     setStackBusy(true);
     setStackMsg(null);
     try {
@@ -774,6 +910,8 @@ export default function App() {
 
       <footer className="footer">
         © {new Date().getFullYear()} God Bot · Blofin Auto Trader · {streamOk ? "ws://live" : "offline"}
+        {" · "}
+        <span className="footer-hotkeys">Ctrl+F5 boot · Ctrl+F6 stop stack · Ctrl+F7 agent repair</span>
       </footer>
     </div>
   );

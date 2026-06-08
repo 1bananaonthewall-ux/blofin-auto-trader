@@ -19,12 +19,10 @@ try {
 
 if (-not $listening) {
     Write-Host "Starting dashboard on port $port..." -ForegroundColor Cyan
-    Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", (Join-Path $Root "scripts\run_dashboard.ps1"),
-        "-Port", "$port"
-    )
-    Start-Sleep -Seconds 8
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File (
+        Join-Path $Root "scripts\start_dashboard_quiet.ps1"
+    ) -Port $port
+    Start-Sleep -Seconds 5
 } else {
     Write-Host "Dashboard already listening on $port" -ForegroundColor Green
 }

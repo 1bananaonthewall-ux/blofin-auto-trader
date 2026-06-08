@@ -574,6 +574,11 @@ body {
   flex-shrink: 0;
 }
 
+.footer-hotkeys {
+  opacity: 0.65;
+  font-size: 0.85em;
+}
+
 .footer {
   text-align: center;
   padding: 0.65rem 1rem;

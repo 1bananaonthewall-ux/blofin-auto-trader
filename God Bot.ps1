@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start", "stop", "restart", "status", "ensure")]
+    [ValidateSet("start", "stop", "restart", "status", "ensure", "install-boot", "open")]
     [string]$Action = "ensure",
     [switch]$RunHourlyNow
 )
@@ -9,6 +9,16 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
 Write-Host "God Bot control -> action: $Action"
+
+if ($Action -eq "install-boot") {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "scripts\install_boot_stack.ps1")
+    exit $LASTEXITCODE
+}
+
+if ($Action -eq "open") {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "scripts\open_god_bot_dashboard.ps1")
+    exit $LASTEXITCODE
+}
 
 if ($Action -in @("start", "restart", "ensure")) {
     $stackArgs = @(

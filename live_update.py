@@ -28,6 +28,8 @@ _RELOAD_ORDER = (
     "indicators",
     "mission_config",
     "ta_confluence",
+    "run_quality",
+    "bobs_bots.regime",
     "strategy",
     "scalp_profile",
     "ml.labels",

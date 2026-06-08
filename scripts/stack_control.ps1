@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start", "stop", "restart", "restart-fresh", "status", "ensure")]
+    [ValidateSet("start", "stop", "stop-stack", "restart", "restart-fresh", "status", "ensure")]
     [string]$Action = "status",
     [switch]$RunHourlyNow,
     [int]$DashboardPort = 5050
@@ -55,9 +55,15 @@ function Get-PidFileBotProcess {
     if (-not (Test-Path $BotPidFile)) { return $null }
     $savedPid = 0
     try { $savedPid = [int](Get-Content $BotPidFile -ErrorAction Stop | Select-Object -First 1) } catch { return $null }
-    if ($savedPid -le 0) { return $null }
+    if ($savedPid -le 0) {
+        Clear-BotPidFile
+        return $null
+    }
     $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
-    if (-not $proc -or $proc.ProcessName -ne "python") { return $null }
+    if (-not $proc -or $proc.ProcessName -ne "python") {
+        Clear-BotPidFile
+        return $null
+    }
     return Get-CimInstance Win32_Process -Filter "ProcessId=$savedPid" -ErrorAction SilentlyContinue
 }
 
@@ -104,9 +110,15 @@ function Test-IsOurBotProcess {
 
 function Get-AllBotPyProcesses {
     $found = @{}
-    foreach ($b in @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
+    $raw = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" | Where-Object {
         Test-IsOurBotProcess $_.CommandLine
-    })) {
+    })
+    $pidSet = @{}
+    foreach ($b in $raw) { $pidSet[[int]$b.ProcessId] = $true }
+    foreach ($b in $raw) {
+        # bot.py may spawn a child system-python worker; keep only the root process.
+        $parentId = [int]$b.ParentProcessId
+        if ($parentId -gt 0 -and $pidSet.ContainsKey($parentId)) { continue }
         $found[$b.ProcessId] = $b
     }
     $pidBot = Get-PidFileBotProcess
@@ -185,7 +197,7 @@ function Stop-DashboardApi {
 
 function Start-DashboardApi {
     param([int]$ListenPort)
-    $dashPs1 = Join-Path $Root "scripts\run_dashboard.ps1"
+    $dashPs1 = Join-Path $Root "scripts\start_dashboard_quiet.ps1"
     Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass",
         "-File", $dashPs1,
@@ -246,10 +258,8 @@ function Wait-ForSingleBot {
 }
 
 function Start-BotProcess {
-    if ((Get-AllBotPyProcesses).Count -gt 0) {
-        Stop-AllBots | Out-Null
-        Start-Sleep -Seconds 2
-    }
+    Stop-AllBots | Out-Null
+    Start-Sleep -Seconds 2
     $env:PYTHONUNBUFFERED = "1"
     $proc = Start-Process -FilePath $BotPython -ArgumentList @($BotPy) -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     Write-BotPidFile $proc.Id
@@ -299,7 +309,12 @@ function Get-BotProcesses {
     Get-AllBotPyProcesses
 }
 
+function Test-SchedulerTasksDisabled {
+    Test-Path (Join-Path $Root "state\no_scheduler_tasks")
+}
+
 function Ensure-TaskEnabled([string]$TaskName) {
+    if (Test-SchedulerTasksDisabled) { return }
     schtasks /Change /TN $TaskName /ENABLE 2>&1 | Out-Null
 }
 
@@ -343,14 +358,15 @@ function Start-Bot {
 function Select-BotProcessToKeep {
     param([array]$Bots)
     if ($Bots.Count -eq 0) { return $null }
+    # Always keep the venv worker; system-python bot.py duplicates are stale.
+    $venv = @($Bots | Where-Object { $_.CommandLine -like "*\.venv\Scripts\python.exe*" })
+    if ($venv.Count -ge 1) {
+        return $venv | Sort-Object ProcessId -Descending | Select-Object -First 1
+    }
     $pidBot = Get-PidFileBotProcess
     if ($pidBot) {
         $match = @($Bots | Where-Object { $_.ProcessId -eq $pidBot.ProcessId })
         if ($match.Count -ge 1) { return $match[0] }
-    }
-    $venv = @($Bots | Where-Object { $_.CommandLine -like "*\.venv\Scripts\python.exe*" })
-    if ($venv.Count -ge 1) {
-        return $venv | Sort-Object ProcessId -Descending | Select-Object -First 1
     }
     return $Bots | Sort-Object ProcessId -Descending | Select-Object -First 1
 }
@@ -374,7 +390,17 @@ function Stop-DuplicateBots {
         $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($keep.ProcessId)" -ErrorAction SilentlyContinue
         if ($cim) { return @($cim) }
     }
-    return @(Get-BotProcesses)
+    Clear-BotPidFile
+    $left = @(Get-BotProcesses)
+    if ($left.Count -ge 1) {
+        $retry = Select-BotProcessToKeep $left
+        if ($retry) {
+            Write-BotPidFile $retry.ProcessId
+            Write-Host "Recovered bot pid $($retry.ProcessId) after dedup"
+            return @($retry)
+        }
+    }
+    return $left
 }
 
 function Keep-SingleBot {
@@ -382,6 +408,19 @@ function Keep-SingleBot {
     if ($bots.Count -eq 0) { return $null }
     if ($bots.Count -eq 1) { return $bots[0].ProcessId }
     return (Stop-DuplicateBots | Select-Object -First 1).ProcessId
+}
+
+function Stop-StraySystemBots {
+    $bots = @(Get-BotProcesses)
+    $venvBots = @($bots | Where-Object { $_.CommandLine -like "*\.venv\Scripts\python.exe*" })
+    $systemBots = @($bots | Where-Object { $_.CommandLine -notlike "*\.venv\Scripts\python.exe*" })
+    if ($venvBots.Count -ge 1 -and $systemBots.Count -ge 1) {
+        foreach ($b in $systemBots) {
+            Stop-Process -Id $b.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped stray system bot pid $($b.ProcessId)"
+        }
+        Start-Sleep -Seconds 1
+    }
 }
 
 function Ensure-SingleInstance {
@@ -394,6 +433,7 @@ function Ensure-SingleInstance {
     Ensure-TaskDisabled $StackGuardTask
     Stop-ConcurrentStackScripts
     try {
+        Stop-StraySystemBots
         if ((Get-BotProcesses).Count -gt 1) {
             Stop-DuplicateBots | Out-Null
             Start-Sleep -Seconds 2
@@ -443,13 +483,16 @@ function Ensure-SingleInstance {
             Start-Sleep -Seconds 5
             Start-Bot | Out-Null
         }
-        if ((Get-BotProcesses).Count -gt 1) {
+        $pidBot = Get-PidFileBotProcess
+        if ($pidBot -and (Test-BotProcessAlive $pidBot.ProcessId)) {
+            Write-Host "Single bot ok pid $($pidBot.ProcessId)"
+        } elseif ((Get-BotProcesses).Count -gt 1) {
             Stop-DuplicateBots | Out-Null
             Start-Sleep -Seconds 2
-        }
-        $pidBot = Get-PidFileBotProcess
-        if ($pidBot) {
-            Write-Host "Single bot ok pid $($pidBot.ProcessId)"
+            $pidBot = Get-PidFileBotProcess
+            if ($pidBot) {
+                Write-Host "Single bot ok pid $($pidBot.ProcessId)"
+            }
         }
     } finally {
         Start-Sleep -Seconds 2
@@ -495,6 +538,13 @@ switch ($Action) {
     "stop" {
         Ensure-TaskDisabled $BotTask
         Stop-Bot
+        Show-Status
+    }
+    "stop-stack" {
+        Ensure-TaskDisabled $BotTask
+        Ensure-TaskDisabled $StackGuardTask
+        Stop-Bot
+        Stop-DashboardApi -ListenPort $DashboardPort
         Show-Status
     }
     "start" {

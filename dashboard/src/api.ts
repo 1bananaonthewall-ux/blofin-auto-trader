@@ -226,7 +226,7 @@ export const api = {
       clearTimeout(timer);
     }
   },
-  stack: async (action: "start" | "stop" | "restart" | "status") => {
+  stack: async (action: "start" | "stop" | "restart" | "status" | "ensure") => {
     const res = await fetch(`/api/stack/${action}`, { method: "POST" });
     const data = await res.json();
     if (!res.ok) {
@@ -244,4 +244,34 @@ export const api = {
     }
     return out;
   },
+  stopStack: async () => {
+    const res = await fetch("/api/stack/stop-stack", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error((data as { error?: string }).error || "stop stack failed");
+    }
+    return data as { ok?: boolean; stopping?: boolean; message?: string };
+  },
+  agentRepair: async () => {
+    const res = await fetch("/api/stack/agent-repair", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error((data as { error?: string }).error || "agent repair failed");
+    }
+    return data as {
+      ok?: boolean;
+      repair_started?: boolean;
+      already_running?: boolean;
+      agent_cued?: boolean;
+      message?: string;
+    };
+  },
+  repairStatus: () =>
+    get<{
+      ok: boolean;
+      bot_running: boolean;
+      stack_ready: boolean;
+      repair_flag: boolean;
+      repair: { status?: string; attempt?: number; last_error?: string };
+    }>("/api/stack/repair-status"),
 };
