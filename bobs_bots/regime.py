@@ -80,10 +80,14 @@ def signal_allowed(
     min_adx: float = 14.0,
     adx_val: float = 0.0,
 ) -> bool:
+    """Quality gates only — direction comes from TA confluence, not macro period bias."""
+    if signal == Signal.FLAT:
+        return False
     if adx_val > 0 and adx_val < min_adx:
         return False
 
     side = signal.value
+    # Optional macro filters (off by default — TA long/short is authoritative).
     if trend_only and period == "neutral":
         return False
     if trend_only and period in ("bull", "bear"):
@@ -91,14 +95,13 @@ def signal_allowed(
             return False
         if period == "bear" and side != "short":
             return False
-
     if trend_with_period and period in ("bull", "bear"):
         if period == "bull" and side != "long":
             return False
         if period == "bear" and side != "short":
             return False
 
-    if require_htf_align and not htf_aligned:
+    if require_htf_align:
         if htf_bias and htf_bias != side:
             return False
         if not htf_aligned and htf_bias is None:

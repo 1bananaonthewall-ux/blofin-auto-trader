@@ -8,7 +8,6 @@ from typing import Any
 
 from bobs_bots.data import clear_candle_cache, load_symbol_candles
 from bobs_bots.evaluator import evaluate_entry
-from bobs_bots.regime import rolling_period_bias
 from bobs_bots.specs import BOT_SPECS, BotSpec, get_spec
 from bobs_bots.period import resolve_backtest_range
 from storefront_market import list_tradeable_assets
@@ -127,12 +126,11 @@ def backtest_symbol(
         window_5m = candles_5m[max(0, i - LOOKBACK_5M + 1) : i + 1]
         window_1h = _slice_htf(candles_1h, ts)
         window_1h_full = _slice_htf(candles_1h, ts)
-        bar_bias = rolling_period_bias(candles_1h, ts, start_ms=start_ms)
         dec = evaluate_entry(
             window_5m,
             window_1h,
             spec,
-            period_bias=bar_bias,
+            period_bias="neutral",
             ohlcv_1h=window_1h_full,
         )
         if dec is None:

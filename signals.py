@@ -372,16 +372,8 @@ def analyze_symbol(
     )
 
     decision = confluence_to_decision(cf)
-    if not throughput_relax:
-        try:
-            from bobs_bots.regime import htf_ema_bias
-
-            closes_5m = [float(row[4]) for row in ohlcv_5m]
-            hb = htf_ema_bias(closes_5m)
-            if hb and decision.signal.value != hb:
-                return None
-        except Exception:
-            pass
+    if decision.signal == Signal.FLAT or decision.signal != cf.direction:
+        return None
     conf = decision.model_confidence
     used_llm = False
     llm_only = bool(getattr(settings, "llm_only_trading", False)) and not getattr(

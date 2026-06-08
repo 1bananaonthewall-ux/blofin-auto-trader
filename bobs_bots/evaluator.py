@@ -71,6 +71,8 @@ def evaluate_entry(
                 return None
 
     decision = confluence_to_decision(cf)
+    if decision.signal == Signal.FLAT or decision.signal != cf.direction:
+        return None
     conf = decision.model_confidence or (decision.score / 100.0)
     if decision.score < spec.min_composite_score:
         return None
