@@ -286,6 +286,19 @@ class AutonomousGrowthEngine:
                 sec = int(self._tpsl_pacer.symbol_sl_cooldown)
                 if sec > 0:
                     self._exit_cooldowns.block(symbol, seconds=sec)
+        if float(net_pnl_usd) < 0:
+            try:
+                from config import load_settings
+                from llm_overseer import pulse_overseer
+
+                s = load_settings()
+                if getattr(s, "llm_overseer_mode", False):
+                    pulse_overseer(
+                        self.pnl.state_dir,
+                        f"loss {symbol.split('/')[0]} roe={roe_pct}",
+                    )
+            except Exception:
+                pass
 
     def update_fluid(
         self, equity: float, free_margin: float, open_count: int

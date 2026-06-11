@@ -21,10 +21,12 @@ from local_llm import chat_completion, resolve_provider, status_line
 log = logging.getLogger(__name__)
 
 DIRECTIVES_FILE = "overseer_directives.json"
+PULSE_FILE = "overseer_pulse.json"
 _last_cycle_ts = 0.0
 _overseer_lock = threading.Lock()
 _overseer_running = False
 DEFAULT_INTERVAL_SEC = 300.0
+MIN_INTERVAL_SEC = 45.0
 
 
 @dataclass
@@ -61,6 +63,85 @@ class OverseerDirectives:
 
 def _directives_path(state_dir: Path) -> Path:
     return state_dir / DIRECTIVES_FILE
+
+
+def _pulse_path(state_dir: Path) -> Path:
+    return state_dir / PULSE_FILE
+
+
+def pulse_overseer(state_dir: Path, reason: str) -> None:
+    """Request Qwen caretaker cycle ASAP (e.g. after a loss or flat curve)."""
+    path = _pulse_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prev = {}
+        if path.is_file():
+            prev = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        prev = {}
+    path.write_text(
+        json.dumps(
+            {
+                "requested_ts": time.time(),
+                "reason": str(reason)[:120],
+                "count": int(prev.get("count") or 0) + 1,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _pulse_pending(state_dir: Path, *, max_age_sec: float = 120.0) -> tuple[bool, str]:
+    path = _pulse_path(state_dir)
+    if not path.is_file():
+        return False, ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        ts = float(raw.get("requested_ts") or 0)
+        if time.time() - ts > max_age_sec:
+            return False, ""
+        return True, str(raw.get("reason") or "")
+    except Exception:
+        return False, ""
+
+
+def _clear_pulse(state_dir: Path) -> None:
+    path = _pulse_path(state_dir)
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def overseer_interval_for_state(state_dir: Path, settings: Any) -> float:
+    """
+    Adaptive Qwen cadence — faster when curve is sick or losers stack.
+    Default OVERSEER_INTERVAL_SECONDS when healthy.
+    """
+    base = float(getattr(settings, "overseer_interval_seconds", DEFAULT_INTERVAL_SEC))
+    wr, pf, streak = 0.5, 1.0, 0
+    try:
+        from roe_learning import get_roe_store
+
+        wr, pf, streak, _ = get_roe_store(state_dir).recent_performance(3600.0, limit=30)
+    except Exception:
+        pass
+    health = _caretaker_health(state_dir)
+    vert = float(health.get("curve_verticality") or 0)
+    dd = float(health.get("drawdown_from_peak_pct") or 0)
+    phase = str(health.get("curve_phase") or "")
+
+    if streak >= 4 or (streak >= 3 and pf < 0.95):
+        return max(MIN_INTERVAL_SEC, min(base, 60.0))
+    if streak >= 2 or wr < 0.40 or pf < 0.90:
+        return max(MIN_INTERVAL_SEC, min(base, 90.0))
+    if dd >= 12.0 or phase in ("preserve", "stress", "recover") or vert < 0.25:
+        return max(MIN_INTERVAL_SEC, min(base, 120.0))
+    if wr >= 0.52 and pf >= 1.12 and streak < 2 and vert >= 0.45:
+        return base
+    return max(MIN_INTERVAL_SEC, min(base, 180.0))
 
 
 def load_directives(state_dir: Path) -> OverseerDirectives:
@@ -586,6 +667,7 @@ def run_overseer_cycle(
         )
     save_directives(state_dir, d)
     _last_cycle_ts = now
+    _clear_pulse(state_dir)
 
     if d.ml_mode in ("quality", "throughput", "neutral"):
         try:
@@ -638,13 +720,17 @@ def maybe_run_overseer_tick(
     if not getattr(settings, "llm_overseer_mode", False):
         return
 
-    interval = float(getattr(settings, "overseer_interval_seconds", DEFAULT_INTERVAL_SEC))
+    interval = overseer_interval_for_state(settings.state_dir, settings)
+    pulsed, pulse_reason = _pulse_pending(settings.state_dir)
     with _overseer_lock:
         if _overseer_running:
             return
-        if (time.time() - _last_cycle_ts) < interval:
+        elapsed = time.time() - _last_cycle_ts
+        if not pulsed and elapsed < interval:
             return
         _overseer_running = True
+    if pulsed:
+        log.warning("QWEN pulse: %s (interval=%ds)", pulse_reason or "distress", int(interval))
 
     import api_backoff
     from trade_blockers import detect_blockers

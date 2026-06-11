@@ -771,6 +771,13 @@ def run_once(
     wr, pf, loss_streak = _load_performance_stats(settings.state_dir)
     engine.record_performance(wr, pf, loss_streak)
     overseer = bool(getattr(settings, "llm_overseer_mode", False))
+    if overseer and loss_streak >= 2:
+        try:
+            from llm_overseer import pulse_overseer
+
+            pulse_overseer(settings.state_dir, f"loss_streak={loss_streak} wr={wr:.0%}")
+        except Exception:
+            pass
     if not getattr(settings, "llm_only_trading", False) or overseer:
         _sync_ml_metrics(engine, ml, tracker)
 
