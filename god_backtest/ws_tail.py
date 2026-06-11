@@ -109,3 +109,21 @@ def sync_ws_tails(
         pass
     thread.join(timeout=3.0)
     return store
+
+
+def sync_ws_tails_batched(
+    inst_ids: list[str],
+    *,
+    batch_size: int = 80,
+    timeout_sec: float = 10.0,
+) -> dict[str, dict[str, list[list[float]]]]:
+    """WS tail sync in chunks — freshens recent bars while REST/cache loads history."""
+    if not inst_ids:
+        return {}
+    merged: dict[str, dict[str, list[list[float]]]] = {}
+    n_batches = (len(inst_ids) + batch_size - 1) // batch_size
+    for bi, i in enumerate(range(0, len(inst_ids), batch_size)):
+        chunk = inst_ids[i : i + batch_size]
+        log.info("ws tail batch %d/%d (%d symbols)", bi + 1, n_batches, len(chunk))
+        merged.update(sync_ws_tails(chunk, timeout_sec=timeout_sec, max_symbols=batch_size))
+    return merged

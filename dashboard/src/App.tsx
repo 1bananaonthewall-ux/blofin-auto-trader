@@ -86,7 +86,7 @@ function DashboardView({
             <span className="stat-value">{status.mission}</span>
           </div>
           <div className="stat">
-            <span className="stat-label">Equity</span>
+            <span className="stat-label">{status.equity_mtm ? "Equity (live)" : "Equity"}</span>
             <span className="stat-value">${status.equity.toFixed(4)}</span>
           </div>
           <div className="stat">

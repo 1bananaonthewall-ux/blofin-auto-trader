@@ -108,6 +108,8 @@ def publish_account_snapshot(
         if free_margin <= 0 and prev_free > 0:
             free_margin = prev_free
 
+    unrealized = sum(float(r.get("pnl_usd") or 0) for r in rows)
+    exposure = sum(float(r.get("notional_usdt") or 0) for r in rows)
     prof_path = state_dir / "profitability.json"
     prof_mtime = prof_path.stat().st_mtime if prof_path.is_file() else 0.0
     payload = {
@@ -115,6 +117,8 @@ def publish_account_snapshot(
         "api_ok": api_ok,
         "equity": round(equity, 6),
         "free_margin": round(free_margin, 6),
+        "unrealized_pnl": round(unrealized, 6),
+        "exposure_usdt": round(exposure, 6),
         "open_count": len(rows),
         "positions": rows,
         "profitability_mtime": prof_mtime,

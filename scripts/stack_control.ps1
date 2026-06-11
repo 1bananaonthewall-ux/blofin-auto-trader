@@ -195,6 +195,26 @@ function Stop-DashboardApi {
     }
 }
 
+function Start-CurveGuardDaemon {
+    $pidFile = Join-Path $Root "state\curve_guard.pid"
+    if (Test-Path $pidFile) {
+        $savedPid = 0
+        try { $savedPid = [int](Get-Content $pidFile -ErrorAction Stop | Select-Object -First 1) } catch { }
+        if ($savedPid -gt 0) {
+            $proc = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+            if ($proc -and $proc.ProcessName -eq "python") {
+                return
+            }
+        }
+    }
+    $daemon = Join-Path $Root "scripts\curve_guard_daemon.py"
+    if (-not (Test-Path $daemon)) { return }
+    Start-Process -FilePath $BotPython -WindowStyle Hidden -ArgumentList @(
+        $daemon
+    ) -WorkingDirectory $Root | Out-Null
+    Write-Host "Curve guard daemon started"
+}
+
 function Start-DashboardApi {
     param([int]$ListenPort)
     $dashPs1 = Join-Path $Root "scripts\start_dashboard_quiet.ps1"
@@ -289,6 +309,8 @@ function Restart-FreshStack {
         Write-Warning "Bot start requested, but process was not detected."
     }
     Start-DashboardApi -ListenPort $DashboardPort | Out-Null
+    Start-CurveGuardDaemon
+    & $BotPython (Join-Path $Root "scripts\curve_guard_daemon.py") --once 2>&1 | Out-Null
     Start-Sleep -Seconds 8
     $pidBot = Get-PidFileBotProcess
     if (-not $pidBot -and -not (Test-BotLogAlive)) {
@@ -565,6 +587,8 @@ switch ($Action) {
     }
     "ensure" {
         Ensure-SingleInstance
+        Start-CurveGuardDaemon
+        & $BotPython (Join-Path $Root "scripts\curve_guard_daemon.py") --once 2>&1 | Out-Null
         Show-Status
     }
 }

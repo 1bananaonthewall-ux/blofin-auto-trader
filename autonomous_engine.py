@@ -639,6 +639,23 @@ class AutonomousGrowthEngine:
             deploy_base = max(deploy_base, 0.16)
             deploy_max = max(deploy_max, 0.30)
 
+        if st and getattr(st, "growth_supercharge_enabled", False):
+            try:
+                from growth_supercharge import get_brain, overlay_knobs
+
+                min_conf, min_score, deploy_base, deploy_max, poll, entry_gap = overlay_knobs(
+                    st,
+                    min_conf=min_conf,
+                    min_score=min_score,
+                    deploy_base=deploy_base,
+                    deploy_max=deploy_max,
+                    poll=poll,
+                    entry_gap=entry_gap,
+                    brain=get_brain(st),
+                )
+            except Exception:
+                log.debug("growth supercharge knob overlay failed", exc_info=True)
+
         return RuntimeKnobs(
             min_confidence=round(min_conf, 3),
             min_signal_score=round(min_score, 1),

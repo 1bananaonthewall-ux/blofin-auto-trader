@@ -440,19 +440,26 @@ def analyze_symbol(
         post_score_gate = score_gate
 
     try:
-        from account_guard import universe_fill_active
+        from quality_pick import apply_quality_gates, quality_pick_active
 
-        if universe_fill_active(settings) or getattr(settings, "entries_never_pause", False):
-            micro = equity is not None and equity > 0 and equity < settings.micro_equity_threshold
-            if micro:
-                post_conf_gate = min(post_conf_gate, 0.52)
-                post_score_gate = min(post_score_gate, 52.0)
-            elif hourly_3r_active(settings) and is_opens_starved(settings):
-                post_conf_gate = min(post_conf_gate, 0.52)
-                post_score_gate = min(post_score_gate, 52.0)
-            elif getattr(settings, "entries_never_pause", False):
-                post_conf_gate = min(post_conf_gate, 0.52)
-                post_score_gate = min(post_score_gate, 50.0)
+        if quality_pick_active(settings):
+            post_conf_gate, post_score_gate = apply_quality_gates(
+                settings, post_conf_gate, post_score_gate
+            )
+        else:
+            from account_guard import universe_fill_active
+
+            if universe_fill_active(settings) or getattr(settings, "entries_never_pause", False):
+                micro = equity is not None and equity > 0 and equity < settings.micro_equity_threshold
+                if micro:
+                    post_conf_gate = min(post_conf_gate, 0.52)
+                    post_score_gate = min(post_score_gate, 52.0)
+                elif hourly_3r_active(settings) and is_opens_starved(settings):
+                    post_conf_gate = min(post_conf_gate, 0.52)
+                    post_score_gate = min(post_score_gate, 52.0)
+                elif getattr(settings, "entries_never_pause", False):
+                    post_conf_gate = min(post_conf_gate, 0.52)
+                    post_score_gate = min(post_score_gate, 50.0)
     except Exception:
         pass
 

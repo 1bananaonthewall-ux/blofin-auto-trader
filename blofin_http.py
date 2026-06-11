@@ -80,6 +80,11 @@ class BlofinHttp:
             "ACCESS-NONCE": nonce,
             "ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
+            # Cloudflare blocks bare REST clients; match browser headers (see monitor.py).
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+            "Origin": "https://blofin.com",
+            "Referer": "https://blofin.com/",
         }
         if api_backoff.is_paused():
             raise RateLimitPaused(api_backoff.seconds_left(), source=f"REST {method} {path}")

@@ -163,10 +163,9 @@ def _account_equity_anchor(*, live_equity: float | None = None) -> float:
     if snap_eq > 0:
         return snap_eq
     fluid = _read_json(STATE_DIR / "fluid_state.json", {}) or {}
-    for key in ("peak_equity", "last_equity"):
-        val = float(fluid.get(key) or 0)
-        if val > 0:
-            return val
+    last_eq = float(fluid.get("last_equity") or 0)
+    if last_eq > 0:
+        return last_eq
     samples = fluid.get("samples") or []
     for item in reversed(samples):
         try:
@@ -178,58 +177,60 @@ def _account_equity_anchor(*, live_equity: float | None = None) -> float:
     return 0.0
 
 
+def _trim_stale_equity_era(
+    rows: list[dict[str, float]], *, anchor: float
+) -> list[dict[str, float]]:
+    """Drop ticks before the last time balance was far above the live account."""
+    if len(rows) < 50 or anchor <= 0:
+        return rows
+    threshold = anchor * 1.12
+    cut_at: int | None = None
+    for i in range(len(rows) - 1, -1, -1):
+        if float(rows[i]["equity"]) > threshold:
+            cut_at = i + 1
+            break
+    if cut_at and len(rows) - cut_at >= 50:
+        return rows[cut_at:]
+    return rows
+
+
 def _sanitize_equity_ticks(
     rows: list[dict[str, float]], *, live_equity: float | None = None
 ) -> list[dict[str, float]]:
-    """Drop zeros and sustained micro-glitch samples; keep ramp-up and real history."""
+    """Keep ticks near the live account size — drop stale eras from old balances."""
     clean = [r for r in rows if float(r.get("equity") or 0) > 0]
     if len(clean) < 3:
         return clean
 
     anchor = _account_equity_anchor(live_equity=live_equity)
-    global_hi = max(float(r["equity"]) for r in clean)
-    ref = anchor if anchor >= 20 else global_hi
+    if anchor <= 0:
+        tail = sorted(float(r["equity"]) for r in clean[-600:])
+        anchor = tail[len(tail) // 2] if tail else 0.0
 
-    first_real_ts: float | None = None
-    for r in clean:
-        if float(r["equity"]) >= max(80.0, ref * 0.45 if ref >= 80 else 80.0):
-            first_real_ts = float(r["ts"])
-            break
-    ramp_start = (first_real_ts - 6 * 3600) if first_real_ts else 0.0
-    ramp_end = (first_real_ts + 12 * 3600) if first_real_ts else 0.0
+    if anchor > 0:
+        if live_equity and live_equity > 0:
+            if anchor < 25.0:
+                lo = max(0.35, anchor * 0.58)
+                hi = anchor * 1.20 + 0.35
+            else:
+                lo = max(0.35, anchor * 0.35)
+                hi = anchor * 1.55 + 2.5
+        else:
+            recent = [float(r["equity"]) for r in clean[-1500:]]
+            rmed = sorted(recent)[len(recent) // 2] if recent else anchor
+            cluster = max(anchor, rmed)
+            lo = max(0.35, cluster * 0.35)
+            hi = cluster * 2.8 + 3.0
+        kept = [r for r in clean if lo <= float(r["equity"]) <= hi]
+        if len(kept) >= max(8, len(clean) // 500):
+            if live_equity and live_equity > 0:
+                kept = _trim_stale_equity_era(kept, anchor=anchor)
+            return kept
 
-    fluid = _read_json(STATE_DIR / "fluid_state.json", {}) or {}
-    peak = float(fluid.get("peak_equity") or 0)
-    hi_cap = max(global_hi * 1.15, (peak * 1.12) if peak > 0 else global_hi * 1.15, ref * 1.4 + 50.0)
-
-    kept: list[dict[str, float]] = []
-    for r in clean:
-        eq = float(r["equity"])
-        ts = float(r["ts"])
-        if eq > hi_cap:
-            continue
-        if first_real_ts and ramp_start <= ts <= ramp_end:
-            kept.append(r)
-            continue
-        if ref >= 120 and eq < max(25.0, ref * 0.12):
-            continue
-        if global_hi >= 200 and eq < 50:
-            continue
-        kept.append(r)
-
-    if len(kept) >= max(5, len(clean) // 80):
-        return kept
-
-    substantial = sorted(float(r["equity"]) for r in clean if r["equity"] >= 15)
-    if len(substantial) >= 5:
-        median = substantial[len(substantial) // 2]
-    else:
-        tail = sorted(float(r["equity"]) for r in clean[-400:])
-        median = tail[len(tail) // 2]
-    hi = max(median * 2.25, median + 1.5)
-    lo = max(0.01, median * 0.4)
-    if peak > median:
-        hi = min(hi, max(peak * 1.12, median * 1.85))
+    tail = sorted(float(r["equity"]) for r in clean[-800:])
+    median = tail[len(tail) // 2] if tail else anchor
+    lo = max(0.25, median * 0.35)
+    hi = median * 2.5 + 2.0
     return [r for r in clean if lo <= float(r["equity"]) <= hi]
 
 
@@ -330,11 +331,29 @@ def build_pnl_curve_payload(
 
     pnl_curve = _read_json(STATE_DIR / "pnl_curve.json", {}) or {}
     fluid = _read_json(STATE_DIR / "fluid_state.json", {}) or {}
-    peak_equity = float(
-        pnl_curve.get("peak_equity")
-        or fluid.get("peak_equity")
-        or (max((r["equity"] for r in all_ticks), default=0))
-    )
+    recent_ticks = all_ticks[-500:] if len(all_ticks) > 500 else all_ticks
+    chart_peak = max((r["equity"] for r in equity), default=0.0)
+    recent_peak = max((r["equity"] for r in recent_ticks), default=0.0)
+    peak_equity = max(chart_peak, recent_peak)
+    if current_equity and current_equity > 0:
+        peak_equity = max(peak_equity, float(current_equity))
+        # Micro accounts: never show a peak from a stale balance era.
+        if float(current_equity) < 25.0:
+            peak_equity = min(peak_equity, float(current_equity) * 1.15)
+            cap = float(current_equity) * 1.18
+            floor = float(current_equity) * 0.55
+            equity = [
+                p for p in equity
+                if floor <= float(p["equity"]) <= cap
+            ] or equity
+    fluid_peak = float(fluid.get("peak_equity") or 0)
+    if (
+        fluid_peak > 0
+        and current_equity
+        and current_equity > 0
+        and fluid_peak <= float(current_equity) * 1.2
+    ):
+        peak_equity = max(peak_equity, fluid_peak)
 
     realized_full = _load_realized_curve()
     realized = realized_full
@@ -732,37 +751,54 @@ def _copilot_llm_health() -> dict[str, Any]:
 
 @app.route("/api/status")
 def api_status():
-    """Fast status from local snapshot (bot publishes); never blocks on REST."""
+    """Account status — live hub when running, else bot snapshot."""
     snap_cache = _read_json(STATE_DIR / "account_snapshot.json", {}) or {}
     degraded = False
     err_msg = ""
+    hub_status: dict[str, Any] | None = None
+    try:
+        hub = get_live_hub().get_snapshot()
+        hub_status = hub.get("status") if isinstance(hub.get("status"), dict) else None
+    except Exception:
+        hub_status = None
     try:
         settings = load_settings()
-        equity = float(snap_cache.get("equity") or 0)
-        free = float(snap_cache.get("free_margin") or equity)
-        positions: dict = {}
+        if hub_status and float(hub_status.get("equity") or 0) > 0:
+            equity = float(hub_status["equity"])
+            free = float(hub_status.get("free_margin") or equity)
+            unrealized = float(hub_status.get("unrealized_pnl") or 0)
+            exposure = float(hub_status.get("exposure_usdt") or 0)
+            open_count = int(hub_status.get("open_count") or 0)
+            daily_pnl = hub_status.get("daily_pnl")
+            monthly_pnl = hub_status.get("monthly_pnl")
+            session_pnl = hub_status.get("session_pnl")
+            today_pct = float(hub_status.get("today_growth_pct") or 0)
+            progress = float(hub_status.get("progress_today_pct") or 0)
+        else:
+            equity = float(snap_cache.get("equity") or 0)
+            free = float(snap_cache.get("free_margin") or equity)
+            unrealized = float(snap_cache.get("unrealized_pnl") or 0)
+            exposure = float(snap_cache.get("exposure_usdt") or 0)
+            open_count = int(snap_cache.get("open_count") or 0)
+            all_ticks = _load_equity_ticks_raw(live_equity=equity if equity > 0 else None)
+            now = datetime.now(timezone.utc)
+            day_start_ts = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+            month_start_ts = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+            session_base = _baseline_equity_at(all_ticks, time.time() - 86400.0)
+            day_base = _baseline_equity_at(all_ticks, day_start_ts)
+            month_base = _baseline_equity_at(all_ticks, month_start_ts)
+            today_pct = (
+                (equity / day_base - 1.0) * 100.0 if day_base and day_base > 0 and equity > 0 else 0.0
+            )
+            progress = progress_toward_daily_goal_pct(today_pct)
+            daily_pnl = round(equity - day_base, 4) if day_base is not None else None
+            monthly_pnl = round(equity - month_base, 4) if month_base is not None else None
+            session_pnl = round(equity - session_base, 4) if session_base is not None else None
         pnl_curve = _read_json(STATE_DIR / "pnl_curve.json", {})
         fluid = _read_json(STATE_DIR / "fluid_state.json", {})
         hourly = _read_json(STATE_DIR / "hourly_report.json", {})
         markov = _read_json(STATE_DIR / "markov_regime.json", {})
         self_heal = _read_json(STATE_DIR / "self_heal.json", {})
-
-        exposure = float(snap_cache.get("exposure_usdt") or 0)
-        unrealized = float(snap_cache.get("unrealized_pnl") or 0)
-        all_ticks = _load_equity_ticks_raw()
-        now = datetime.now(timezone.utc)
-        day_start_ts = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        month_start_ts = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
-        day_base = _baseline_equity_at(all_ticks, day_start_ts)
-        month_base = _baseline_equity_at(all_ticks, month_start_ts)
-        session_base = _baseline_equity_at(all_ticks, time.time() - 86400.0)
-        today_pct = (
-            (equity / day_base - 1.0) * 100.0 if day_base and day_base > 0 and equity > 0 else 0.0
-        )
-        progress = progress_toward_daily_goal_pct(today_pct)
-        daily_pnl = round(equity - day_base, 4) if day_base is not None else None
-        monthly_pnl = round(equity - month_base, 4) if month_base is not None else None
-        session_pnl = round(equity - session_base, 4) if session_base is not None else None
 
         return jsonify(
             {
@@ -779,7 +815,7 @@ def api_status():
                 "daily_pnl": daily_pnl,
                 "monthly_pnl": monthly_pnl,
                 "session_pnl": session_pnl,
-                "open_count": len(positions) or int(snap_cache.get("open_count") or 0),
+                "open_count": open_count,
                 "bot_running": _bot_running(),
                 "live": settings.mode == "live" and not settings.dry_run,
                 "mode": settings.mode,
@@ -929,14 +965,14 @@ def api_signals():
 
 @sock.route("/ws/live")
 def ws_live(ws):
-    """Push live bot snapshot ~every 1.5s (setups, positions, trades, logs, curve)."""
+    """Push live bot snapshot — fast when open positions (MTM equity)."""
     hub = get_live_hub()
     try:
         snap = hub.get_snapshot()
         ws.send(json.dumps({"type": "hello", "version": API_VERSION, "data": snap}))
         last_sig = _snapshot_fingerprint(snap)
         while True:
-            time.sleep(1.5)
+            time.sleep(0.35)
             snap = hub.get_snapshot()
             sig = _snapshot_fingerprint(snap)
             if sig != last_sig:

@@ -28,7 +28,8 @@ def main() -> int:
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--no-ws", action="store_true", help="Disable websocket tail sync")
     p.add_argument("--no-cache", action="store_true")
-    p.add_argument("--refit-ml", action="store_true", help="Forward ML refit each train fold")
+    p.add_argument("--refit-ml", action="store_true", help="Forward ML refit each train fold (in-memory only; never overwrites live model)")
+    p.add_argument("--apply-live", action="store_true", help="Push walk-forward winners to live god-bot gates (default: report only)")
     p.add_argument("--smoke", action="store_true", help="Quick test: 5 symbols, 60d lookback")
     args = p.parse_args()
 
@@ -53,6 +54,7 @@ def main() -> int:
         use_ws_tail=not args.no_ws,
         refit_ml=args.refit_ml,
         use_cache=not args.no_cache,
+        apply_live=args.apply_live,
     )
     print(json.dumps(
         {

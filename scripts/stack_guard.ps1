@@ -26,6 +26,7 @@ if (-not $listening) {
 }
 
 $Py = if (Test-Path ".\.venv\Scripts\python.exe") { ".\.venv\Scripts\python.exe" } else { "python" }
+& $Py scripts\curve_guard_daemon.py --once 2>&1 | Out-File $Log -Append -Encoding utf8
 & $Py scripts\log_watch_optimizer.py 2>&1 | Out-File $Log -Append -Encoding utf8
 & $Py scripts\repair_open_tpsl.py 2>&1 | Out-File $Log -Append -Encoding utf8
 & $Py scripts\stack_status.py 2>&1 | Out-File $Log -Append -Encoding utf8

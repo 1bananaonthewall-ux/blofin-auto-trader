@@ -97,6 +97,7 @@ class Settings:
     unrestricted_trading: bool        # skip drawdown/mission/fluid entry pauses
     entries_never_pause: bool       # always allow new entries when margin ok; optimizers still tune quality
     account_curve_maximize: bool      # steer entries/harvest to steepen dashboard account curve
+    growth_supercharge_enabled: bool  # merge growth-agent backtest + learning brain into God Bot
     runner_filter_enabled: bool       # favor steady directional runners, skip choppy up/down
     runner_min_score: float           # minimum runner_score to enter (when filter on)
     runner_max_chop: float            # chop_index above this => reject
@@ -179,6 +180,7 @@ class Settings:
     optimizer_target_min_tph: int
     optimizer_target_max_tph: int
     optimizer_quality_first: bool
+    quality_pick_mode: bool  # never loosen gates when starved; raise bar from live WR
     optimizer_flow_learning_enabled: bool
     optimizer_flow_target_tph: int
     optimizer_flow_lookback_reports: int
@@ -218,6 +220,8 @@ class Settings:
     llm_trading_strict: bool
     llm_only_trading: bool
     llm_overseer_mode: bool
+    llm_copilot_trading: bool
+    llm_copilot_strict: bool
     overseer_interval_seconds: int
     llm_policy_cache_sec: float
     momentum_wave_mode: bool
@@ -328,6 +332,7 @@ def load_settings() -> Settings:
             if os.getenv("ACCOUNT_CURVE_MAXIMIZE") is not None
             else _env_bool("CURVE_MAXIMIZER", True)
         ),
+        growth_supercharge_enabled=_env_bool("GROWTH_SUPERCHARGE_ENABLED", True),
         runner_filter_enabled=_env_bool("RUNNER_FILTER_ENABLED", True),
         runner_min_score=float(os.getenv("RUNNER_MIN_SCORE", "0.48")),
         runner_max_chop=float(os.getenv("RUNNER_MAX_CHOP", "0.56")),
@@ -421,6 +426,7 @@ def load_settings() -> Settings:
         optimizer_target_min_tph=int(os.getenv("OPTIMIZER_TARGET_MIN_TPH", "1")),
         optimizer_target_max_tph=int(os.getenv("OPTIMIZER_TARGET_MAX_TPH", "9999")),
         optimizer_quality_first=_env_bool("OPTIMIZER_QUALITY_FIRST", True),
+        quality_pick_mode=_env_bool("QUALITY_PICK_MODE", True),
         optimizer_flow_learning_enabled=_env_bool("OPTIMIZER_FLOW_LEARNING_ENABLED", True),
         optimizer_flow_target_tph=int(os.getenv("OPTIMIZER_FLOW_TARGET_TPH", "3")),
         optimizer_flow_lookback_reports=int(os.getenv("OPTIMIZER_FLOW_LOOKBACK_REPORTS", "80")),
@@ -462,6 +468,11 @@ def load_settings() -> Settings:
         llm_trading_strict=_env_bool("LLM_TRADING_STRICT", False),
         llm_only_trading=_env_bool("LLM_ONLY_TRADING", False),
         llm_overseer_mode=_env_bool("LLM_OVERSEER_MODE", False),
+        llm_copilot_trading=_env_bool(
+            "LLM_COPILOT_TRADING",
+            _env_bool("LLM_OVERSEER_MODE", False) or _env_bool("LLM_TRADING_ENABLED", True),
+        ),
+        llm_copilot_strict=_env_bool("LLM_COPILOT_STRICT", True),
         overseer_interval_seconds=int(os.getenv("OVERSEER_INTERVAL_SECONDS", "300")),
         llm_policy_cache_sec=float(os.getenv("LLM_POLICY_CACHE_SEC", "45")),
         momentum_wave_mode=_env_bool("MOMENTUM_WAVE_MODE", True),

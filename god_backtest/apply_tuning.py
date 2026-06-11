@@ -20,6 +20,36 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def revert_live_tuning(*, reason: str = "manual") -> None:
+    """Remove walk-forward overlays so live God Bot uses base spec gates only."""
+    if TUNE_PATH.is_file():
+        try:
+            tune = json.loads(TUNE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            tune = {}
+        tune.pop("god-bot", None)
+        if tune:
+            TUNE_PATH.write_text(json.dumps(tune, indent=2), encoding="utf-8")
+        else:
+            TUNE_PATH.unlink(missing_ok=True)
+
+    OPTIMIZER_PATH.write_text(
+        '''"""Gate overrides — pass-through (backtest must not tune live)."""
+def apply_overrides(conf_gate, score_gate, *, markov_state='', trades_last_hour=0):
+    return conf_gate, score_gate
+''',
+        encoding="utf-8",
+    )
+    record = {
+        "reverted_at": _utc(),
+        "reason": reason,
+        "live_apply": False,
+    }
+    APPLIED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    APPLIED_PATH.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    log.info("reverted god-bot live tuning (%s)", reason)
+
+
 def apply_params_to_god_bot(
     params: dict[str, Any],
     *,

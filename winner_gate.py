@@ -60,6 +60,15 @@ def evaluate_winner(
     if side == Signal.FLAT:
         return WinnerVerdict(False, "reject", 0.0, "flat")
 
+    if symbol and getattr(settings, "llm_overseer_mode", False):
+        try:
+            from llm_overseer import symbol_avoided
+
+            if symbol_avoided(symbol, settings.state_dir):
+                return WinnerVerdict(False, "reject", 0.0, f"overseer avoid {symbol.split('/')[0]}")
+        except Exception:
+            pass
+
     if symbol:
         try:
             from trade_lessons import entry_blocked_by_lessons
@@ -86,7 +95,9 @@ def evaluate_winner(
     universe = universe_fill_active(settings)
     abundant = universe or getattr(settings, "entries_never_pause", False)
     h3r = hourly_3r_active(settings)
-    if starved or abundant:
+    from quality_pick import quality_pick_active
+
+    if not quality_pick_active(settings) and (starved or abundant):
         relax = 0.10 if h3r else (0.08 if universe else 0.06)
         vol_floor = 0.06 if (starved and h3r) else 0.18
         thr = EffectiveWinnerThresholds(
@@ -133,7 +144,9 @@ def evaluate_winner(
         return WinnerVerdict(False, "reject", 0.0, "vote count disagrees with direction")
 
     exp, exp_n = rolling_expectancy(settings.state_dir, window=24)
-    edge_cf_bump = 0.14 if (starved and h3r) else 0.08
+    edge_cf_bump = 0.14 if (starved and h3r and not quality_pick_active(settings)) else 0.08
+    if quality_pick_active(settings):
+        edge_cf_bump = 0.12
     if exp is not None and exp < -0.15 and cf.confluence_score < thr.min_confluence + edge_cf_bump:
         return WinnerVerdict(
             False,
@@ -268,13 +281,50 @@ def evaluate_winner(
         tier = "elite"
     else:
         tier = "good"
-    if settings.winner_elite_only and tier not in ("apex", "elite"):
+    elite_required = settings.winner_elite_only
+    if getattr(settings, "llm_overseer_mode", False):
+        try:
+            from llm_overseer import overseer_elite_only, overseer_min_winner_tier
+
+            if overseer_elite_only(settings.state_dir):
+                elite_required = True
+            floor = overseer_min_winner_tier(settings.state_dir)
+            tier_rank = {"good": 0, "elite": 1, "apex": 2}
+            if tier_rank.get(tier, 0) < tier_rank.get(floor, 0):
+                return WinnerVerdict(
+                    False,
+                    "reject",
+                    score,
+                    f"overseer tier {tier} < floor {floor}",
+                )
+        except Exception:
+            pass
+    if elite_required and tier not in ("apex", "elite"):
         return WinnerVerdict(
             False, "reject", score, f"elite-only: score {score:.2f} < {thr.elite_score:.2f}"
         )
-    if score < thr.min_score:
+    min_score = thr.min_score
+    if quality_pick_active(settings):
+        wr, pf = (0.5, 1.0)
+        try:
+            from quality_pick import live_performance as _live_perf
+
+            wr, pf = _live_perf(settings)
+        except Exception:
+            pass
+        if wr < 0.42 or pf < 0.90:
+            min_score = max(min_score, thr.elite_score - 0.04)
+        pick_s = getattr(decision, "pick_score", 0.0) or 0.0
+        if pick_s < settings.pick_min_score - 0.04:
+            return WinnerVerdict(
+                False,
+                "reject",
+                score,
+                f"pick score {pick_s:.2f} below quality floor",
+            )
+    if score < min_score:
         return WinnerVerdict(
-            False, "reject", score, f"winner score {score:.2f} < {thr.min_score:.2f}"
+            False, "reject", score, f"winner score {score:.2f} < {min_score:.2f}"
         )
 
     if tier == "apex":

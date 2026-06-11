@@ -309,7 +309,9 @@ class ScalpOptimizer:
 
         self.target_max_tph = effective_hourly_tph_cap(settings)
         quality_first = getattr(settings, "optimizer_quality_first", True)
-        if getattr(settings, "hourly_3r_winner_mode", False):
+        if getattr(settings, "quality_pick_mode", True):
+            quality_first = True
+        elif getattr(settings, "hourly_3r_winner_mode", False):
             quality_first = False
         self._throughput_mode = not quality_first
         self._last_run = 0.0
@@ -452,7 +454,9 @@ class ScalpOptimizer:
         base_gap = self.settings.scalp_entry_gap_seconds
         base_cd = float(self.settings.scalp_cooldown_minutes)
 
-        quality_first = getattr(self.settings, "optimizer_quality_first", True) and not self._throughput_mode
+        quality_first = getattr(self.settings, "quality_pick_mode", True) or (
+            getattr(self.settings, "optimizer_quality_first", True) and not self._throughput_mode
+        )
         flow_cf, flow_agree, flow_ml, flow_score, flow_note = self._learn_flow_adjustment()
 
         from hourly_3r import (
@@ -522,8 +526,13 @@ class ScalpOptimizer:
             action = "tighten_quality"
             notes.append(f"wr={wr:.0%} pf={pf:.2f}")
 
-        # Winning hot → slight loosen to capture more A+ hours
-        elif wr >= 0.52 and pf >= 1.15 and opens_60m < self.target_max_tph:
+        # Winning hot → slight loosen to capture more A+ hours (disabled in quality-pick mode)
+        elif (
+            not getattr(self.settings, "quality_pick_mode", True)
+            and wr >= 0.52
+            and pf >= 1.15
+            and opens_60m < self.target_max_tph
+        ):
             t.confluence_delta = max(-0.06, t.confluence_delta - 0.008)
             t.min_score_delta = max(-0.04, t.min_score_delta - 0.01)
             if not pace_only:
@@ -547,7 +556,11 @@ class ScalpOptimizer:
             notes.append(f"overtrading>{self.target_max_tph}/hr")
 
         # Learned flow bias: adapt from what historically improved tph without quality collapse.
-        if flow_note and not flow_note.startswith("flow_coldstart"):
+        if (
+            not getattr(self.settings, "quality_pick_mode", True)
+            and flow_note
+            and not flow_note.startswith("flow_coldstart")
+        ):
             t.confluence_delta = max(-0.10, min(0.10, t.confluence_delta + flow_cf))
             t.agreeing_delta = max(-3, min(3, t.agreeing_delta + flow_agree))
             t.ml_conf_delta = max(-0.08, min(0.08, t.ml_conf_delta + flow_ml))
@@ -562,7 +575,8 @@ class ScalpOptimizer:
         self._save()
         auto_mode = maybe_apply_autocode(
             self.state_dir,
-            enabled=getattr(self.settings, "optimizer_autocode_enabled", True),
+            enabled=getattr(self.settings, "optimizer_autocode_enabled", True)
+            and not getattr(self.settings, "quality_pick_mode", True),
             action=action,
             win_rate=wr,
             profit_factor=pf,
@@ -614,6 +628,8 @@ def micro_tune_for_flow(
     Returns (adjusted_mission_floor, note).
     """
     global _micro_last_nudge, _active
+    if getattr(settings, "quality_pick_mode", True):
+        return mission_floor, ""
     if ranked_count <= 0 or top_tier not in {"good", "elite", "apex"}:
         return mission_floor, ""
     if top_winner_score < 0.48:

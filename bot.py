@@ -207,6 +207,15 @@ def try_open(
         if blocked:
             log.info("side guard %s: %s", symbol, why)
             return False
+    try:
+        from quality_pick import entry_blocked_by_live_roe
+
+        blocked, why = entry_blocked_by_live_roe(settings, symbol, decision.signal.value)
+        if blocked:
+            log.info("quality pick block %s: %s", symbol.split("/")[0], why)
+            return False
+    except Exception:
+        pass
     if cooldowns.is_blocked(symbol):
         log.info("skip %s: symbol cooldown", symbol.split("/")[0])
         return False
@@ -595,6 +604,24 @@ def try_open(
         margin=plan.margin_usd,
         req_daily_pct=knobs.required_daily_return_pct,
     )
+    try:
+        from growth_supercharge import get_brain
+
+        brain = get_brain(settings)
+        if brain is not None:
+            brain.record_open(
+                symbol,
+                decision.signal.value,
+                {
+                    "score": decision.score,
+                    "confidence": conf,
+                    "run_label": getattr(decision, "run_label", ""),
+                    "is_choppy": bool(getattr(decision, "is_choppy", False)),
+                    "winner_tier": getattr(decision, "winner_tier", ""),
+                },
+            )
+    except Exception:
+        pass
     zone = getattr(decision, "confluence_zone", "")
     cf_pct = getattr(decision, "confluence_score", 0.0) * 100
     log.info(
@@ -723,6 +750,16 @@ def run_once(
             equity = lk_eq
             free_margin = lk_free if lk_free > 0 else lk_eq
     engine.snapshot_equity(equity)
+    try:
+        from growth_supercharge import enabled as supercharge_on, get_brain
+
+        if supercharge_on(settings):
+            brain = get_brain(settings)
+            lessons = brain.sync_closes(ex, journal)
+            if lessons:
+                log.info("GROWTH BRAIN | %s", brain.reflection())
+    except Exception:
+        log.debug("growth brain sync failed", exc_info=True)
     try:
         from account_scale import maybe_capital_infusion
 
@@ -964,78 +1001,139 @@ def run_once(
         log.debug("overseer tick failed", exc_info=True)
 
     llm_only = bool(getattr(settings, "llm_only_trading", False)) and not overseer
+    use_confluence_core = False
+    cc_ranked: list = []
+    try:
+        from growth_supercharge import confluence_core_active, daily_loss_pause_active
+
+        if confluence_core_active(settings) and not llm_only:
+            if daily_loss_pause_active(settings, optimizer, equity):
+                log.info("confluence core: daily loss pause — no new entries")
+                return knobs.poll_seconds
+            use_confluence_core = True
+    except Exception:
+        pass
+
     candidates = []
-    for sym in scan:
+    if use_confluence_core:
         try:
-            if not llm_only:
-                if getattr(settings, "trade_lessons_enabled", True):
-                    try:
-                        from trade_lessons import symbol_blocked
+            from confluence_core import scan_and_rank
 
-                        blocked, reason = symbol_blocked(settings, sym)
-                        if blocked:
-                            log.debug("skip %s: %s", sym.split("/")[0], reason)
-                            continue
-                    except Exception:
-                        pass
-                if (
-                    quality_store is not None
-                    and settings.symbol_quality_enabled
-                    and not quality_store.allow(sym, settings.symbol_quality_floor)
-                ):
-                    continue
-                if (
-                    quality_store is not None
-                    and getattr(settings, "runner_filter_enabled", True)
-                    and quality_store.skip_choppy_symbol(sym, floor=getattr(settings, "runner_min_score", 0.48))
-                ):
-                    log.debug("skip %s: remembered choppy runner score", sym.split("/")[0])
-                    continue
-            scan_min_conf = knobs.min_confidence
-            scan_min_score = knobs.min_signal_score
-            if fill_mode and equity > 0 and equity < settings.micro_equity_threshold:
-                scan_min_conf = min(scan_min_conf, 0.52)
-                scan_min_score = min(scan_min_score, 52.0)
-            elif fill_mode and (starved or opens_starved):
-                scan_min_conf = min(scan_min_conf, 0.52)
-                scan_min_score = min(scan_min_score, 50.0)
-            elif getattr(settings, "entries_never_pause", False):
-                scan_min_conf = min(scan_min_conf, 0.52)
-                scan_min_score = min(scan_min_score, 50.0)
-            d = analyze_symbol(
-                ex,
-                settings,
-                sym,
-                None if llm_only else ml,
-                equity=equity,
-                min_confidence=scan_min_conf,
-                min_signal_score=scan_min_score,
+            cc_ranked, _n = scan_and_rank(
+                ex, settings, scan, held, cooldowns, knobs, equity=equity
             )
-            if d and d.signal != Signal.FLAT and engine.passes_signal_gate(
-                d, knobs, min_confidence=scan_min_conf, min_signal_score=scan_min_score
-            ):
-                if not llm_only and quality_store is not None:
-                    quality_store.note_run_quality(
-                        sym,
-                        run_score=float(getattr(d, "run_score", 0.5) or 0.5),
-                        label=str(getattr(d, "run_label", "mixed") or "mixed"),
-                        is_runner=bool(getattr(d, "is_runner", False)),
-                        is_choppy=bool(getattr(d, "is_choppy", False)),
-                    )
-                    sq = quality_store.score(sym)
-                    try:
-                        from roe_learning import get_roe_store
+        except Exception:
+            log.exception("confluence core scan failed")
+            use_confluence_core = False
+    if not use_confluence_core:
+        for sym in scan:
+            try:
+                if not llm_only:
+                    if getattr(settings, "trade_lessons_enabled", True):
+                        try:
+                            from trade_lessons import symbol_blocked
 
-                        sq = max(0.0, min(1.0, sq + get_roe_store(settings.state_dir).symbol_score_delta(sym)))
+                            blocked, reason = symbol_blocked(settings, sym)
+                            if blocked:
+                                log.debug("skip %s: %s", sym.split("/")[0], reason)
+                                continue
+                        except Exception:
+                            pass
+                    try:
+                        from growth_supercharge import enabled as supercharge_on, get_brain, symbol_blocked as gs_block
+
+                        if supercharge_on(settings):
+                            blocked, reason = gs_block(get_brain(settings), sym)
+                            if blocked:
+                                log.debug("skip %s: %s", sym.split("/")[0], reason)
+                                continue
                     except Exception:
                         pass
-                    d.symbol_quality = sq
-                    if settings.symbol_quality_enabled and sq < 0.35:
-                        d.score = max(0.0, d.score - (0.35 - sq) * 12.0)
-                candidates.append((sym, d))
-            time.sleep(0.12 if llm_only else 0.05)
-        except Exception:
-            log.exception("scan %s", sym)
+                    try:
+                        from quality_pick import quality_pick_active, symbol_entry_blocked
+
+                        if quality_pick_active(settings):
+                            blocked, reason = symbol_entry_blocked(settings, sym)
+                            if blocked:
+                                log.debug("skip %s: %s", sym.split("/")[0], reason)
+                                continue
+                    except Exception:
+                        pass
+                    if (
+                        quality_store is not None
+                        and settings.symbol_quality_enabled
+                        and not quality_store.allow(sym, settings.symbol_quality_floor)
+                    ):
+                        continue
+                    if (
+                        quality_store is not None
+                        and getattr(settings, "runner_filter_enabled", True)
+                        and quality_store.skip_choppy_symbol(sym, floor=getattr(settings, "runner_min_score", 0.48))
+                    ):
+                        log.debug("skip %s: remembered choppy runner score", sym.split("/")[0])
+                        continue
+                scan_min_conf = knobs.min_confidence
+                scan_min_score = knobs.min_signal_score
+                try:
+                    from quality_pick import apply_quality_gates, quality_pick_active
+
+                    if quality_pick_active(settings):
+                        scan_min_conf, scan_min_score = apply_quality_gates(
+                            settings, scan_min_conf, scan_min_score
+                        )
+                    elif fill_mode and equity > 0 and equity < settings.micro_equity_threshold:
+                        scan_min_conf = min(scan_min_conf, 0.52)
+                        scan_min_score = min(scan_min_score, 52.0)
+                    elif fill_mode and (starved or opens_starved):
+                        scan_min_conf = min(scan_min_conf, 0.52)
+                        scan_min_score = min(scan_min_score, 50.0)
+                    elif getattr(settings, "entries_never_pause", False):
+                        scan_min_conf = min(scan_min_conf, 0.52)
+                        scan_min_score = min(scan_min_score, 50.0)
+                except Exception:
+                    if fill_mode and equity > 0 and equity < settings.micro_equity_threshold:
+                        scan_min_conf = min(scan_min_conf, 0.52)
+                        scan_min_score = min(scan_min_score, 52.0)
+                    elif fill_mode and (starved or opens_starved):
+                        scan_min_conf = min(scan_min_conf, 0.52)
+                        scan_min_score = min(scan_min_score, 50.0)
+                    elif getattr(settings, "entries_never_pause", False):
+                        scan_min_conf = min(scan_min_conf, 0.52)
+                        scan_min_score = min(scan_min_score, 50.0)
+                d = analyze_symbol(
+                    ex,
+                    settings,
+                    sym,
+                    None if llm_only else ml,
+                    equity=equity,
+                    min_confidence=scan_min_conf,
+                    min_signal_score=scan_min_score,
+                )
+                if d and d.signal != Signal.FLAT and engine.passes_signal_gate(
+                    d, knobs, min_confidence=scan_min_conf, min_signal_score=scan_min_score
+                ):
+                    if not llm_only and quality_store is not None:
+                        quality_store.note_run_quality(
+                            sym,
+                            run_score=float(getattr(d, "run_score", 0.5) or 0.5),
+                            label=str(getattr(d, "run_label", "mixed") or "mixed"),
+                            is_runner=bool(getattr(d, "is_runner", False)),
+                            is_choppy=bool(getattr(d, "is_choppy", False)),
+                        )
+                        sq = quality_store.score(sym)
+                        try:
+                            from roe_learning import get_roe_store
+
+                            sq = max(0.0, min(1.0, sq + get_roe_store(settings.state_dir).symbol_score_delta(sym)))
+                        except Exception:
+                            pass
+                        d.symbol_quality = sq
+                        if settings.symbol_quality_enabled and sq < 0.35:
+                            d.score = max(0.0, d.score - (0.35 - sq) * 12.0)
+                    candidates.append((sym, d))
+                time.sleep(0.12 if llm_only else 0.05)
+            except Exception:
+                log.exception("scan %s", sym)
 
     max_open = effective_max_open(settings, equity)
     if max_open >= UNLIMITED_POSITIONS:
@@ -1120,11 +1218,37 @@ def run_once(
             log.info("opened %d position(s) (llm_only)", opened)
         return knobs.poll_seconds
 
-    ranked = rank_setups(
-        candidates,
-        knobs.path_reliability,
-        mission_scale=engine.mission_scale_conviction,
-    )
+    if use_confluence_core:
+        ranked = cc_ranked
+    else:
+        ranked = rank_setups(
+            candidates,
+            knobs.path_reliability,
+            mission_scale=engine.mission_scale_conviction,
+        )
+        try:
+            from growth_supercharge import enabled as supercharge_on, get_brain, rank_boost
+
+            if supercharge_on(settings):
+                brain = get_brain(settings)
+                for r in ranked:
+                    side = r.decision.signal.value
+                    r.conviction = rank_boost(brain, r.symbol, side, r.conviction)
+                ranked.sort(key=lambda r: r.conviction, reverse=True)
+        except Exception:
+            pass
+        try:
+            from llm_copilot import copilot_active, vet_ranked_setups
+
+            if copilot_active(settings) and ranked:
+                ranked = vet_ranked_setups(
+                    settings,
+                    ranked,
+                    max_vet=max(2, per_tick * 2),
+                    equity=equity,
+                )
+        except Exception:
+            log.debug("cortex copilot vet failed", exc_info=True)
     entry_press = (
         fill_mode
         or starved
@@ -1156,20 +1280,31 @@ def run_once(
                 mission_floor,
                 max(0.46, engine._last_mission.min_conviction - 0.10),
             )
-    allow_apex_fallback = (
-        (tp.allow_elite_fallback if tp else starved)
-        or not settings.winner_apex_preferred
-        or entry_press
-    )
-    elite = select_conviction_ties(
-        ranked,
-        max_opens=per_tick,
-        min_conviction=mission_floor,
-        apex_preferred=settings.winner_apex_preferred and not entry_press,
-        elite_only=settings.winner_elite_only and not entry_press,
-        allow_elite_fallback=allow_apex_fallback,
-    )
-    if not elite and ranked and entry_press and settings.winner_only_mode:
+    if use_confluence_core:
+        from confluence_core import select_top_opens
+        from growth_supercharge import load_policy
+
+        elite = select_top_opens(
+            ranked,
+            max_opens=per_tick,
+            policy=load_policy(settings.state_dir),
+            knobs=knobs,
+        )
+    else:
+        allow_apex_fallback = (
+            (tp.allow_elite_fallback if tp else starved)
+            or not settings.winner_apex_preferred
+            or entry_press
+        )
+        elite = select_conviction_ties(
+            ranked,
+            max_opens=per_tick,
+            min_conviction=mission_floor,
+            apex_preferred=settings.winner_apex_preferred and not entry_press,
+            elite_only=settings.winner_elite_only and not entry_press,
+            allow_elite_fallback=allow_apex_fallback,
+        )
+    if not use_confluence_core and not elite and ranked and entry_press and settings.winner_only_mode:
         from scalp_optimizer import micro_tune_for_flow
 
         top = ranked[0]
@@ -1353,13 +1488,50 @@ def main() -> None:
         log.warning(
             "ENTRIES_NEVER_PAUSE=true — mission/fluid/curve entry pauses OFF; optimizers still tune quality"
         )
+    if getattr(settings, "quality_pick_mode", True):
+        from quality_pick import apply_quality_pick_boot
+
+        apply_quality_pick_boot(settings)
+        from quality_pick import live_performance
+
+        wr, pf = live_performance(settings)
+        log.warning(
+            "QUALITY_PICK_MODE — gates never loosen when starved; live WR floors active "
+            "(1h wr=%.0f%% pf=%.2f); ROE symbol blocks on",
+            wr * 100,
+            pf,
+        )
     log.info("AUTONOMOUS ENGINE: %s", engine.doctrine_summary())
+
+    if getattr(settings, "growth_supercharge_enabled", False):
+        from growth_supercharge import load_policy
+
+        pol = load_policy(settings.state_dir)
+        core = "confluence core" if pol.get("confluence_core_mode", True) else "gate overlay"
+        log.warning(
+            "GROWTH SUPERCHARGE ON (%s) — conf<=%.2f score<=%.0f margin~%.1f%% skip_choppy=%s "
+            "| holdout=%s%% PF=%s WR=%s%% | learning brain active",
+            core,
+            pol["min_confidence"],
+            pol["min_signal_score"],
+            pol["margin_pct_per_trade"],
+            pol.get("skip_choppy", True),
+            pol.get("holdout_return_pct", "—"),
+            pol.get("holdout_profit_factor", "—"),
+            pol.get("holdout_win_rate_pct", "—"),
+        )
 
     if getattr(settings, "llm_overseer_mode", False):
         log.warning(
-            "LLM OVERSEER: 1.5B supervises ML swarm | optimize every %ds | "
-            "instant universe ratings | autocode + blocker fixes",
+            "QWEN CARETAKER: full bot ownership via overseer every %ds — "
+            "optimize gates, fix losers, cortex learn, stack repairs",
             getattr(settings, "overseer_interval_seconds", 300),
+        )
+    if getattr(settings, "llm_copilot_trading", False):
+        log.warning(
+            "CORTEX COPILOT: Qwen vets top finalists with ever-learning cortex "
+            "(ML/winner/pick first, then LLM approves opens | strict=%s)",
+            getattr(settings, "llm_copilot_strict", True),
         )
     if settings.llm_trading_enabled or getattr(settings, "llm_overseer_mode", False):
         try:

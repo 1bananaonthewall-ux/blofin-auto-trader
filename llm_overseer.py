@@ -1,9 +1,9 @@
 """
-LLM overseer — supervises ML swarm, rates universe, optimizes God Bot every 5 minutes.
+Qwen caretaker overseer — God Bot's built-in LLM with full supervisory mandate.
 
-- Instant asset ratings via universe_rater (no per-symbol LLM on entries).
-- Every OVERSEER_INTERVAL_SECONDS (default 300): detect blockers, LLM tune gates,
-  patch safe .env knobs, rewrite optimizer_overrides via autocode.
+Every OVERSEER_INTERVAL_SECONDS (default 300): Qwen reads bot health, blockers,
+and cortex memory; tunes gates, avoid/prefer symbols, patches safe .env knobs,
+runs repairs (TP/SL, curve, stack), and triggers autocode.
 """
 
 from __future__ import annotations
@@ -31,20 +31,29 @@ DEFAULT_INTERVAL_SEC = 300.0
 class OverseerDirectives:
     conf_delta: float = 0.0
     score_delta: float = 0.0
+    pick_min_delta: float = 0.0
     prefer: list[str] = field(default_factory=list)
     avoid: list[str] = field(default_factory=list)
     ml_mode: str = "neutral"
+    winner_tier_floor: str = "good"
+    elite_only: bool = False
     notes: str = ""
     updated_ts: float = 0.0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "OverseerDirectives":
+        tier = str(raw.get("winner_tier_floor") or "good").lower()
+        if tier not in ("good", "elite", "apex"):
+            tier = "good"
         return cls(
             conf_delta=float(raw.get("conf_delta") or 0.0),
             score_delta=float(raw.get("score_delta") or 0.0),
+            pick_min_delta=float(raw.get("pick_min_delta") or 0.0),
             prefer=[str(x) for x in (raw.get("prefer") or [])][:12],
             avoid=[str(x) for x in (raw.get("avoid") or [])][:12],
             ml_mode=str(raw.get("ml_mode") or "neutral"),
+            winner_tier_floor=tier,
+            elite_only=bool(raw.get("elite_only")),
             notes=str(raw.get("notes") or "")[:200],
             updated_ts=float(raw.get("updated_ts") or 0.0),
         )
@@ -72,9 +81,12 @@ def save_directives(state_dir: Path, d: OverseerDirectives) -> None:
             {
                 "conf_delta": d.conf_delta,
                 "score_delta": d.score_delta,
+                "pick_min_delta": d.pick_min_delta,
                 "prefer": d.prefer,
                 "avoid": d.avoid,
                 "ml_mode": d.ml_mode,
+                "winner_tier_floor": d.winner_tier_floor,
+                "elite_only": d.elite_only,
                 "notes": d.notes,
                 "updated_ts": d.updated_ts,
             },
@@ -87,6 +99,23 @@ def save_directives(state_dir: Path, d: OverseerDirectives) -> None:
 def get_gate_adjustments(state_dir: Path) -> tuple[float, float]:
     d = load_directives(state_dir)
     return d.conf_delta, d.score_delta
+
+
+def get_winner_adjustments(state_dir: Path) -> OverseerDirectives:
+    """Winner-pick knobs for pick_engine / winner_gate."""
+    return load_directives(state_dir)
+
+
+def overseer_elite_only(state_dir: Path) -> bool:
+    d = load_directives(state_dir)
+    return bool(d.elite_only or d.winner_tier_floor in ("elite", "apex"))
+
+
+def overseer_min_winner_tier(state_dir: Path) -> str:
+    d = load_directives(state_dir)
+    if d.elite_only:
+        return "elite"
+    return d.winner_tier_floor if d.winner_tier_floor in ("good", "elite", "apex") else "good"
 
 
 def symbol_avoided(symbol: str, state_dir: Path) -> bool:
@@ -122,17 +151,188 @@ def _parse_llm_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _cold_hot_symbols(state_dir: Path) -> tuple[list[str], list[str]]:
+    cold: list[str] = []
+    hot: list[str] = []
+    try:
+        from roe_learning import get_roe_store
+
+        recent = list((get_roe_store(state_dir)._data.get("global") or {}).get("recent") or [])[-24:]
+        for row in recent:
+            sym = str(row.get("symbol") or "").split("/")[0].upper()
+            if not sym:
+                continue
+            roe = float(row.get("roe_pct") or 0)
+            if roe < -8.0 and sym not in cold:
+                cold.append(sym)
+            elif roe > 12.0 and sym not in hot:
+                hot.append(sym)
+    except Exception:
+        pass
+    return cold[:10], hot[:10]
+
+
+def _caretaker_health(state_dir: Path) -> dict[str, Any]:
+    """Bot vitals for Qwen — equity, curve, pauses, open risk."""
+    health: dict[str, Any] = {}
+    try:
+        snap = json.loads((state_dir / "account_snapshot.json").read_text(encoding="utf-8"))
+        health["equity"] = round(float(snap.get("equity") or 0), 2)
+        health["open_positions"] = int(snap.get("open_count") or snap.get("positions") or 0)
+    except Exception:
+        health["equity"] = 0.0
+        health["open_positions"] = 0
+    try:
+        curve = json.loads((state_dir / "pnl_curve.json").read_text(encoding="utf-8"))
+        health["curve_verticality"] = round(float(curve.get("last_verticality") or 0), 3)
+        health["curve_phase"] = str(curve.get("last_phase") or "")
+        health["drawdown_from_peak_pct"] = round(float(curve.get("drawdown_from_peak_pct") or 0), 2)
+    except Exception:
+        pass
+    try:
+        from runtime_gates import read_entries_pause
+
+        paused, reason = read_entries_pause(state_dir)
+        health["entries_paused_runtime"] = paused
+        health["pause_reason"] = reason
+    except Exception:
+        health["entries_paused_runtime"] = False
+    try:
+        from local_cortex import knowledge_block
+
+        kb = knowledge_block(400)
+        health["cortex_chars"] = len(kb or "")
+    except Exception:
+        health["cortex_chars"] = 0
+    return health
+
+
+def _qwen_caretaker_prompt() -> str:
+    return (
+        "You are Qwen — the living caretaker of God Bot (Blofin USDT perpetual scalper). "
+        "You have FULL responsibility: optimize gates, pick winners, keep the stack healthy, "
+        "fix anything broken, and protect the account curve. ML swarm + winner gate + pick engine "
+        "execute entries; YOU supervise, tune, veto symbols, patch config, and run repairs. "
+        "Your cortex learns from every close — use hot/cold symbols and loss_streak. "
+        "MISSION: steep vertical account curve; more winners; cut loser strings fast. "
+        "On loss_streak>=3 or win_rate_1h<0.42: quality mode, elite tier, avoid cold symbols, "
+        "consider ENTRIES_PAUSED=true briefly (15–30 min) only if streak>=5 and PF<0.9. "
+        "When healthy (WR>=0.50, PF>=1.1, streak<2): loosen slightly if flow_starved. "
+        "Keep bot RUNNING CLEAN: clear false pauses, enable ML_CONTINUOUS_TRAIN if ml_not_ready, "
+        "repair TP/SL if tpsl_repair blocker, stack_ensure if dashboard/bot stale. "
+        "Never enable LLM_ONLY_TRADING. "
+        "Return ONLY JSON: "
+        '{"conf_delta":float,"score_delta":float,"pick_min_delta":float,'
+        '"prefer":["SYM"],"avoid":["SYM"],'
+        '"ml_mode":"quality|throughput|neutral","winner_tier_floor":"good|elite|apex",'
+        '"elite_only":bool,'
+        '"env_fixes":{"KEY":"value"},'
+        '"actions":["cortex_train"|"repair_tpsl"|"stack_ensure"|"clear_pause"|"curve_repair"|"ml_refit"],'
+        '"notes":"what you did and why"}. '
+        "Bounds: conf_delta [-0.02,0.06], score_delta [-2,6], pick_min_delta [0,0.10]. "
+        "env_fixes allowlist: QUALITY_PICK_MODE, WINNER_ONLY_MODE, WINNER_ELITE_ONLY, "
+        "LLM_COPILOT_TRADING, LLM_COPILOT_STRICT, SYMBOLS_PER_TICK, OPTIMIZER_TARGET_MIN_TPH, "
+        "ENTRIES_PAUSED, HOURLY_3R_WINNER_MODE, ML_CONTINUOUS_TRAIN, OPTIMIZER_AUTOCODE_ENABLED."
+    )
+
+
+def _execute_overseer_actions(
+    actions: list[str],
+    *,
+    state_dir: Path,
+    root: Path,
+    settings: Any,
+) -> list[str]:
+    """Run allowlisted caretaker repairs Qwen requests in actions[]."""
+    import subprocess
+    import sys
+
+    allowed = frozenset(
+        {
+            "cortex_train",
+            "repair_tpsl",
+            "stack_ensure",
+            "clear_pause",
+            "curve_repair",
+            "ml_refit",
+        }
+    )
+    done: list[str] = []
+    for raw in actions[:6]:
+        action = str(raw).strip().lower()
+        if action not in allowed:
+            continue
+        try:
+            if action == "cortex_train":
+                from local_cortex import train
+
+                summary = train(state_dir)
+                done.append(f"cortex_train:{summary.get('examples', 0)}")
+            elif action == "clear_pause":
+                from runtime_gates import clear_entries_pause
+
+                clear_entries_pause(state_dir)
+                done.append("clear_pause")
+            elif action == "ml_refit":
+                (state_dir / "ml_force_refit.flag").write_text(
+                    json.dumps({"reason": "qwen_overseer"}, indent=2),
+                    encoding="utf-8",
+                )
+                done.append("ml_refit")
+            elif action == "curve_repair":
+                from curve_guard import repair_equity_curve, fetch_live_equity
+
+                eq, _ = fetch_live_equity(state_dir)
+                repair_equity_curve(state_dir, live_equity=eq if eq > 0 else None)
+                done.append("curve_repair")
+            elif action == "repair_tpsl":
+                script = root / "scripts" / "repair_open_tpsl.py"
+                if script.is_file():
+                    subprocess.run(
+                        [sys.executable, str(script)],
+                        cwd=str(root),
+                        check=False,
+                        timeout=120,
+                    )
+                    done.append("repair_tpsl")
+            elif action == "stack_ensure":
+                ps1 = root / "scripts" / "stack_control.ps1"
+                if ps1.is_file():
+                    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
+                    subprocess.run(
+                        [
+                            "powershell",
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(ps1),
+                            "-Action",
+                            "ensure",
+                        ],
+                        cwd=str(root),
+                        check=False,
+                        timeout=90,
+                        creationflags=flags,
+                    )
+                    done.append("stack_ensure")
+        except Exception as exc:
+            log.warning("OVERSEER action %s failed: %s", action, exc)
+    return done
+
+
 def _metrics_snapshot(state_dir: Path) -> dict[str, Any]:
     from universe_rater import load_ratings
 
     ratings = load_ratings(state_dir)
-    wr, pf, streak = 0.5, 1.0, 0
+    wr, pf, streak, avg_roe = 0.5, 1.0, 0, 0.0
     try:
         from roe_learning import get_roe_store
 
-        wr, pf, streak, _ = get_roe_store(state_dir).recent_performance(3600.0, limit=30)
+        wr, pf, streak, avg_roe = get_roe_store(state_dir).recent_performance(3600.0, limit=30)
     except Exception:
         pass
+    cold, hot = _cold_hot_symbols(state_dir)
     opens_60m = 0
     try:
         from scalp_optimizer import ScalpOptimizer
@@ -145,8 +345,12 @@ def _metrics_snapshot(state_dir: Path) -> dict[str, Any]:
     return {
         "win_rate_1h": round(wr, 3),
         "profit_factor_1h": round(min(5.0, pf), 2),
+        "avg_roe_1h": round(float(avg_roe), 2),
         "loss_streak": streak,
         "opens_last_hour": opens_60m,
+        "cold_symbols_recent": cold,
+        "hot_symbols_recent": hot,
+        "bot_health": _caretaker_health(state_dir),
         "top_rated": [
             {
                 "sym": r.get("symbol", "").split("/")[0],
@@ -201,6 +405,53 @@ def _deterministic_fixes(blockers: dict[str, Any], settings: Any) -> dict[str, s
     return fixes
 
 
+def _deterministic_winner_directives(
+    metrics: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Tighten winner bar when live WR/PF is weak — before LLM runs."""
+    wr = float(metrics.get("win_rate_1h") or 0.5)
+    pf = float(metrics.get("profit_factor_1h") or 1.0)
+    streak = int(metrics.get("loss_streak") or 0)
+    cold = list(metrics.get("cold_symbols_recent") or [])
+    hot = list(metrics.get("hot_symbols_recent") or [])
+    top = [r.get("sym") for r in (metrics.get("top_rated") or [])[:6] if r.get("sym")]
+
+    if wr >= 0.48 and pf >= 1.05 and streak < 3:
+        return None
+
+    prefer = list(dict.fromkeys(hot + top))[:10]
+    avoid = cold[:10]
+    if wr < 0.38 or pf < 0.85 or streak >= 4:
+        blob: dict[str, Any] = {
+            "conf_delta": 0.04,
+            "score_delta": 3.0,
+            "pick_min_delta": 0.06,
+            "prefer": prefer,
+            "avoid": avoid,
+            "ml_mode": "quality",
+            "winner_tier_floor": "elite",
+            "elite_only": True,
+            "actions": ["cortex_train"],
+            "notes": f"auto quality: wr={wr:.0%} pf={pf:.2f} streak={streak}",
+        }
+        if streak >= 5:
+            blob["actions"] = ["cortex_train", "curve_repair"]
+        return blob
+    if wr < 0.45 or pf < 0.95 or streak >= 2:
+        return {
+            "conf_delta": 0.02,
+            "score_delta": 2.0,
+            "pick_min_delta": 0.04,
+            "prefer": prefer,
+            "avoid": avoid,
+            "ml_mode": "quality",
+            "winner_tier_floor": "elite",
+            "elite_only": False,
+            "notes": f"auto tighten: wr={wr:.0%} pf={pf:.2f} streak={streak}",
+        }
+    return None
+
+
 def _apply_env_fixes(root: Path, fixes: dict[str, str]) -> list[str]:
     if not fixes:
         return []
@@ -230,35 +481,50 @@ def run_overseer_cycle(
         if applied:
             log.warning("OVERSEER auto-fix (deterministic): %s", ", ".join(applied))
 
+    metrics = _metrics_snapshot(state_dir)
+    auto_winner = _deterministic_winner_directives(metrics)
+    if auto_winner:
+        d_auto = OverseerDirectives.from_dict({**auto_winner, "updated_ts": now})
+        save_directives(state_dir, d_auto)
+        env_auto = {
+            "QUALITY_PICK_MODE": "true",
+            "WINNER_ONLY_MODE": "true",
+            "LLM_COPILOT_TRADING": "true",
+        }
+        if d_auto.elite_only:
+            env_auto["WINNER_ELITE_ONLY"] = "true"
+        applied = _apply_env_fixes(root, env_auto)
+        if applied:
+            log.warning("OVERSEER winner-tighten (deterministic): %s", ", ".join(applied))
+        auto_actions = auto_winner.get("actions") or []
+        if isinstance(auto_actions, list) and auto_actions:
+            _execute_overseer_actions(
+                [str(a) for a in auto_actions],
+                state_dir=state_dir,
+                root=root,
+                settings=settings,
+            )
+
     if resolve_provider() == "none":
         log.warning("OVERSEER: no LLM provider — deterministic fixes only")
         _last_cycle_ts = now
-        return None
+        return load_directives(state_dir) if auto_winner else None
 
-    metrics = _metrics_snapshot(state_dir)
-    system = (
-        "You optimize a crypto God Bot (ML signal + winner + pick + swarm + 15m optimizer). "
-        "Foresee blockers and fix flow BEFORE trades starve. Return ONLY JSON: "
-        '{"conf_delta":float,"score_delta":float,"prefer":["SYM"],"avoid":["SYM"],'
-        '"ml_mode":"quality|throughput|neutral","env_fixes":{"KEY":"value"},'
-        '"notes":"short"}. '
-        "Bounds: conf_delta [-0.06,0.06], score_delta [-4,4]. "
-        "env_fixes keys allowed: LLM_ONLY_TRADING, LLM_OVERSEER_MODE, SIGNAL_MODE, "
-        "SYMBOLS_PER_TICK, OPTIMIZER_TARGET_MIN_TPH, ML_CONTINUOUS_TRAIN, ENTRIES_PAUSED, "
-        "HOURLY_3R_WINNER_MODE, WINNER_ONLY_MODE, WHATSAPP_LLM_PROVIDER. "
-        "If blockers show flow_starved or opens_last_hour<4: throughput mode, loosen gates, "
-        "raise SYMBOLS_PER_TICK. If llm_only_per_symbol: set LLM_ONLY_TRADING=false. "
-        "Never enable LLM_ONLY_TRADING."
-    )
+    system = _qwen_caretaker_prompt()
     payload = {
+        "role": "You are Qwen. This is your God Bot — optimize it and keep it healthy.",
         "metrics": metrics,
         "blockers": blockers.get("issues") or [],
-        "llm": status_line(),
+        "llm_backend": status_line(),
         "settings": {
             "llm_only": getattr(settings, "llm_only_trading", False),
+            "llm_copilot": getattr(settings, "llm_copilot_trading", False),
             "signal_mode": getattr(settings, "signal_mode", ""),
             "symbols_per_tick": getattr(settings, "symbols_per_tick", 0),
             "hourly_3r": getattr(settings, "hourly_3r_winner_mode", False),
+            "entries_paused_env": getattr(settings, "entries_paused", False),
+            "quality_pick": getattr(settings, "quality_pick_mode", False),
+            "winner_only": getattr(settings, "winner_only_mode", False),
         },
     }
     text, err = chat_completion(
@@ -266,7 +532,7 @@ def run_overseer_cycle(
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
         ],
-        max_tokens=280,
+        max_tokens=380,
         temperature=0.12,
         mode="policy",
     )
@@ -285,16 +551,39 @@ def run_overseer_cycle(
     if isinstance(env_fixes, dict) and env_fixes:
         llm_applied = _apply_env_fixes(root, {str(k): str(v) for k, v in env_fixes.items()})
         if llm_applied:
-            log.warning("OVERSEER auto-fix (LLM): %s", ", ".join(llm_applied))
+            log.warning("QWEN caretaker env: %s", ", ".join(llm_applied))
 
+    raw_actions = blob.get("actions") or []
+    if isinstance(raw_actions, list) and raw_actions:
+        action_log = _execute_overseer_actions(
+            [str(a) for a in raw_actions],
+            state_dir=state_dir,
+            root=root,
+            settings=settings,
+        )
+        if action_log:
+            log.warning("QWEN caretaker actions: %s", ", ".join(action_log))
+
+    merged = {**(auto_winner or {}), **blob}
     d = OverseerDirectives.from_dict(
         {
-            **blob,
-            "conf_delta": max(-0.06, min(0.06, float(blob.get("conf_delta") or 0))),
-            "score_delta": max(-4.0, min(4.0, float(blob.get("score_delta") or 0))),
+            **merged,
+            "conf_delta": max(-0.02, min(0.06, float(merged.get("conf_delta") or 0))),
+            "score_delta": max(-2.0, min(6.0, float(merged.get("score_delta") or 0))),
+            "pick_min_delta": max(0.0, min(0.10, float(merged.get("pick_min_delta") or 0))),
             "updated_ts": now,
         }
     )
+    if d.ml_mode == "quality" or d.elite_only:
+        _apply_env_fixes(
+            root,
+            {
+                "QUALITY_PICK_MODE": "true",
+                "WINNER_ONLY_MODE": "true",
+                "LLM_COPILOT_TRADING": "true",
+                **({"WINNER_ELITE_ONLY": "true"} if d.elite_only else {}),
+            },
+        )
     save_directives(state_dir, d)
     _last_cycle_ts = now
 
@@ -321,13 +610,17 @@ def run_overseer_cycle(
             log.debug("overseer autocode failed", exc_info=True)
 
     log.warning(
-        "OVERSEER 5m optimize | conf%+.3f score%+.1f prefer=%s avoid=%s mode=%s | %s",
+        "QWEN caretaker | conf%+.3f score%+.1f pick%+.2f tier=%s elite=%s "
+        "prefer=%s avoid=%s mode=%s | %s",
         d.conf_delta,
         d.score_delta,
+        d.pick_min_delta,
+        d.winner_tier_floor,
+        d.elite_only,
         ",".join(d.prefer[:5]) or "-",
         ",".join(d.avoid[:5]) or "-",
         d.ml_mode,
-        d.notes[:80],
+        d.notes[:120],
     )
     return d
 

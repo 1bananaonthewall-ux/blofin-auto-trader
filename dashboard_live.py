@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from config import load_settings
+from dashboard_mtm import mtm_equity, mtm_free_margin, mtm_positions
 from exchange_client import BlofinExchange
+from markets import symbol_to_inst_id
 from mission_config import (
     TARGET_DAILY_GROWTH_PCT,
     progress_toward_daily_goal_pct,
@@ -106,20 +108,33 @@ def _position_rows(live: dict[str, dict], registry: dict) -> list[dict]:
         info = pos.get("info") or {}
         side = str(pos.get("side", "long")).lower()
         entry = float(pos.get("entry_price") or 0)
-        mark = float(info.get("markPx") or info.get("markPrice") or pos.get("mark_price") or entry)
+        mark = float(
+            pos.get("mark_price")
+            or info.get("markPx")
+            or info.get("markPrice")
+            or entry
+        )
         contracts = float(pos.get("contracts") or 0)
         lev = int(pos.get("leverage") or info.get("leverage") or info.get("lever") or 0)
         margin = float(pos.get("margin_usdt") or 0)
-        roe_pct, pnl_usd, notional, eff_lev = BlofinExchange.position_display_metrics(
-            side=side,
-            entry=entry,
-            mark=mark,
-            margin_usdt=margin,
-            leverage=lev,
-            unrealized_usd=float(pos.get("unrealized_pnl_usd")) if pos.get("unrealized_pnl_usd") is not None else None,
-            row=info if info else None,
-            contracts=contracts,
-        )
+        if pos.get("roe_pct") is not None and pos.get("unrealized_pnl_usd") is not None:
+            roe_pct = float(pos["roe_pct"])
+            pnl_usd = float(pos["unrealized_pnl_usd"])
+            notional = float(pos.get("notional_usdt") or 0)
+            eff_lev = float(pos.get("effective_leverage") or lev)
+        else:
+            roe_pct, pnl_usd, notional, eff_lev = BlofinExchange.position_display_metrics(
+                side=side,
+                entry=entry,
+                mark=mark,
+                margin_usdt=margin,
+                leverage=lev,
+                unrealized_usd=float(pos.get("unrealized_pnl_usd"))
+                if pos.get("unrealized_pnl_usd") is not None
+                else None,
+                row=info if info else None,
+                contracts=contracts,
+            )
         reg = registry.get(sym, {}) or registry.get(key, {})
         rows.append(
             {
@@ -436,11 +451,8 @@ def build_live_positions(
     """Fresh open positions — exchange book preferred, snapshot+registry fallback."""
     now = now or time.time()
     registry = _read_json(_state_dir / "position_registry.json", {}) or {}
-    exchange_fresh = bool(
-        exchange_positions and (now - exchange_positions_ts) < 120.0
-    )
     exchange_syms: set[str] | None = None
-    if exchange_fresh and exchange_positions:
+    if exchange_positions:
         exchange_syms = {
             str(p.get("symbol") or k.split("#")[0])
             for k, p in exchange_positions.items()
@@ -565,6 +577,21 @@ def _prof_pnl_near(prof_rows: list[dict], symbol: str, close_ts: float, window_s
     return best
 
 
+def _closed_row_quality(row: dict) -> int:
+    """Prefer rows with prices + ROE when deduping the same close."""
+    score = 0
+    if float(row.get("entry") or 0) > 0:
+        score += 2
+    if float(row.get("exit") or 0) > 0:
+        score += 2
+    if row.get("roe_pct") is not None:
+        score += 2
+    src = str(row.get("source") or "")
+    if src in ("profitability", "journal", "outcome"):
+        score += 1
+    return score
+
+
 def _format_closed_row(
     *,
     symbol: str,
@@ -615,6 +642,10 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
     prof = _read_json(_state_dir / "profitability.json", {"trades": []}) or {"trades": []}
     prof_rows = list(prof.get("trades") or [])
     cutoff = time.time() - hours * 3600 if hours > 0 else 0
+    recent_cutoff = cutoff or (time.time() - 7 * 86400)
+    recent_prof = [t for t in prof_rows if parse_ts(t.get("ts")) >= recent_cutoff]
+    if len(recent_prof) < 40:
+        recent_prof = prof_rows[-250:]
 
     rows: list[dict] = []
 
@@ -632,8 +663,27 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
         margin: float,
         contracts: float,
         lev: int,
+        roe_hint: float | None = None,
     ) -> None:
         if cutoff and ts and ts < cutoff:
+            return
+        if roe_hint is not None and (prof_pnl is not None or fill_pnl is not None):
+            pnl_val = float(prof_pnl if prof_pnl is not None else fill_pnl or 0)
+            rows.append(
+                _format_closed_row(
+                    symbol=sym,
+                    side=side,
+                    pnl_usd=pnl_val,
+                    roe_pct=float(roe_hint),
+                    ts=ts,
+                    event=event,
+                    entry=entry if entry > 0 else None,
+                    exit_px=exit_px if exit_px > 0 else None,
+                    leverage=lev if lev > 0 else None,
+                    margin_usdt=margin if margin > 0 else None,
+                    source=source,
+                )
+            )
             return
         if entry <= 0 or exit_px <= 0:
             return
@@ -658,6 +708,8 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
             contracts=contracts if contracts > 0 else None,
             contract_size=_contract_size_for(sym),
         )
+        if roe is None and roe_hint is not None:
+            roe = float(roe_hint)
         rows.append(
             _format_closed_row(
                 symbol=sym,
@@ -671,6 +723,77 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
                 leverage=lev if lev > 0 else None,
                 margin_usdt=margin if margin > 0 else None,
                 source=source,
+            )
+        )
+
+    for t in reversed(recent_prof):
+        sym = str(t.get("symbol") or "?")
+        ts = parse_ts(t.get("ts"))
+        entry_px = float(t.get("entry") or 0)
+        exit_px = float(t.get("exit") or 0)
+        if entry_px <= 0 or exit_px <= 0:
+            continue
+        if cutoff and ts and ts < cutoff:
+            continue
+        reg = registry.get(sym) or {}
+        lev = int(t.get("leverage") or reg.get("leverage") or 0) or _default_close_leverage()
+        margin = float(reg.get("margin_usdt") or 0)
+        contracts = float(reg.get("contracts") or 0)
+        roe_hint = t.get("roe_pct")
+        try:
+            roe_hint = float(roe_hint) if roe_hint is not None else None
+        except (TypeError, ValueError):
+            roe_hint = None
+        _append_row(
+            sym=sym,
+            side=str(t.get("side") or "long"),
+            ts=ts,
+            entry=entry_px,
+            exit_px=exit_px,
+            event=str(t.get("event") or "close"),
+            source="profitability",
+            fill_pnl=None,
+            prof_pnl=float(t.get("net_pnl") or t.get("pnl_usd") or 0),
+            margin=margin,
+            contracts=contracts,
+            lev=lev,
+            roe_hint=roe_hint,
+        )
+
+    for t in reversed(recent_prof):
+        sym = str(t.get("symbol") or "?")
+        ts = parse_ts(t.get("ts"))
+        entry_px = float(t.get("entry") or 0)
+        exit_px = float(t.get("exit") or 0)
+        if entry_px > 0 and exit_px > 0:
+            continue
+        if cutoff and ts and ts < cutoff:
+            continue
+        if any(
+            r.get("symbol") == sym and abs(float(r.get("ts") or 0) - ts) < 300
+            for r in rows
+        ):
+            continue
+        roe_hint = t.get("roe_pct")
+        try:
+            roe_hint = float(roe_hint) if roe_hint is not None else None
+        except (TypeError, ValueError):
+            roe_hint = None
+        pnl = float(t.get("net_pnl") or t.get("pnl_usd") or 0)
+        if roe_hint is None and abs(pnl) < 1e-9:
+            continue
+        rows.append(
+            _format_closed_row(
+                symbol=sym,
+                side=str(t.get("side") or "long"),
+                pnl_usd=pnl,
+                roe_pct=roe_hint,
+                ts=ts,
+                event=str(t.get("event") or "close"),
+                entry=entry_px if entry_px > 0 else None,
+                exit_px=exit_px if exit_px > 0 else None,
+                leverage=int(t.get("leverage") or 0) or None,
+                source="profitability",
             )
         )
 
@@ -813,37 +936,6 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
                 lev=lev,
             )
 
-    for t in prof_rows:
-        sym = str(t.get("symbol") or "?")
-        ts = parse_ts(t.get("ts"))
-        entry_px = float(t.get("entry") or 0)
-        exit_px = float(t.get("exit") or 0)
-        if entry_px <= 0 or exit_px <= 0:
-            continue
-        if any(
-            r.get("symbol") == sym and abs(float(r.get("ts") or 0) - ts) < 300
-            for r in rows
-        ):
-            continue
-        reg = registry.get(sym) or {}
-        lev = int(t.get("leverage") or reg.get("leverage") or 0) or _default_close_leverage()
-        margin = float(reg.get("margin_usdt") or 0)
-        contracts = float(reg.get("contracts") or 0)
-        _append_row(
-            sym=sym,
-            side=str(t.get("side") or "long"),
-            ts=ts,
-            entry=entry_px,
-            exit_px=exit_px,
-            event=str(t.get("event") or "close"),
-            source="profitability",
-            fill_pnl=None,
-            prof_pnl=float(t.get("net_pnl") or t.get("pnl_usd") or 0),
-            margin=margin,
-            contracts=contracts,
-            lev=lev,
-        )
-
     deduped: list[dict] = []
     for row in sorted(rows, key=lambda r: float(r.get("ts") or 0), reverse=True):
         sym = row.get("symbol")
@@ -859,9 +951,27 @@ def closed_trades_list(limit: int = 80, hours: float = 0) -> list[dict]:
         if dup is None:
             deduped.append(row)
             continue
-        if abs(float(row.get("pnl_usd") or 0)) < abs(float(dup.get("pnl_usd") or 0)) * 1.35:
+        if _closed_row_quality(row) > _closed_row_quality(dup):
             deduped[deduped.index(dup)] = row
-    return deduped[:limit]
+        elif (
+            _closed_row_quality(row) == _closed_row_quality(dup)
+            and abs(float(row.get("pnl_usd") or 0))
+            > abs(float(dup.get("pnl_usd") or 0)) * 1.35
+        ):
+            deduped[deduped.index(dup)] = row
+    sparse_drop: list[dict] = []
+    for row in deduped:
+        sym = row.get("symbol")
+        ts = float(row.get("ts") or 0)
+        if _closed_row_quality(row) < 4 and any(
+            _closed_row_quality(other) >= 4
+            and other.get("symbol") == sym
+            and abs(float(other.get("ts") or 0) - ts) < 900
+            for other in deduped
+        ):
+            continue
+        sparse_drop.append(row)
+    return sparse_drop[:limit]
 
 
 # Back-compat alias for internal callers
@@ -911,6 +1021,11 @@ class LiveDataHub:
         self._prev_open_syms: set[str] = set()
         self._closed_cache: list[dict] | None = None
         self._closed_cache_ver = 0.0
+        self._stream: Any = None
+        self._mtm_anchor_equity = 0.0
+        self._mtm_anchor_unrealized = 0.0
+        self._mtm_anchor_free = 0.0
+        self._mtm_anchor_ts = 0.0
 
     def start(self) -> None:
         if self._running:
@@ -943,11 +1058,7 @@ class LiveDataHub:
             now = time.time()
             if now - self._exchange_positions_ts >= 10.0 or not self._positions:
                 self._refresh_exchange(now)
-            rows = build_live_positions(
-                exchange_positions=self._positions,
-                exchange_positions_ts=self._exchange_positions_ts,
-                now=now,
-            )
+            rows, _unreal, _eq = self._positions_with_mtm(now)
             errors: dict[str, str] = {}
             if self._positions_err:
                 errors["positions"] = self._positions_err
@@ -970,6 +1081,65 @@ class LiveDataHub:
         self._closed_cache_ver = ver
         return rows
 
+    def _ensure_mtm_stream(self, symbols: list[str]) -> None:
+        if not symbols:
+            return
+        ex = self._get_exchange()
+        if ex is None:
+            return
+        inst_ids = [symbol_to_inst_id(s) for s in symbols if s]
+        if not inst_ids:
+            return
+        try:
+            from market_stream import BlofinMarketStream
+
+            if self._stream is None:
+                self._stream = BlofinMarketStream(
+                    ex.http, demo=ex.settings.mode == "demo"
+                )
+                self._stream.start(inst_ids)
+            self._stream.set_priority(inst_ids)
+        except Exception as exc:
+            log.debug("mtm stream start failed: %s", exc)
+
+    def _sync_mtm_anchor(self, equity: float, free: float, positions: list[dict]) -> None:
+        unreal = sum(float(p.get("pnl_usd") or 0) for p in positions)
+        if equity > 0:
+            self._mtm_anchor_equity = float(equity)
+            self._mtm_anchor_unrealized = unreal
+            self._mtm_anchor_free = float(free) if free > 0 else float(equity) * 0.85
+            self._mtm_anchor_ts = time.time()
+
+    def _positions_with_mtm(self, now: float) -> tuple[list[dict], float, float]:
+        positions = build_live_positions(
+            exchange_positions=self._positions,
+            exchange_positions_ts=self._exchange_positions_ts,
+            now=now,
+        )
+        syms = [str(p.get("symbol") or "") for p in positions if p.get("symbol")]
+        if syms:
+            self._ensure_mtm_stream(syms)
+        positions, unreal = mtm_positions(positions, self._stream)
+        equity = self._equity
+        free = self._free
+        if (
+            self._mtm_anchor_equity > 0
+            and self._mtm_anchor_ts > 0
+            and (now - self._mtm_anchor_ts) < 120.0
+            and positions
+        ):
+            equity = mtm_equity(
+                anchor_equity=self._mtm_anchor_equity,
+                anchor_unrealized=self._mtm_anchor_unrealized,
+                current_unrealized=unreal,
+            )
+            free = mtm_free_margin(
+                anchor_free=self._mtm_anchor_free,
+                anchor_unrealized=self._mtm_anchor_unrealized,
+                current_unrealized=unreal,
+            )
+        return positions, unreal, equity
+
     def _get_exchange(self) -> BlofinExchange | None:
         if self._ex is not None:
             return self._ex
@@ -988,32 +1158,31 @@ class LiveDataHub:
             return None
 
     def _refresh_exchange(self, now: float) -> None:
-        # Equity from bot snapshot when available; positions always reconciled vs exchange.
         snap = _load_bot_positions()
+        bot_eq = 0.0
+        bot_fr = 0.0
+        bot_api_ok = True
         if snap is not None:
-            _rows, bot_ts, meta = snap
-            eq = float(meta.get("equity") or 0)
-            fr = float(meta.get("free_margin") or 0)
-            if eq > 0:
-                self._equity = eq
-                self._free = fr if fr > 0 else eq * 0.85
-                self._equity_ts = bot_ts
-                self._equity_err = None
-            elif not meta.get("api_ok", True):
-                fb_eq, fb_free = _last_known_equity()
-                if fb_eq > 0:
-                    self._equity = fb_eq
-                    self._free = fb_free
-                    self._equity_err = "Using last known equity (Blofin rate limit)"
-            if not meta.get("api_ok", True):
+            _rows, _bot_ts, meta = snap
+            bot_eq = float(meta.get("equity") or 0)
+            bot_fr = float(meta.get("free_margin") or 0)
+            bot_api_ok = bool(meta.get("api_ok", True))
+            if not bot_api_ok:
                 self._positions_err = "Using cached positions (Blofin rate limit)"
 
-        need_positions = now - self._exchange_positions_ts >= 15.0 or not self._positions
-        need_equity = snap is None and (now - self._equity_ts >= 60.0 or self._equity <= 0)
+        mtm_active = bool(self._positions)
+        pos_interval = 12.0 if mtm_active else 15.0
+        eq_interval = 45.0 if mtm_active else 30.0
+        need_positions = now - self._exchange_positions_ts >= pos_interval or not self._positions
+        need_equity = now - self._equity_ts >= eq_interval or self._equity <= 0
         if not need_positions and not need_equity:
             return
         ex = self._get_exchange()
         if ex is None:
+            if bot_eq > 0 and self._equity <= 0:
+                self._equity = bot_eq
+                self._free = bot_fr if bot_fr > 0 else bot_eq * 0.85
+                self._equity_ts = now
             return
         if need_positions:
             try:
@@ -1025,6 +1194,16 @@ class LiveDataHub:
                     self._positions_ts = now
                     self._positions_err = None
                     self._reconcile_positions_file(fresh)
+                    rest_rows = build_live_positions(
+                        exchange_positions=fresh,
+                        exchange_positions_ts=now,
+                        now=now,
+                    )
+                    syms = [str(p.get("symbol") or "") for p in rest_rows]
+                    if syms:
+                        self._ensure_mtm_stream(syms)
+                    if self._equity > 0:
+                        self._sync_mtm_anchor(self._equity, self._free, rest_rows)
                 elif self._positions:
                     self._positions_err = (
                         self._positions_err or "exchange positions empty (rate limit?); using cache"
@@ -1046,10 +1225,26 @@ class LiveDataHub:
                 fr = ex.fetch_free_equity_usdt()
                 if eq > 0:
                     self._equity = eq
-                    self._free = fr
+                    self._free = fr if fr > 0 else eq * 0.85
                     self._equity_ts = now
                     self._equity_err = None
+                    if self._positions:
+                        rest_rows = build_live_positions(
+                            exchange_positions=self._positions,
+                            exchange_positions_ts=self._exchange_positions_ts,
+                            now=now,
+                        )
+                        self._sync_mtm_anchor(eq, self._free, rest_rows)
+                elif bot_eq > 0:
+                    self._equity = bot_eq
+                    self._free = bot_fr if bot_fr > 0 else bot_eq * 0.85
+                    self._equity_ts = now
+                    self._equity_err = (self._equity_err or "equity fetch empty — using bot snapshot")[:200]
                 elif self._equity <= 0:
+                    fb_eq, fb_free = _last_known_equity()
+                    if fb_eq > 0:
+                        self._equity = fb_eq
+                        self._free = fb_free
                     self._equity_err = (self._equity_err or "equity fetch empty (rate limit?)")[:200]
             except Exception as exc:
                 msg = str(exc)[:200]
@@ -1207,22 +1402,28 @@ class LiveDataHub:
         if bot_book is not None:
             _, _, account_meta = bot_book
 
-        positions = build_live_positions(
-            exchange_positions=self._positions,
-            exchange_positions_ts=self._exchange_positions_ts,
-            now=now,
-        )
+        positions, unrealized, equity = self._positions_with_mtm(now)
         signals = build_signals_feed(positions=positions, log_lines=lines)
         exposure = sum(float(p.get("notional_usdt") or 0) for p in positions)
-        unrealized = sum(float(p.get("pnl_usd") or 0) for p in positions)
-        equity = self._equity
         free = self._free
-        if bot_book is not None:
+        mtm_live = (
+            self._mtm_anchor_equity > 0
+            and positions
+            and (now - self._mtm_anchor_ts) < 120.0
+        )
+        if bot_book is not None and not mtm_live:
             eq_snap = float(account_meta.get("equity") or 0)
             fr_snap = float(account_meta.get("free_margin") or 0)
-            if eq_snap > 0:
+            exchange_fresh = (now - self._equity_ts) < 90.0 and equity > 0
+            if not exchange_fresh and eq_snap > 0:
                 equity = eq_snap
                 free = fr_snap if fr_snap > 0 else eq_snap * 0.85
+        elif mtm_live:
+            free = mtm_free_margin(
+                anchor_free=self._mtm_anchor_free,
+                anchor_unrealized=self._mtm_anchor_unrealized,
+                current_unrealized=unrealized,
+            )
         if equity <= 0:
             fb_eq, fb_free = _last_known_equity()
             if fb_eq > 0:
@@ -1270,6 +1471,7 @@ class LiveDataHub:
                 "progress_today_pct": round(progress, 4),
                 "progress_log_pct": round(progress, 4),
                 "equity": round(equity, 4),
+                "equity_mtm": mtm_live,
                 "free_margin": round(free, 4),
                 "used_margin": round(max(equity - free, 0), 4),
                 "exposure_usdt": round(exposure, 4),
@@ -1360,7 +1562,8 @@ class LiveDataHub:
                     self._snapshot = snap
             except Exception as exc:
                 log.warning("live hub tick failed: %s", exc)
-            time.sleep(1.5)
+            has_open = bool(self._positions)
+            time.sleep(0.4 if has_open else 1.5)
 
 
 _HUB: LiveDataHub | None = None

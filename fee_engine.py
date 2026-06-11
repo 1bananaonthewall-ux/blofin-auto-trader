@@ -63,9 +63,10 @@ def analyze_trade_fees(
     exit_fee_usd = notional * exit_fee_pct
     total_fee_usd = entry_fee_usd + exit_fee_usd
     
-    # Minimum profit % needed to just break even on fees
-    # Fee % is on notional, profit % is on equity deployed (notional/leverage)
-    min_profit_to_beat_fees_pct = roundtrip_fee_pct * leverage  # scaled by leverage
+    # Minimum *price move* % needed to break even on fees.
+    # Fees and PnL both scale linearly with notional, so leverage cancels:
+    # required price move = roundtrip_fee_rate (independent of leverage).
+    min_profit_to_beat_fees_pct = roundtrip_fee_pct
     
     # Estimated gross profit from take profit move
     gross_profit_pct = take_distance_pct  # as decimal
@@ -140,10 +141,12 @@ def ensure_fee_overcoming(
     strict_rr = min_rr >= 2.5
     adjusted_stop = min(stop_pct, safe_cap)
     if not strict_rr:
-        fee_noise_stop = roundtrip_fee_rate * min(leverage, 15) * 0.8
+        # Minimum stop = ~10x roundtrip fees so normal fee impact can't trigger SL.
+        # Leverage-independent (fees and PnL both scale with notional).
+        fee_noise_stop = roundtrip_fee_rate * 10
         adjusted_stop = max(adjusted_stop, min(fee_noise_stop, safe_cap * 0.5))
 
-    required_tp_pct = adjusted_stop + (roundtrip_fee_rate * leverage * min_fee_coverage_multiple)
+    required_tp_pct = adjusted_stop + (roundtrip_fee_rate * min_fee_coverage_multiple)
     if strict_rr:
         adjusted_take = adjusted_stop * min_rr
         adjusted_take = max(adjusted_take, required_tp_pct)
@@ -177,11 +180,11 @@ def ensure_fee_overcoming(
                 required_tp_pct = adjusted_stop * min_rr
                 required_tp_pct = max(
                     required_tp_pct,
-                    adjusted_stop + (roundtrip_fee_rate * leverage * safety_factor),
+                    adjusted_stop + (roundtrip_fee_rate * safety_factor),
                 )
                 adjusted_take = required_tp_pct
             else:
-                required_tp_pct = adjusted_stop + (roundtrip_fee_rate * leverage * safety_factor)
+                required_tp_pct = adjusted_stop + (roundtrip_fee_rate * safety_factor)
                 adjusted_take = max(adjusted_take, required_tp_pct)
             adjusted_fee_analysis = analyze_trade_fees(
                 entry_price=entry_price,

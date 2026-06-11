@@ -42,6 +42,7 @@ def main() -> int:
     p.add_argument("--test-days", type=int, default=21)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--refit-ml", action="store_true")
+    p.add_argument("--apply-live", action="store_true", help="Push walk-forward winners to live gates (default: report only)")
     p.add_argument("--no-live-safe", action="store_true", help="Allow more workers; still never stops bot")
     p.add_argument("--no-ws", action="store_true", help="Skip WS tail (safer when live bot uses same API)")
     args = p.parse_args()
@@ -74,6 +75,7 @@ def main() -> int:
                 use_cache=True,
                 live_safe=not args.no_live_safe,
                 use_ws_tail=not args.no_ws,
+                apply_live=args.apply_live,
             )
         except Exception as exc:
             log.exception("round %d crashed: %s", rnd, exc)

@@ -50,6 +50,7 @@ def run_walkforward_backtest(
     refit_ml: bool = False,
     use_cache: bool = True,
     live_safe: bool = True,
+    apply_live: bool = False,
 ) -> dict[str, Any]:
     """
     Walk-forward God Bot backtest on Blofin USDT perp universe.
@@ -58,6 +59,7 @@ def run_walkforward_backtest(
     - Requests up to 10y history; Blofin returns whatever exists per listing (often months–2y).
     - WebSocket tail sync freshens recent bars; bulk history is parallel REST + gzip cache.
     - Optimizes gate params on train windows, scores out-of-sample test windows.
+    - apply_live=False by default: backtest reports only; never mutates live gates/ML.
     """
     t0 = time.time()
     if live_safe:
@@ -182,7 +184,11 @@ def run_walkforward_backtest(
 
         oos_so_far = [f["oos_score"] for f in fold_reports]
         applied = None
-        if fold_result.get("oos_score", -1e9) > 0 and fold_result.get("oos_total_trades", 0) >= 10:
+        if (
+            apply_live
+            and fold_result.get("oos_score", -1e9) > 0
+            and fold_result.get("oos_total_trades", 0) >= 10
+        ):
             try:
                 applied = apply_from_fold_report(fold_result)
             except Exception as exc:
@@ -240,10 +246,14 @@ def run_walkforward_backtest(
 
     from god_backtest.apply_tuning import apply_from_full_report
 
-    try:
-        report["applied_tuning"] = apply_from_full_report(report)
-    except Exception as exc:
-        log.warning("final apply tuning failed: %s", exc)
+    if apply_live:
+        try:
+            report["applied_tuning"] = apply_from_full_report(report)
+        except Exception as exc:
+            log.warning("final apply tuning failed: %s", exc)
+    else:
+        report["applied_tuning"] = {"live_apply": False, "note": "report-only; live bot unchanged"}
+        log.info("walk-forward complete — live apply skipped (apply_live=False)")
 
     _write_live_progress(
         {

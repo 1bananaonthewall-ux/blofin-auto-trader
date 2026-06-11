@@ -50,6 +50,7 @@ _RELOAD_ORDER = (
     "scalp_optimizer",
     "optimizer_autocode",
     "optimizer_overrides",
+    "quality_pick",
     "universe_rater",
     "trade_blockers",
     "overseer_env",

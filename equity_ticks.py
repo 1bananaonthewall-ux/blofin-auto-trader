@@ -89,6 +89,10 @@ def append_equity_tick(
     ref_eq = _last_append_equity if _last_append_equity > 0 else file_eq
     if ref_eq >= 50 and equity < ref_eq * 0.20:
         return False
+    # Micro accounts: reject single-tick spikes that poison the chart.
+    if ref_eq > 0 and ref_eq < 25.0:
+        if equity > ref_eq * 1.22 or equity < ref_eq * 0.50:
+            return False
     changed = ref_eq > 0 and abs(equity - ref_eq) >= min_change_usd
     if ref_eq > 0:
         pct_move = abs(equity - ref_eq) / ref_eq

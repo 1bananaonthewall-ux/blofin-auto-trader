@@ -1,6 +1,7 @@
 export interface Status {
   mission: string;
   equity: number;
+  equity_mtm?: boolean;
   free_margin: number;
   used_margin: number;
   exposure_usdt?: number;

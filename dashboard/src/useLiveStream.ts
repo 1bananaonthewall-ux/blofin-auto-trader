@@ -156,7 +156,7 @@ export function useLiveStream() {
         .catch(() => {});
     };
     pollPositions();
-    const posTimer = setInterval(pollPositions, 2500);
+    const posTimer = setInterval(pollPositions, 800);
     return () => clearInterval(posTimer);
   }, []);
 

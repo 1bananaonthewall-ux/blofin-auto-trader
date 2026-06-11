@@ -281,7 +281,8 @@ def evaluate_pick_for_symbol(
             return PickVerdict(False, winner_score, f"RSI exhausted ({decision.rsi:.0f})")
 
     sym_wr, sym_n = _recent_side_edge(settings.state_dir, symbol, side.value)
-    if sym_wr is not None and sym_wr < 0.22:
+    cold_floor = 0.30 if quality_pick_active(settings) else 0.22
+    if sym_wr is not None and sym_wr < cold_floor:
         return PickVerdict(
             False, winner_score, f"{symbol} {side.value} cold streak wr={sym_wr:.0%} n={sym_n}",
         )
@@ -298,27 +299,66 @@ def evaluate_pick_for_symbol(
         pick = min(1.0, pick + 0.04)
 
     min_pick = getattr(settings, "pick_min_score", 0.62)
+    from quality_pick import quality_pick_active
+
+    if getattr(settings, "llm_overseer_mode", False):
+        try:
+            from llm_overseer import get_winner_adjustments, overseer_min_winner_tier, symbol_avoided
+
+            if symbol_avoided(symbol, settings.state_dir):
+                return PickVerdict(False, pick, f"overseer avoid {symbol.split('/')[0]}")
+            od = get_winner_adjustments(settings.state_dir)
+            if od.pick_min_delta > 0:
+                min_pick = max(min_pick, getattr(settings, "pick_min_score", 0.62) + od.pick_min_delta)
+            tier_rank = {"good": 0, "elite": 1, "apex": 2}
+            floor = overseer_min_winner_tier(settings.state_dir)
+            if tier_rank.get(winner_tier, 0) < tier_rank.get(floor, 0):
+                return PickVerdict(
+                    False,
+                    pick,
+                    f"overseer tier {winner_tier} < floor {floor}",
+                    fast_win=fast,
+                )
+        except Exception:
+            pass
+
+    quality_mode = quality_pick_active(settings)
     try:
         starved = is_entry_starved(settings)
     except Exception:
         starved = False
-    if starved:
-        min_pick = min(min_pick, 0.42 if hourly_3r_active(settings) else 0.48)
-    try:
-        from account_guard import universe_fill_active
+    if quality_mode:
+        wr, _pf = (0.5, 1.0)
+        try:
+            from quality_pick import live_performance
 
-        if universe_fill_active(settings):
-            min_pick = min(min_pick, 0.30)
-    except Exception:
-        pass
-    if getattr(settings, "entries_never_pause", False):
-        min_pick = min(min_pick, 0.28)
-    if getattr(decision, "confluence_zone", "") == "llm":
-        min_pick = min(min_pick, 0.45)
-    if winner_tier in ("good", "elite", "apex"):
-        min_pick = min(min_pick, max(0.28, getattr(settings, "winner_min_score", 0.55) - 0.14))
-    if winner_tier in ("elite", "apex"):
-        min_pick = min(min_pick, 0.50)
+            wr, _pf = live_performance(settings)
+        except Exception:
+            pass
+        if wr < 0.42:
+            min_pick = max(min_pick, 0.58)
+        elif wr < 0.48:
+            min_pick = max(min_pick, 0.55)
+        if winner_tier not in ("elite", "apex"):
+            min_pick = max(min_pick, 0.52)
+    else:
+        if starved:
+            min_pick = min(min_pick, 0.42 if hourly_3r_active(settings) else 0.48)
+        try:
+            from account_guard import universe_fill_active
+
+            if universe_fill_active(settings):
+                min_pick = min(min_pick, 0.30)
+        except Exception:
+            pass
+        if getattr(settings, "entries_never_pause", False):
+            min_pick = min(min_pick, 0.28)
+        if getattr(decision, "confluence_zone", "") == "llm":
+            min_pick = min(min_pick, 0.45)
+        if winner_tier in ("good", "elite", "apex"):
+            min_pick = min(min_pick, max(0.28, getattr(settings, "winner_min_score", 0.55) - 0.14))
+        if winner_tier in ("elite", "apex"):
+            min_pick = min(min_pick, 0.50)
     if pick < min_pick:
         return PickVerdict(
             False,
