@@ -1,0 +1,13 @@
+{
+  "name": "God Bot caretaker",
+  "trigger": { "type": "schedule", "cron": "*/15 * * * *", "label": "Every 15 minutes" },
+  "repository": {
+    "owner": "1bananaonthewall-ux",
+    "name": "blofin-auto-trader",
+    "branch": "main",
+    "url": "https://github.com/1bananaonthewall-ux/blofin-auto-trader"
+  },
+  "tools": ["open_pull_request", "memories"],
+  "promptFile": ".cursor/automations/god-bot-caretaker.prompt.md",
+  "notes": "Import at cursor.com/automations for cloud runs. Local: Task BlofinGodBotCaretaker + Cursor agent loop."
+}

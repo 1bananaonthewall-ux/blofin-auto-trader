@@ -1,0 +1,17 @@
+---
+description: When God Bot caretaker is due, health-check and auto-restart the stack first.
+globs:
+alwaysApply: true
+---
+
+# God Bot caretaker
+
+If `.cursor/GODBOT_CARETAKER_DUE` exists, or the user message is an `AGENT_LOOP_TICK_GODBOT_CARETAKER` / caretaker loop wake:
+
+1. Read `.cursor/skills/god-bot-caretaker/SKILL.md` and execute the full checklist.
+2. Auto-restart via `scripts/stack_control.ps1` (`ensure` or `restart-fresh`) when bot/dashboard are unhealthy — do not ask the user to restart manually.
+3. Delete `.cursor/GODBOT_CARETAKER_DUE` when finished and update `state/last_cursor_caretaker.txt`.
+
+If both `GODBOT_CARETAKER_DUE` and `STACK_REPAIR_DUE` exist, stack-repair takes precedence until `stack_repair_check.py` passes.
+
+Do not skip caretaker work for generic chat unless the user explicitly says to skip caretaker for this session.
