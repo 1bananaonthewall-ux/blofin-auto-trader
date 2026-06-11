@@ -28,6 +28,8 @@ ALLOWED_ENV: dict[str, set[str] | None] = {
     "PICK_MIN_SCORE": None,
     "LLM_COPILOT_TRADING": {"true", "false"},
     "LLM_COPILOT_STRICT": {"true", "false"},
+    "LLM_EXIT_ADVISOR": {"true", "false"},
+    "LLM_AUTOPSY_ENABLED": {"true", "false"},
     "LLM_TRADING_ENABLED": {"true", "false"},
     "MOON_SWARM_ENABLED": {"true", "false"},
     "SYMBOLS_PER_TICK": None,

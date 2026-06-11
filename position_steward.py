@@ -771,6 +771,24 @@ def manage_all_open_positions(
     harvested = harvest_all_mature(
         ex, settings, positions, registry, tracker, engine, harvest_eagerness
     )
+    try:
+        from llm_exit_advisor import maybe_advise_exits
+
+        qwen_closed = maybe_advise_exits(
+            ex,
+            settings,
+            positions,
+            registry,
+            engine,
+            tracker,
+            harvest_eagerness=harvest_eagerness,
+        )
+        if qwen_closed:
+            positions = ex.fetch_all_positions()
+            positions = enrich_positions(positions, registry)
+            harvested += qwen_closed
+    except Exception:
+        log.debug("qwen exit advisor failed", exc_info=True)
 
     if positions:
         lines = []

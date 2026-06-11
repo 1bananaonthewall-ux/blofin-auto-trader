@@ -1004,6 +1004,9 @@ def run_once(
             ml=ml,
             opens_allowed=opens_allowed,
         )
+        from llm_autopsy import maybe_run_autopsy_tick
+
+        maybe_run_autopsy_tick(settings)
     except Exception:
         log.debug("overseer tick failed", exc_info=True)
 
@@ -1539,6 +1542,16 @@ def main() -> None:
             "CORTEX COPILOT: Qwen vets top finalists with ever-learning cortex "
             "(ML/winner/pick first, then LLM approves opens | strict=%s)",
             getattr(settings, "llm_copilot_strict", True),
+        )
+    if getattr(settings, "llm_exit_advisor", False):
+        log.warning(
+            "QWEN EXIT ADVISOR: reviews open positions every %.0fs — cut losers / harvest when curve needs it",
+            getattr(settings, "llm_exit_advisor_interval_sec", 60),
+        )
+    if getattr(settings, "llm_autopsy_enabled", False):
+        log.warning(
+            "QWEN AUTOPSY: learns from recent closes every %.0fs — updates avoid/prefer",
+            getattr(settings, "llm_autopsy_interval_sec", 600),
         )
     if settings.llm_trading_enabled or getattr(settings, "llm_overseer_mode", False):
         try:

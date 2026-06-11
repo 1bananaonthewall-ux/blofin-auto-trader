@@ -222,6 +222,10 @@ class Settings:
     llm_overseer_mode: bool
     llm_copilot_trading: bool
     llm_copilot_strict: bool
+    llm_exit_advisor: bool
+    llm_exit_advisor_interval_sec: float
+    llm_autopsy_enabled: bool
+    llm_autopsy_interval_sec: float
     overseer_interval_seconds: int
     llm_policy_cache_sec: float
     momentum_wave_mode: bool
@@ -473,6 +477,16 @@ def load_settings() -> Settings:
             _env_bool("LLM_OVERSEER_MODE", False) or _env_bool("LLM_TRADING_ENABLED", True),
         ),
         llm_copilot_strict=_env_bool("LLM_COPILOT_STRICT", True),
+        llm_exit_advisor=_env_bool(
+            "LLM_EXIT_ADVISOR",
+            _env_bool("LLM_OVERSEER_MODE", False),
+        ),
+        llm_exit_advisor_interval_sec=float(os.getenv("LLM_EXIT_ADVISOR_INTERVAL_SEC", "60")),
+        llm_autopsy_enabled=_env_bool(
+            "LLM_AUTOPSY_ENABLED",
+            _env_bool("LLM_OVERSEER_MODE", False),
+        ),
+        llm_autopsy_interval_sec=float(os.getenv("LLM_AUTOPSY_INTERVAL_SEC", "600")),
         overseer_interval_seconds=int(os.getenv("OVERSEER_INTERVAL_SECONDS", "300")),
         llm_policy_cache_sec=float(os.getenv("LLM_POLICY_CACHE_SEC", "45")),
         momentum_wave_mode=_env_bool("MOMENTUM_WAVE_MODE", True),
