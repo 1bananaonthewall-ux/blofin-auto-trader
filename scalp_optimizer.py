@@ -236,7 +236,9 @@ def effective_winner_thresholds(settings: "Settings", tuning: ScalpTuning | None
     base_elite = settings.winner_elite_score
     base_apex = settings.winner_apex_score
     quality_first = getattr(settings, "optimizer_quality_first", True)
-    if getattr(settings, "hourly_3r_winner_mode", False):
+    if getattr(settings, "quality_pick_mode", True) or getattr(settings, "entries_never_pause", False):
+        quality_first = True
+    elif getattr(settings, "hourly_3r_winner_mode", False):
         quality_first = False
     cf_d = t.confluence_delta if not quality_first else max(0.0, t.confluence_delta)
     agree_d = t.agreeing_delta if not quality_first else max(0, t.agreeing_delta)
@@ -309,7 +311,7 @@ class ScalpOptimizer:
 
         self.target_max_tph = effective_hourly_tph_cap(settings)
         quality_first = getattr(settings, "optimizer_quality_first", True)
-        if getattr(settings, "quality_pick_mode", True):
+        if getattr(settings, "quality_pick_mode", True) or getattr(settings, "entries_never_pause", False):
             quality_first = True
         elif getattr(settings, "hourly_3r_winner_mode", False):
             quality_first = False
@@ -454,8 +456,10 @@ class ScalpOptimizer:
         base_gap = self.settings.scalp_entry_gap_seconds
         base_cd = float(self.settings.scalp_cooldown_minutes)
 
-        quality_first = getattr(self.settings, "quality_pick_mode", True) or (
-            getattr(self.settings, "optimizer_quality_first", True) and not self._throughput_mode
+        quality_first = (
+            getattr(self.settings, "quality_pick_mode", True)
+            or getattr(self.settings, "entries_never_pause", False)
+            or (getattr(self.settings, "optimizer_quality_first", True) and not self._throughput_mode)
         )
         flow_cf, flow_agree, flow_ml, flow_score, flow_note = self._learn_flow_adjustment()
 

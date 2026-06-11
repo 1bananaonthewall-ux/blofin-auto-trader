@@ -62,7 +62,7 @@ class TradingDoctrine:
     min_entry_gap_seconds: float = 75.0
     margin_deploy_base_pct: float = 0.08
     margin_deploy_max_pct: float = 0.28
-    max_opens_per_tick: int = 3
+    max_opens_per_tick: int = 99
     conviction_tie_abs_gap: float = 0.022
     conviction_tie_rel_gap: float = 0.035
 
@@ -565,6 +565,7 @@ class AutonomousGrowthEngine:
 
         max_opens = d.max_opens_per_tick
         if st:
+            max_opens = max(max_opens, int(st.max_opens_per_tick))
             from account_guard import effective_max_opens_per_tick
 
             max_opens = effective_max_opens_per_tick(st, equity, max_opens)
@@ -588,33 +589,34 @@ class AutonomousGrowthEngine:
                 allow_entries = allow_entries and curve.verticality > 0.45 and ai > 0.25
             elif curve.preserve_capital:
                 allow_entries = allow_entries and curve.entry_scale >= 0.4
-            if (
-                st
-                and equity > 0
-                and equity < st.small_account_threshold
-                and open_count >= max(4, st.micro_equity_max_open + 1)
-                and curve.curve_phase == "declining"
-                and curve.actual_daily_pct < -2.0
-            ):
-                allow_entries = False
-            if (
-                st
-                and equity < st.small_account_threshold
-                and open_count >= 5
-                and curve.actual_daily_pct < -3.0
-                and curve.drawdown_from_peak_pct > 8.0
-            ):
-                allow_entries = False
+            if not self._no_entry_pause():
+                if (
+                    st
+                    and equity > 0
+                    and equity < st.small_account_threshold
+                    and open_count >= max(4, st.micro_equity_max_open + 1)
+                    and curve.curve_phase == "declining"
+                    and curve.actual_daily_pct < -2.0
+                ):
+                    allow_entries = False
+                if (
+                    st
+                    and equity < st.small_account_threshold
+                    and open_count >= 5
+                    and curve.actual_daily_pct < -3.0
+                    and curve.drawdown_from_peak_pct > 8.0
+                ):
+                    allow_entries = False
             if st and equity >= st.small_account_threshold:
                 deploy_base = max(deploy_base, 0.14)
                 deploy_max = max(deploy_max, min(0.38, st.margin_use_fraction * 0.42))
-                max_opens = max(max_opens, min(5, st.max_opens_per_tick))
+                max_opens = max(max_opens, st.max_opens_per_tick)
                 entry_gap = min(entry_gap, max(25.0, gap_base * 0.55))
                 symbols_tick = max(symbols_tick, min(220, d.symbols_per_tick_base))
             if st and equity >= 100.0:
                 deploy_base = max(deploy_base, 0.18)
                 deploy_max = max(deploy_max, min(0.48, st.margin_use_fraction * 0.55))
-                max_opens = max(max_opens, min(6, st.max_opens_per_tick))
+                max_opens = max(max_opens, st.max_opens_per_tick)
                 entry_gap = min(entry_gap, 20.0)
         # Hourly 3R winner mode: fast scan, enough opens for >=1 TP win/hour at 3:1.
         if st and getattr(st, "hourly_3r_winner_mode", False):
@@ -626,29 +628,25 @@ class AutonomousGrowthEngine:
             symbols_tick = max(symbols_tick, min(240, st.symbols_per_tick))
             poll = max(5, min(poll, 8 if wins_tgt >= 3 else 10))
             entry_gap = min(entry_gap, 5.0 if wins_tgt >= 3 else 7.0)
-            max_opens = max(max_opens, min(6, st.max_opens_per_tick))
+            max_opens = max(max_opens, st.max_opens_per_tick)
             deploy_base = max(deploy_base, 0.14)
             deploy_max = max(deploy_max, 0.26)
         if st:
             from account_guard import universe_fill_active
 
             if universe_fill_active(st):
-                min_conf = min(min_conf, 0.52)
-                min_score = min(min_score, 48.0)
                 symbols_tick = max(symbols_tick, min(280, st.symbols_per_tick))
                 poll = max(5, min(poll, 8))
                 entry_gap = min(entry_gap, 4.0)
-                max_opens = max(max_opens, min(16, st.max_opens_per_tick))
+                max_opens = max(max_opens, st.max_opens_per_tick)
                 deploy_base = max(deploy_base, 0.12)
                 deploy_max = max(deploy_max, min(0.32, st.margin_use_fraction * 0.45))
         # Momentum wave mode: bias toward concurrent momentum runners and faster recycle.
         elif st and getattr(st, "momentum_wave_mode", False):
-            min_conf = min(min_conf, 0.56)
-            min_score = min(min_score, 52.0)
             symbols_tick = max(symbols_tick, min(220, st.symbols_per_tick))
             poll = max(8, min(poll, 18))
             entry_gap = min(entry_gap, 10.0)
-            max_opens = max(max_opens, min(8, st.max_opens_per_tick))
+            max_opens = max(max_opens, st.max_opens_per_tick)
             deploy_base = max(deploy_base, 0.16)
             deploy_max = max(deploy_max, 0.30)
 

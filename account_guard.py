@@ -94,8 +94,9 @@ def entry_allowed(
 
 
 def effective_max_opens_per_tick(settings: "Settings", equity: float, base: int) -> int:
+    """No artificial per-tick open cap — only margin limits fills; quality gates pick winners."""
     tick_cap = max(1, int(settings.max_opens_per_tick))
-    if universe_fill_active(settings):
-        scan_batch = max(8, min(16, int(getattr(settings, "symbols_per_tick", 120)) // 12))
-        return max(base, tick_cap, scan_batch)
-    return max(1, min(base, tick_cap))
+    scan_batch = max(tick_cap, min(99, int(getattr(settings, "symbols_per_tick", 120)) // 2))
+    if universe_fill_active(settings) or getattr(settings, "entries_never_pause", False):
+        return max(base, scan_batch)
+    return max(base, tick_cap)

@@ -1259,19 +1259,29 @@ def run_once(
                 )
         except Exception:
             log.debug("cortex copilot vet failed", exc_info=True)
+    from quality_pick import quality_pick_active
+
+    quality_first = quality_pick_active(settings) or getattr(settings, "entries_never_pause", False)
     entry_press = (
-        fill_mode
-        or starved
-        or opens_starved
-        or wins_starved
-        or (settings.winner_only_mode and getattr(settings, "entries_never_pause", False))
+        not quality_first
+        and (
+            fill_mode
+            or starved
+            or opens_starved
+            or wins_starved
+        )
     )
     mission_floor = knobs.min_confidence
     if settings.llm_trading_enabled:
         mission_floor = min(mission_floor, settings.llm_trading_min_confidence + 0.05)
-    if entry_press:
-        if settings.winner_only_mode and getattr(settings, "entries_never_pause", False):
-            mission_floor = min(mission_floor, 0.44)
+    if quality_first:
+        try:
+            from quality_pick import apply_quality_gates
+
+            mission_floor, _ = apply_quality_gates(settings, mission_floor, knobs.min_signal_score)
+        except Exception:
+            pass
+    elif entry_press:
         if wins_starved and not opens_starved:
             mission_floor = min(
                 max(mission_floor, 0.44, knobs.min_confidence * 0.78),
@@ -1302,19 +1312,29 @@ def run_once(
         )
     else:
         allow_apex_fallback = (
-            (tp.allow_elite_fallback if tp else starved)
-            or not settings.winner_apex_preferred
-            or entry_press
+            not quality_first
+            and (
+                (tp.allow_elite_fallback if tp else starved)
+                or not settings.winner_apex_preferred
+                or entry_press
+            )
         )
         elite = select_conviction_ties(
             ranked,
             max_opens=per_tick,
             min_conviction=mission_floor,
             apex_preferred=settings.winner_apex_preferred and not entry_press,
-            elite_only=settings.winner_elite_only and not entry_press,
+            elite_only=settings.winner_elite_only,
             allow_elite_fallback=allow_apex_fallback,
         )
-    if not use_confluence_core and not elite and ranked and entry_press and settings.winner_only_mode:
+    if (
+        not use_confluence_core
+        and not elite
+        and ranked
+        and entry_press
+        and settings.winner_only_mode
+        and not quality_first
+    ):
         from scalp_optimizer import micro_tune_for_flow
 
         top = ranked[0]

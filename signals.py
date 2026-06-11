@@ -297,7 +297,7 @@ def analyze_symbol(
 
     opens_starved = hourly_3r_active(settings) and is_opens_starved(settings)
     entry_starved = hourly_3r_active(settings) and is_entry_starved(settings)
-    throughput_relax = opens_starved or entry_starved
+    throughput_relax = not quality_first and (opens_starved or entry_starved)
     min_confluence = 0.48 if throughput_relax else 0.52
     min_agreeing = 4 if throughput_relax else 5
 
@@ -352,7 +352,7 @@ def analyze_symbol(
             elif mk_snap.state == "stress":
                 stress_conf = settings.markov_confidence_penalty_stress
                 stress_score = 3.0
-                if hourly_3r_active(settings) and is_opens_starved(settings):
+                if not quality_first and hourly_3r_active(settings) and is_opens_starved(settings):
                     stress_conf *= 0.45
                     stress_score *= 0.5
                 conf_gate = min(0.96, conf_gate + stress_conf)
@@ -442,14 +442,14 @@ def analyze_symbol(
     try:
         from quality_pick import apply_quality_gates, quality_pick_active
 
-        if quality_pick_active(settings):
+        if quality_pick_active(settings) or getattr(settings, "entries_never_pause", False):
             post_conf_gate, post_score_gate = apply_quality_gates(
                 settings, post_conf_gate, post_score_gate
             )
         else:
             from account_guard import universe_fill_active
 
-            if universe_fill_active(settings) or getattr(settings, "entries_never_pause", False):
+            if universe_fill_active(settings):
                 micro = equity is not None and equity > 0 and equity < settings.micro_equity_threshold
                 if micro:
                     post_conf_gate = min(post_conf_gate, 0.52)
@@ -457,9 +457,6 @@ def analyze_symbol(
                 elif hourly_3r_active(settings) and is_opens_starved(settings):
                     post_conf_gate = min(post_conf_gate, 0.52)
                     post_score_gate = min(post_score_gate, 52.0)
-                elif getattr(settings, "entries_never_pause", False):
-                    post_conf_gate = min(post_conf_gate, 0.52)
-                    post_score_gate = min(post_score_gate, 50.0)
     except Exception:
         pass
 

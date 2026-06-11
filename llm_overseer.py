@@ -296,16 +296,17 @@ def _qwen_caretaker_prompt() -> str:
         "execute entries; YOU supervise, tune, veto symbols, patch config, and run repairs. "
         "Your cortex learns from every close — use hot/cold symbols and loss_streak. "
         "MISSION: steep vertical account curve; more winners; cut loser strings fast. "
-        "On loss_streak>=3 or win_rate_1h<0.42: quality mode, elite tier, avoid cold symbols, "
-        "consider ENTRIES_PAUSED=true briefly (15–30 min) only if streak>=5 and PF<0.9. "
-        "When healthy (WR>=0.50, PF>=1.1, streak<2): loosen slightly if flow_starved. "
+        "NEVER limit open count or pause entries for throughput — margin is the only cap. "
+        "On loss_streak>=2 or win_rate_1h<0.45: quality mode, elite tier, avoid cold symbols, "
+        "raise pick_min_delta — never ENTRIES_PAUSED, never loosen gates for flow_starved. "
+        "When healthy: keep quality bar; prefer more winners not more junk. "
         "Keep bot RUNNING CLEAN: clear false pauses, enable ML_CONTINUOUS_TRAIN if ml_not_ready, "
         "repair TP/SL if tpsl_repair blocker, stack_ensure if dashboard/bot stale. "
         "Never enable LLM_ONLY_TRADING. "
         "Return ONLY JSON: "
         '{"conf_delta":float,"score_delta":float,"pick_min_delta":float,'
         '"prefer":["SYM"],"avoid":["SYM"],'
-        '"ml_mode":"quality|throughput|neutral","winner_tier_floor":"good|elite|apex",'
+        '"ml_mode":"quality|neutral","winner_tier_floor":"good|elite|apex",'
         '"elite_only":bool,'
         '"env_fixes":{"KEY":"value"},'
         '"actions":["cortex_train"|"repair_tpsl"|"stack_ensure"|"clear_pause"|"curve_repair"|"ml_refit"],'
@@ -470,11 +471,8 @@ def _deterministic_fixes(blockers: dict[str, Any], settings: Any) -> dict[str, s
 
     if "flow_starved" in issue_ids or "llm_approvals_no_fills" in issue_ids:
         fixes["OPTIMIZER_AUTOCODE_ENABLED"] = "true"
-        cur = int(getattr(settings, "symbols_per_tick", 120))
-        fixes["SYMBOLS_PER_TICK"] = str(min(200, max(cur, 120)))
-        tph = int(getattr(settings, "optimizer_target_min_tph", 4))
-        if tph < 4:
-            fixes["OPTIMIZER_TARGET_MIN_TPH"] = "4"
+        fixes["QUALITY_PICK_MODE"] = "true"
+        fixes["ENTRIES_PAUSED"] = "false"
 
     if "ml_not_ready" in issue_ids:
         fixes["ML_CONTINUOUS_TRAIN"] = "true"
@@ -673,11 +671,7 @@ def run_overseer_cycle(
         try:
             from optimizer_autocode import maybe_apply_autocode
 
-            action = (
-                "loosen_throughput"
-                if d.ml_mode == "throughput"
-                else ("tighten_quality" if d.ml_mode == "quality" else "steady")
-            )
+            action = "tighten_quality" if d.ml_mode == "quality" else "steady"
             maybe_apply_autocode(
                 state_dir,
                 enabled=getattr(settings, "optimizer_autocode_enabled", True),

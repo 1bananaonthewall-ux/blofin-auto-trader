@@ -235,7 +235,14 @@ def evaluate_pick_for_symbol(
     from account_guard import universe_fill_active
 
     universe = universe_fill_active(settings)
-    if starved_3r or universe:
+    never_loosen = getattr(settings, "entries_never_pause", False)
+    try:
+        from quality_pick import quality_pick_active
+
+        never_loosen = never_loosen or quality_pick_active(settings)
+    except Exception:
+        pass
+    if not never_loosen and (starved_3r or universe):
         hard_opp += 0.14
     if opp_ratio > hard_opp:
         return PickVerdict(False, winner_score, f"opposition {opp_ratio:.0%} overwhelming")
@@ -251,14 +258,14 @@ def evaluate_pick_for_symbol(
         min_run = getattr(settings, "runner_min_score", 0.48)
         is_runner = getattr(cf, "is_runner", False) or getattr(cf, "run_score", 0.5) >= min_run + 0.04
         if getattr(cf, "is_choppy", False) or (chop >= max_chop and path_eff < min_path):
-            if not starved_3r and not (runner_priority and is_runner):
+            if not (starved_3r and not never_loosen) and not (runner_priority and is_runner):
                 return PickVerdict(
                     False,
                     winner_score,
                     f"choppy {chop:.0%} path={path_eff:.0%} — need directional runner",
                 )
         if getattr(cf, "run_score", 0.5) < min_run - 0.14 and path_eff < min_path - 0.04:
-            if not starved_3r:
+            if not (starved_3r and not never_loosen):
                 return PickVerdict(
                     False,
                     winner_score,
@@ -270,8 +277,8 @@ def evaluate_pick_for_symbol(
             winner_tier in ("good", "elite", "apex")
             and len(cf.opposing) <= 3
             and (
-                starved_3r
-                or universe
+                (starved_3r and not never_loosen)
+                or (universe and not never_loosen)
                 or len(cf.agreeing) >= 4
                 or winner_score >= getattr(settings, "winner_min_score", 0.55) - 0.04
                 or winner_tier in ("elite", "apex")
@@ -281,7 +288,7 @@ def evaluate_pick_for_symbol(
             return PickVerdict(False, winner_score, f"RSI exhausted ({decision.rsi:.0f})")
 
     sym_wr, sym_n = _recent_side_edge(settings.state_dir, symbol, side.value)
-    cold_floor = 0.30 if quality_pick_active(settings) else 0.22
+    cold_floor = 0.30 if never_loosen else 0.22
     if sym_wr is not None and sym_wr < cold_floor:
         return PickVerdict(
             False, winner_score, f"{symbol} {side.value} cold streak wr={sym_wr:.0%} n={sym_n}",
@@ -327,7 +334,8 @@ def evaluate_pick_for_symbol(
         starved = is_entry_starved(settings)
     except Exception:
         starved = False
-    if quality_mode:
+    never_loosen = quality_mode or getattr(settings, "entries_never_pause", False)
+    if never_loosen:
         wr, _pf = (0.5, 1.0)
         try:
             from quality_pick import live_performance
@@ -341,24 +349,8 @@ def evaluate_pick_for_symbol(
             min_pick = max(min_pick, 0.55)
         if winner_tier not in ("elite", "apex"):
             min_pick = max(min_pick, 0.52)
-    else:
-        if starved:
-            min_pick = min(min_pick, 0.42 if hourly_3r_active(settings) else 0.48)
-        try:
-            from account_guard import universe_fill_active
-
-            if universe_fill_active(settings):
-                min_pick = min(min_pick, 0.30)
-        except Exception:
-            pass
-        if getattr(settings, "entries_never_pause", False):
-            min_pick = min(min_pick, 0.28)
-        if getattr(decision, "confluence_zone", "") == "llm":
-            min_pick = min(min_pick, 0.45)
-        if winner_tier in ("good", "elite", "apex"):
-            min_pick = min(min_pick, max(0.28, getattr(settings, "winner_min_score", 0.55) - 0.14))
-        if winner_tier in ("elite", "apex"):
-            min_pick = min(min_pick, 0.50)
+    elif starved:
+        min_pick = min(min_pick, 0.42 if hourly_3r_active(settings) else 0.48)
     if pick < min_pick:
         return PickVerdict(
             False,

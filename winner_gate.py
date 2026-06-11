@@ -93,11 +93,11 @@ def evaluate_winner(
     from account_guard import universe_fill_active
 
     universe = universe_fill_active(settings)
-    abundant = universe or getattr(settings, "entries_never_pause", False)
     h3r = hourly_3r_active(settings)
     from quality_pick import quality_pick_active
 
-    if not quality_pick_active(settings) and (starved or abundant):
+    # Never loosen winner bar for throughput — only quality_pick tightens when WR is weak.
+    if not quality_pick_active(settings) and starved and not getattr(settings, "entries_never_pause", False):
         relax = 0.10 if h3r else (0.08 if universe else 0.06)
         vol_floor = 0.06 if (starved and h3r) else 0.18
         thr = EffectiveWinnerThresholds(
