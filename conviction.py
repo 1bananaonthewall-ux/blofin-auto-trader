@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from strategy import StrategyDecision
 
@@ -21,7 +21,7 @@ class RankedSetup:
     score: float
 
 
-def conviction_score(decision: StrategyDecision, path_reliability: float) -> float:
+def conviction_score(decision: StrategyDecision, path_reliability: float, *, weak_wr_blend: bool = False) -> float:
     """Higher = stronger edge — driven by TA confluence + ML + path reliability."""
     conf = getattr(decision, "model_confidence", 0.0) or (decision.score / 100.0)
     cf = getattr(decision, "confluence_score", 0.0) or conf
@@ -67,6 +67,19 @@ def conviction_score(decision: StrategyDecision, path_reliability: float) -> flo
         conv = min(1.0, conv * (1.0 + 0.04 * (run_s - 0.5)))
     elif run_s < 0.38:
         conv *= 0.90
+    fast_w = float(getattr(decision, "fast_win_score", 0.0) or 0.0)
+    if fast_w >= 0.55:
+        conv = min(1.0, conv + (fast_w - 0.50) * 0.18)
+    ml_edge = float(getattr(decision, "ml_edge", 0.0) or 0.0)
+    if ml_edge > 0.08:
+        conv = min(1.0, conv + ml_edge * 0.14)
+    if ps >= 0.62:
+        conv = min(1.0, max(conv, ps * 0.97))
+    if weak_wr_blend:
+        fast_w = float(getattr(decision, "fast_win_score", 0.0) or 0.0)
+        ml_edge = float(getattr(decision, "ml_edge", 0.0) or 0.0)
+        blend = 0.45 * ps + 0.35 * fast_w + 0.20 * max(0.0, ml_edge)
+        conv = max(conv, min(1.0, blend))
     return conv
 
 
@@ -93,11 +106,20 @@ def rank_setups(
     path_reliability: float,
     *,
     mission_scale: Callable[[float], float] | None = None,
+    settings: Any | None = None,
 ) -> list[RankedSetup]:
     ranked: list[RankedSetup] = []
+    weak_blend = False
+    if settings is not None:
+        try:
+            from winner_intel import optimizer_loosen_frozen
+
+            weak_blend = optimizer_loosen_frozen(settings)
+        except Exception:
+            pass
     for sym, dec in candidates:
         conf = getattr(dec, "model_confidence", 0.0) or (dec.score / 100.0)
-        conv = conviction_score(dec, path_reliability)
+        conv = conviction_score(dec, path_reliability, weak_wr_blend=weak_blend)
         if mission_scale:
             conv = mission_scale(conv)
         ranked.append(
@@ -108,9 +130,11 @@ def rank_setups(
         runner_flag = 1 if getattr(dec, "is_runner", False) else 0
         run_s = float(getattr(dec, "run_score", 0.0) or 0.0)
         return (
+            getattr(dec, "pick_score", 0.0),
+            getattr(dec, "fast_win_score", 0.0),
+            float(getattr(dec, "ml_edge", 0.0) or 0.0),
             runner_flag,
             run_s,
-            getattr(dec, "pick_score", 0.0),
             getattr(dec, "winner_score", 0.0),
             r.conviction,
             r.confidence,

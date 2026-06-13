@@ -38,6 +38,9 @@ class PositionRegistry:
         margin_usdt: float | None = None,
         contracts: float | None = None,
         trade_style: str | None = None,
+        is_probe: bool = False,
+        full_contracts: float | None = None,
+        path_efficiency: float | None = None,
     ) -> None:
         row: dict[str, Any] = {
             "opened_at": time.time(),
@@ -54,7 +57,23 @@ class PositionRegistry:
             row["margin_usdt"] = round(float(margin_usdt), 6)
         if contracts is not None and contracts > 0:
             row["contracts"] = float(contracts)
+        if is_probe:
+            row["is_probe"] = True
+            row["probe_state"] = "pending"
+            row["full_contracts"] = float(full_contracts or contracts or 0)
+        if path_efficiency is not None:
+            row["path_efficiency"] = float(path_efficiency)
         self._data[symbol] = row
+        self._save()
+
+    def update_probe(self, symbol: str, *, state: str, contracts: float | None = None) -> None:
+        row = self._data.get(symbol)
+        if not row:
+            return
+        row["probe_state"] = state
+        if contracts is not None:
+            row["contracts"] = float(contracts)
+        row["is_probe"] = state not in ("confirmed", "failed", "scaled")
         self._save()
 
     def update_tpsl(

@@ -170,6 +170,14 @@ def _apply_tuning_nudge(
     opt = ScalpOptimizer(state_dir, settings)
     t = opt.tuning
     step = 0.012 if severity == "mild" else 0.022
+    try:
+        from winner_intel import optimizer_loosen_frozen
+
+        if optimizer_loosen_frozen(settings):
+            actions.append("throughput_nudge_skipped_quality_freeze")
+            return
+    except Exception:
+        pass
 
     t.confluence_delta = max(-0.12, t.confluence_delta - step)
     t.agreeing_delta = max(-3, t.agreeing_delta - (1 if severity != "mild" else 0))

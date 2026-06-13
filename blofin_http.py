@@ -19,6 +19,22 @@ from api_backoff import RateLimitPaused, parse_retry_after, register_429
 
 log = logging.getLogger(__name__)
 
+
+def normalize_order_row(result):
+    if isinstance(result, list) and result:
+        row = result[0]
+        return row if isinstance(row, dict) else {"orderId": row}
+    if isinstance(result, dict):
+        return result
+    return {"orderId": result}
+
+
+def extract_order_id(result) -> str:
+    row = normalize_order_row(result)
+    oid = row.get("orderId") or row.get("ordId") or row.get("id")
+    return str(oid or "").strip()
+
+
 BASE_URL = "https://openapi.blofin.com"
 DEMO_URL = "https://demo-trading-openapi.blofin.com"
 
@@ -317,7 +333,7 @@ class BlofinHttp:
 
     def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
         result = self.request("POST", "/api/v1/trade/order", body=body)
-        return result if isinstance(result, dict) else {"orderId": result}
+        return normalize_order_row(result)
 
     def close_position(
         self,

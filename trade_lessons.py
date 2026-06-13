@@ -34,6 +34,9 @@ LESSON_TAGS = (
     "ml_refit",
     "funding_headwind",
     "stress_caution",
+    "punish_chase",
+    "punish_wide_spread",
+    "punish_bad_session",
 )
 
 
@@ -205,6 +208,14 @@ def analyze_close(record: dict[str, Any]) -> TradeLesson:
             tags.append("punish_symbol")
         if "sl" in reason.lower():
             negative.append("stop_hit")
+        chase = float(record.get("vwap_distance_pct") or record.get("chase_pct") or 0)
+        if abs(chase) > 0.012:
+            negative.append(f"chase_entry {chase:.2%}")
+            tags.append("punish_chase")
+        spread = float(record.get("spread_pct") or record.get("book_spread_pct") or 0)
+        if spread > 0.0012:
+            negative.append(f"wide_spread {spread:.3%}")
+            tags.append("punish_wide_spread")
         if curve in ("declining", "stress"):
             negative.append(f"curve_{curve}")
             tags.append("stress_caution")
@@ -342,6 +353,12 @@ def apply_lesson(settings: "Settings", record: dict[str, Any], lesson: TradeLess
         pb = active.setdefault("pattern_blocks", {})
         key = f"choppy:{lesson.symbol}"
         pb[key] = {"until": time.time() + 2400.0, "reason": "choppy_loss"}
+    if lesson.outcome == "loss" and "punish_chase" in lesson.tags:
+        pb = active.setdefault("pattern_blocks", {})
+        pb["chase"] = {"until": time.time() + 1800.0, "reason": "chase_loss"}
+    if lesson.outcome == "loss" and "punish_wide_spread" in lesson.tags:
+        pb = active.setdefault("pattern_blocks", {})
+        pb["spread"] = {"until": time.time() + 1200.0, "reason": "wide_spread_loss"}
 
     min_new = int(getattr(settings, "trade_lesson_ml_refit_every", 2))
     active["closes_since_refit"] = int(active.get("closes_since_refit", 0)) + 1
@@ -416,6 +433,8 @@ def entry_blocked_by_lessons(
     *,
     run_label: str = "",
     is_choppy: bool = False,
+    chase_pct: float = 0.0,
+    spread_pct: float = 0.0,
 ) -> tuple[bool, str]:
     if not getattr(settings, "trade_lessons_enabled", True):
         return False, ""
@@ -425,6 +444,15 @@ def entry_blocked_by_lessons(
     ok, reason = pattern_blocked(settings, symbol, run_label=run_label, is_choppy=is_choppy)
     if ok:
         return True, f"lesson pattern: {reason}"
+    active = _load_active(settings.state_dir)
+    now = time.time()
+    for key, block in (active.get("pattern_blocks") or {}).items():
+        if float(block.get("until", 0)) <= now:
+            continue
+        if key == "chase" and abs(chase_pct) > 0.008:
+            return True, str(block.get("reason") or "chase lesson block")
+        if key == "spread" and spread_pct > 0.001:
+            return True, str(block.get("reason") or "spread lesson block")
     return False, ""
 
 

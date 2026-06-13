@@ -496,6 +496,194 @@ def ensure_sltp_on_all(
     return fixed
 
 
+def cut_declining_losers(
+    ex: "BlofinExchange",
+    settings: "Settings",
+    positions: dict,
+    registry: PositionRegistry,
+    engine: "AutonomousGrowthEngine",
+    tracker: "TradeOutcomeTracker | None",
+) -> int:
+    """Deterministic loser cuts when account curve is declining — no LLM required."""
+    curve = getattr(engine, "_last_curve", None)
+    phase = str(getattr(curve, "curve_phase", "") or "").lower() if curve else ""
+    if phase != "declining":
+        return 0
+    from position_rotator import RotationAction, execute_rotation
+
+    closed = 0
+    now = time.time()
+    for sym in list(positions.keys()):
+        pos = positions.get(sym)
+        if not pos:
+            continue
+        meta = registry.get(sym) or {}
+        entry = float(pos.get("entry_price") or meta.get("entry_price") or 0)
+        if entry <= 0:
+            continue
+        side = str(pos.get("side") or meta.get("side") or "long")
+        last = (ex.stream.get_last_price(sym) if ex.stream else None) or entry
+        lev = int(meta.get("leverage") or settings.scalp_leverage if settings.scalp_mode else settings.leverage)
+        gross = (last - entry) / entry if side == "long" else (entry - last) / entry
+        roe = gross * max(1, lev) * 100.0
+        opened = float(meta.get("opened_at") or 0)
+        age_min = (now - opened) / 60.0 if opened else 0.0
+        if roe > -8.0 or age_min < 2.0:
+            continue
+        rot = RotationAction(
+            symbol=sym,
+            action="harvest",
+            reason=f"declining_curve_cut roe={roe:.1f}% age={age_min:.0f}m",
+            pnl_after_fees_usd=0.0,
+        )
+        margin = float(meta.get("margin_usdt") or pos.get("margin") or 0)
+        est_pnl = margin * roe / 100.0 if margin > 0 else 0.0
+        if execute_rotation(ex, rot, positions, registry, settings.dry_run, tracker):
+            engine.record_closed_trade(
+                sym,
+                est_pnl,
+                side=side,
+                event="declining_cut",
+                roe_pct=roe,
+                entry=entry,
+                leverage=lev or None,
+            )
+            positions.pop(sym, None)
+            closed += 1
+            log.warning(
+                "DECLINING CUT %s %s roe=%.1f%% — protect micro curve",
+                str(pos.get("symbol") or sym).split("/")[0],
+                side,
+                roe,
+            )
+    return closed
+
+
+
+
+def _position_roe_pct(side: str, entry: float, last: float, leverage: int = 10) -> float:
+    gross = _gross_pnl_pct(side, entry, last)
+    return gross * leverage * 100.0
+
+
+def manage_probe_positions(
+    ex: "BlofinExchange",
+    settings: "Settings",
+    positions: dict,
+    registry: PositionRegistry,
+    engine: "AutonomousGrowthEngine",
+    tracker: "TradeOutcomeTracker | None",
+) -> int:
+    """Scale probe entries up on confirmation or cut fast on failure."""
+    changed = 0
+    for sym, pos in list(positions.items()):
+        meta = registry.get(sym) or {}
+        if not meta.get("is_probe") or meta.get("probe_state") not in ("pending", None):
+            continue
+        opened = float(meta.get("opened_at") or 0)
+        age = time.time() - opened if opened else 0
+        if age < 55:
+            continue
+        trade_sym = str(pos.get("symbol") or sym).split("#")[0]
+        side = str(pos.get("side") or "")
+        entry = float(pos.get("entry_price") or 0)
+        last = (ex.stream.get_last_price(trade_sym) if ex.stream else None) or entry
+        lev = int(pos.get("leverage") or meta.get("leverage") or settings.leverage)
+        roe = _position_roe_pct(side, entry, last, lev)
+        full = float(meta.get("full_contracts") or 0)
+        cur = float(pos.get("contracts") or meta.get("contracts") or 0)
+        if roe <= -1.0 and age >= 60:
+            try:
+                ex.close_position(trade_sym, pos, dry_run=False)
+                registry.update_probe(trade_sym, state="failed")
+                registry.remove(trade_sym)
+                positions.pop(sym, None)
+                changed += 1
+                log.info("PROBE FAIL-CUT %s roe=%.1f%%", trade_sym.split("/")[0], roe)
+            except Exception:
+                log.debug("probe fail-cut error", exc_info=True)
+            continue
+        if roe >= 0.3 and full > cur and age >= 75:
+            add = max(0.0, full - cur)
+            market = ex.market_for(trade_sym)
+            min_sz = market.min_size if market else 0.01
+            if add >= min_sz:
+                try:
+                    ex.open_position(
+                        trade_sym, side, add,
+                        stop_pct=float(meta.get("stop_pct") or 0.012),
+                        take_pct=float(meta.get("take_pct") or 0.036),
+                        dry_run=settings.dry_run,
+                        leverage=lev,
+                        try_maker=False,
+                    )
+                    registry.update_probe(trade_sym, state="scaled", contracts=full)
+                    changed += 1
+                    log.info("PROBE SCALE-UP %s +%.4f roe=%.1f%%", trade_sym.split("/")[0], add, roe)
+                except Exception:
+                    log.debug("probe scale-up error", exc_info=True)
+    return changed
+
+
+def manage_smart_exits(
+    ex: "BlofinExchange",
+    settings: "Settings",
+    positions: dict,
+    registry: PositionRegistry,
+    engine: "AutonomousGrowthEngine",
+    tracker: "TradeOutcomeTracker | None",
+) -> int:
+    """Breakeven stop move, chop exit, partial TP at 1R."""
+    closed = 0
+    for sym, pos in list(positions.items()):
+        meta = registry.get(sym) or {}
+        trade_sym = str(pos.get("symbol") or sym).split("#")[0]
+        side = str(pos.get("side") or "")
+        entry = float(pos.get("entry_price") or 0)
+        if entry <= 0:
+            continue
+        last = (ex.stream.get_last_price(trade_sym) if ex.stream else None) or entry
+        lev = int(pos.get("leverage") or meta.get("leverage") or settings.leverage)
+        roe = _position_roe_pct(side, entry, last, lev)
+        opened = float(meta.get("opened_at") or 0)
+        age = time.time() - opened if opened else 0
+        stop_pct = float(meta.get("stop_pct") or pos.get("stop_pct") or 0.012)
+        one_r_roe = stop_pct * lev * 100.0
+
+        if age >= 90 and roe >= 1.2 and not meta.get("breakeven_moved"):
+            meta["breakeven_moved"] = True
+            registry._data[trade_sym] = meta
+            registry._save()
+            log.info("BREAKEVEN armed %s roe=%.1f%%", trade_sym.split("/")[0], roe)
+
+        path_eff = float(meta.get("path_efficiency") or pos.get("path_efficiency") or 0.5)
+        if age >= 120 and roe < 0 and path_eff < 0.25:
+            try:
+                ex.close_position(trade_sym, pos, dry_run=False)
+                registry.remove(trade_sym)
+                positions.pop(sym, None)
+                closed += 1
+                log.info("CHOP EXIT %s path=%.0f%% roe=%.1f%%", trade_sym.split("/")[0], path_eff * 100, roe)
+            except Exception:
+                pass
+            continue
+
+        if not meta.get("partial_tp_done") and roe >= one_r_roe * 0.95 and one_r_roe > 0:
+            contracts = float(pos.get("contracts") or 0)
+            market = ex.market_for(trade_sym)
+            min_sz = market.min_size if market else 0.01
+            close_sz = max(min_sz, contracts * 0.4)
+            if contracts > close_sz + min_sz * 0.5:
+                try:
+                    ex.close_position(trade_sym, pos, dry_run=settings.dry_run, size=close_sz)
+                    meta["partial_tp_done"] = True
+                    registry._data[trade_sym] = meta
+                    registry._save()
+                    log.info("PARTIAL TP 1R %s closed %.0f%% roe=%.1f%%", trade_sym.split("/")[0], 40, roe)
+                except Exception:
+                    log.debug("partial tp failed", exc_info=True)
+    return closed
+
 def harvest_all_mature(
     ex: "BlofinExchange",
     settings: "Settings",
@@ -768,9 +956,18 @@ def manage_all_open_positions(
     if close_trigger_breached(ex, settings, positions, registry, engine, tracker):
         positions = ex.fetch_all_positions()
         positions = enrich_positions(positions, registry)
+    manage_probe_positions(ex, settings, positions, registry, engine, tracker)
+    smart_closed = manage_smart_exits(ex, settings, positions, registry, engine, tracker)
+    if smart_closed:
+        positions = ex.fetch_all_positions()
+        positions = enrich_positions(positions, registry)
     harvested = harvest_all_mature(
         ex, settings, positions, registry, tracker, engine, harvest_eagerness
     )
+    curve_cuts = cut_declining_losers(ex, settings, positions, registry, engine, tracker)
+    if curve_cuts:
+        positions = ex.fetch_all_positions()
+        positions = enrich_positions(positions, registry)
     try:
         from llm_exit_advisor import maybe_advise_exits
 

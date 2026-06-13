@@ -110,6 +110,36 @@ def symbol_entry_blocked(settings: "Settings", symbol: str) -> tuple[bool, str]:
     return False, ""
 
 
+
+
+def choppy_side_blocked(settings: "Settings", symbol: str, side: str) -> tuple[bool, str]:
+    """Block symbol/side after repeated choppy-entry losses."""
+    if not quality_pick_active(settings):
+        return False, ""
+    try:
+        from roe_learning import get_roe_store
+
+        store = get_roe_store(settings.state_dir)
+        side_key = str(side).lower()
+        recent = [
+            r
+            for r in (store._data.get("global", {}).get("recent") or [])
+            if str(r.get("symbol") or "") == symbol
+            and str(r.get("side") or "").lower() == side_key
+        ][-4:]
+    except Exception:
+        return False, ""
+    if len(recent) < 2:
+        return False, ""
+    chop_losses = sum(
+        1
+        for r in recent
+        if float(r.get("roe_pct") or 0) < 0 and abs(float(r.get("roe_pct") or 0)) >= 12.0
+    )
+    if chop_losses >= 2:
+        return True, f"{side_key} on {symbol.split('/')[0]} repeated chop losses"
+    return False, ""
+
 def entry_blocked_by_live_roe(
     settings: "Settings",
     symbol: str,
@@ -135,6 +165,21 @@ def entry_blocked_by_live_roe(
     blocked, reason = symbol_entry_blocked(settings, symbol)
     if blocked:
         return True, reason
+
+    chop_blocked, chop_reason = choppy_side_blocked(settings, symbol, side)
+    if chop_blocked:
+        return True, chop_reason
+
+    try:
+        from forward_pick import symbol_forward_blocked
+
+        fwd_blocked, fwd_reason = symbol_forward_blocked(
+            settings.state_dir, symbol, str(side).lower()
+        )
+        if fwd_blocked:
+            return True, fwd_reason
+    except Exception:
+        pass
 
     side_key = str(side).lower()
     recent = [

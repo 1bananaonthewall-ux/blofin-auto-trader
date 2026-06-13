@@ -46,6 +46,8 @@ class MLPredictor:
 
         self.meta_path = state_dir / "signal_model_meta.json"
 
+        self.state_dir = state_dir
+
         self.min_confidence = min_confidence
 
         self.min_score = min_score
@@ -326,6 +328,12 @@ class MLPredictor:
 
         p_short = float(proba[1]) if len(proba) > 1 else 0.0
 
+        try:
+            from ml.calibration import calibrate_pair
+
+            p_long, p_short = calibrate_pair(p_long, p_short, self.state_dir)
+        except Exception:
+            pass
         return p_long, p_short
 
 

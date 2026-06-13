@@ -200,6 +200,20 @@ class BlofinMarketStream:
         except (TypeError, ValueError):
             return None
 
+    def get_spread_pct(self, symbol: str) -> float:
+        row = self.get_ticker(symbol)
+        if not row:
+            return 0.0
+        try:
+            bid = float(row.get("bidPrice") or row.get("bid") or 0)
+            ask = float(row.get("askPrice") or row.get("ask") or 0)
+            if bid > 0 and ask > 0 and ask >= bid:
+                mid = (bid + ask) / 2.0
+                return (ask - bid) / mid if mid > 0 else 0.0
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
     def get_ticker(self, symbol: str) -> dict[str, Any] | None:
         iid = symbol_to_inst_id(symbol)
         with self._lock:

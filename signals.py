@@ -218,6 +218,8 @@ def analyze_symbol(
             return None
     ohlcv_1m = ex.fetch_ohlcv(symbol, "1m", 100)
     ohlcv_5m = ex.fetch_ohlcv(symbol, "5m", 50)
+    ohlcv_15m = ex.fetch_ohlcv(symbol, "15m", 40)
+    ohlcv_1h = ex.fetch_ohlcv(symbol, "1H", 30)
     funding = ex.fetch_funding_rate(symbol)
 
     if getattr(settings, "llm_only_trading", False) and not getattr(
@@ -301,9 +303,21 @@ def analyze_symbol(
     min_confluence = 0.48 if throughput_relax else 0.52
     min_agreeing = 4 if throughput_relax else 5
 
+    book_spread = 0.0
+    try:
+        from winner_intel import book_spread_pct
+
+        book_spread = book_spread_pct(ex, symbol)
+    except Exception:
+        pass
+    settings._entry_ohlcv_1m = ohlcv_1m
+
     cf = run_all_analyses(
         ohlcv_1m,
         ohlcv_5m,
+        ohlcv_15m=ohlcv_15m,
+        ohlcv_1h=ohlcv_1h,
+        book_spread_pct=book_spread,
         funding_rate=funding,
         ml_decision=ml_decision,
         min_confluence_score=min_confluence,
@@ -627,6 +641,15 @@ def analyze_symbol(
     decision.winner_score = max(verdict.score, pick.score)
     decision.pick_score = pick.score
     decision.fast_win_score = pick.fast_win
+    decision.p_long = float(getattr(ml_ctx, "p_long", 0.0) or 0.0)
+    decision.p_short = float(getattr(ml_ctx, "p_short", 0.0) or 0.0)
+    decision.regime = str(getattr(cf, "regime", "") or "")
+    try:
+        from forward_pick import ml_direction_edge
+
+        decision.ml_edge = ml_direction_edge(ml_ctx, decision.signal)
+    except Exception:
+        decision.ml_edge = 0.0
 
     log.info(
         "CONFLUENCE %s %s score=%.0f conf=%.2f cf=%.0f%% run=%s %.0f%% path=%.0f%% "

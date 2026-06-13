@@ -79,6 +79,8 @@ def evaluate_winner(
                 side.value if hasattr(side, "value") else str(side),
                 run_label=str(getattr(cf, "run_label", "") or ""),
                 is_choppy=bool(getattr(cf, "is_choppy", False)),
+                chase_pct=float(getattr(cf, "vwap_distance_pct", 0.0) or 0.0),
+                spread_pct=float(getattr(cf, "spread_pct", 0.0) or getattr(cf, "book_spread_pct", 0.0) or 0.0),
             )
             if blocked:
                 return WinnerVerdict(False, "reject", 0.0, reason)
@@ -219,6 +221,17 @@ def evaluate_winner(
             cf.chop_index >= getattr(settings, "runner_max_chop", 0.56)
             and cf.path_efficiency < getattr(settings, "runner_min_path_eff", 0.26) + 0.04
         )
+        try:
+            from quality_pick import quality_pick_active
+
+            if quality_pick_active(settings):
+                chop_cap = min(getattr(settings, "runner_max_chop", 0.56), 0.50)
+                is_choppy = is_choppy or (
+                    cf.chop_index >= chop_cap
+                    and cf.path_efficiency < getattr(settings, "runner_min_path_eff", 0.26) + 0.08
+                )
+        except Exception:
+            pass
         min_run = getattr(settings, "runner_min_score", 0.48)
         is_runner = getattr(cf, "is_runner", False) or getattr(cf, "run_score", 0.5) >= min_run
         if is_choppy and not is_runner:

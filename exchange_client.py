@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import api_backoff
 from api_backoff import RateLimitPaused
-from blofin_http import BlofinHttp
+from blofin_http import BlofinHttp, extract_order_id
 from config import Settings
 from liquidation_guard import (
     effective_leverage,
@@ -817,6 +817,7 @@ class BlofinExchange:
         take_pct: float,
         dry_run: bool,
         leverage: int | None = None,
+        try_maker: bool = False,
     ) -> dict[str, Any] | None:
         """Market entry with SL/TP attached on the same order (exchange-managed exits)."""
         market = self.market_for(symbol)
@@ -863,6 +864,26 @@ class BlofinExchange:
             margin_mode,
             dry_run,
         )
+        if try_maker and not dry_run and price > 0:
+            maker_fill = self._enter_maker_then_market(
+                inst_id=inst_id,
+                symbol=symbol,
+                side=side,
+                contracts=size_f,
+                min_size=min_size,
+                price=price,
+                position_side=position_side,
+                order_side=order_side,
+                margin_mode=margin_mode,
+                leverage=lev,
+            )
+            if maker_fill is not None:
+                time.sleep(0.35)
+                pos_after = self._lookup_open_position(symbol, side)
+                if pos_after:
+                    self._attach_tpsl_after_fill(symbol, side, pos_after, stop_pct, take_pct, lev)
+                    return maker_fill
+
         if dry_run:
             return None
 
@@ -2291,3 +2312,65 @@ class BlofinExchange:
                 broker_id=self.settings.broker_id,
             )
         time.sleep(0.15)
+
+    def _enter_maker_then_market(
+        self,
+        *,
+        inst_id: str,
+        symbol: str,
+        side: str,
+        contracts: float,
+        min_size: float,
+        price: float,
+        position_side: str,
+        order_side: str,
+        margin_mode: str,
+        leverage: int,
+        wait_sec: float = 4.0,
+    ) -> dict[str, Any] | None:
+        """Post-only limit near touch; fall back to market if not filled."""
+        import time as _time
+
+        offset = 0.0001 if order_side == "buy" else -0.0001
+        limit_px = price * (1.0 + offset)
+        size_str = _quantize_order_size(contracts, min_size)
+        maker_body = {
+            "instId": inst_id,
+            "marginMode": margin_mode,
+            "positionSide": position_side,
+            "side": order_side,
+            "orderType": "limit",
+            "price": str(round(limit_px, 8)),
+            "size": size_str,
+            "brokerId": self.settings.broker_id,
+            "postOnly": True,
+        }
+        try:
+            resp = self.http.place_order(maker_body)
+            order_id = extract_order_id(resp)
+            if not order_id:
+                return None
+            deadline = _time.time() + wait_sec
+            while _time.time() < deadline:
+                pos = self._lookup_open_position(symbol, side)
+                if pos and float(pos.get("contracts") or 0) > 0:
+                    log.info("MAKER fill %s %s", symbol.split("/")[0], side)
+                    return resp
+                _time.sleep(0.4)
+            self.http.cancel_order(inst_id, order_id)
+            log.info("MAKER timeout %s — market fallback", symbol.split("/")[0])
+        except Exception as exc:
+            log.debug("maker entry failed %s: %s", symbol.split("/")[0], exc)
+        return None
+
+    def _attach_tpsl_after_fill(self, symbol, side, pos_after, stop_pct, take_pct, lev):
+        try:
+            entry = float(pos_after.get("entry_price") or pos_after.get("avgPx") or 0)
+            contracts = float(pos_after.get("contracts") or 0)
+            if entry > 0 and contracts > 0:
+                self.repair_position_tpsl(
+                    symbol, side, contracts,
+                    take_pct=take_pct, configured_leverage=lev, dry_run=False,
+                )
+        except Exception:
+            pass

@@ -486,6 +486,13 @@ class ScalpOptimizer:
         if roe_tighten and starved and _abundant_flow(self.settings):
             roe_tighten = neg_streak >= 7 or avg_roe <= -18.0
 
+        try:
+            from winner_intel import optimizer_loosen_frozen
+
+            freeze_loosen = optimizer_loosen_frozen(self.settings)
+        except Exception:
+            freeze_loosen = quality_first
+
         if starved and eq15 > -2.5:
             if not pace_only:
                 gap = (t.entry_gap_seconds or base_gap) - 4.0
@@ -495,6 +502,9 @@ class ScalpOptimizer:
             if quality_first:
                 action = "pace_up_quality"
                 notes.append(f"starved<{self.target_min_tph}/hr pace-only (gates fixed)")
+            elif freeze_loosen:
+                action = "pace_up_quality_frozen"
+                notes.append("starved but gates frozen (quality/weak WR)")
             else:
                 t.confluence_delta = max(-0.10, t.confluence_delta - 0.018)
                 t.agreeing_delta = max(-3, t.agreeing_delta - 1)

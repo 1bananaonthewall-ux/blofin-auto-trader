@@ -200,6 +200,9 @@ def try_open(
     conviction: float,
     margin_fraction: float,
     cooldown_seconds: int | None = None,
+    winner_tier: str = "",
+    curve_phase: str = "",
+    curve_verticality: float = 0.0,
 ) -> bool:
     d = engine.doctrine
     if side_guard is not None:
@@ -283,6 +286,14 @@ def try_open(
         margin_top_up_enabled=settings.margin_top_up_enabled,
         skip_liq_room_check=skip_liq_room,
     )
+    from intelligent_sizing import max_equity_risk_pct
+
+    risk_cap = max_equity_risk_pct(
+        curve_phase=curve_phase,
+        curve_verticality=curve_verticality,
+        winner_tier=winner_tier or getattr(decision, "winner_tier", "") or "",
+        loss_streak=getattr(engine, "_consecutive_losses", 0),
+    )
     plan = sizer.plan_trade(
         decision.close,
         decision.stop_pct,
@@ -291,6 +302,7 @@ def try_open(
         market.min_size,
         margin_fraction=margin_fraction,
         equity=equity,
+        max_equity_risk_pct=risk_cap,
     )
     if plan is None:
         log.info("skip %s: margin sizer returned no plan", symbol.split("/")[0])
@@ -401,14 +413,45 @@ def try_open(
         )
         return False
 
+    entry_contracts = plan.contracts
+    is_probe = False
+    full_contracts = plan.contracts
+    try:
+        from quality_pick import quality_pick_active
+
+        tier = str(getattr(decision, "winner_tier", "") or "")
+        if quality_pick_active(settings) and tier not in ("elite", "apex"):
+            probe_frac = float(getattr(settings, "entry_probe_fraction", 0.55))
+            min_sz = float(getattr(plan, "min_contract_size", 0) or 0)
+            if probe_frac > 0 and probe_frac < 1.0 and entry_contracts > 0:
+                import math
+
+                probed = entry_contracts * probe_frac
+                if min_sz > 0:
+                    probed = max(min_sz, math.floor(probed / min_sz) * min_sz)
+                if probed >= min_sz and probed < entry_contracts:
+                    is_probe = True
+                    full_contracts = entry_contracts
+                    entry_contracts = probed
+                    log.info(
+                        "PROBE entry %s %s size=%.4f (%.0f%% of plan)",
+                        symbol.split("/")[0],
+                        decision.signal.value,
+                        entry_contracts,
+                        probe_frac * 100,
+                    )
+    except Exception:
+        entry_contracts = plan.contracts
+
     result = ex.open_position(
         symbol=symbol,
         side=decision.signal.value,
-        contracts=plan.contracts,
+        contracts=entry_contracts,
         stop_pct=plan.stop_pct,
         take_pct=plan.take_pct,
         dry_run=settings.dry_run,
         leverage=plan.leverage,
+        try_maker=bool(getattr(settings, "maker_entry_enabled", True)),
     )
     if result is None and not settings.dry_run:
         err = getattr(ex, "last_open_error", "") or ""
@@ -487,8 +530,11 @@ def try_open(
         take_pct=plan.take_pct,
         conviction=conviction,
         margin_usdt=plan.margin_usd,
-        contracts=plan.contracts,
+        contracts=entry_contracts,
         trade_style=tpsl_pol.style,
+        is_probe=is_probe,
+        full_contracts=full_contracts if is_probe else entry_contracts,
+        path_efficiency=float(getattr(decision, "path_efficiency", 0.0) or 0.0),
     )
     repaired = getattr(ex, "last_repaired_tpsl", None)
     if repaired:
@@ -584,6 +630,10 @@ def try_open(
                     chop_index=float(getattr(decision, "chop_index", 0.0) or 0.0),
                     run_label=str(getattr(decision, "run_label", "") or ""),
                     pick_score=float(getattr(decision, "pick_score", 0.0) or 0.0),
+                    p_long=float(getattr(decision, "p_long", 0.0) or 0.0),
+                    p_short=float(getattr(decision, "p_short", 0.0) or 0.0),
+                    ml_edge=float(getattr(decision, "ml_edge", 0.0) or 0.0),
+                    regime=str(getattr(decision, "regime", "") or ""),
                     curve_phase=curve.curve_phase if curve else "",
                     margin_mode=settings.margin_mode,
                 )
@@ -1183,17 +1233,24 @@ def run_once(
             free_margin = ex.fetch_free_equity_usdt()
             if free_margin < engine.doctrine.min_free_margin_usdt:
                 break
-            margin_frac = margin_fraction_for_conviction(
-                setup.conviction,
-                setup.confidence,
+            from intelligent_sizing import intelligent_margin_fraction
+
+            margin_frac = intelligent_margin_fraction(
+                conviction=setup.conviction,
+                confidence=setup.confidence,
                 base_pct=knobs.margin_deploy_base_pct,
                 max_pct=knobs.margin_deploy_max_pct,
                 action_intensity=knobs.action_intensity,
                 tie_count=1,
                 loss_streak=engine._consecutive_losses,
+                equity=equity,
+                free_margin=free_margin,
+                open_count=len(open_positions),
+                curve_phase=knobs.curve_phase,
+                curve_verticality=knobs.curve_verticality,
+                winner_tier=getattr(setup.decision, "winner_tier", "") or "",
+                settings=settings,
             )
-            if equity < settings.micro_equity_threshold:
-                margin_frac = max(margin_frac, min(0.85, settings.micro_max_margin_frac * 3.0))
             try:
                 if try_open(
                     ex,
@@ -1213,6 +1270,9 @@ def run_once(
                     conviction=setup.conviction,
                     margin_fraction=margin_frac,
                     cooldown_seconds=cd_sec,
+                    winner_tier=getattr(setup.decision, "winner_tier", "") or "",
+                    curve_phase=knobs.curve_phase,
+                    curve_verticality=knobs.curve_verticality,
                 ):
                     opened += 1
                     if not tpsl_pace and cd_sec > 0:
@@ -1235,6 +1295,7 @@ def run_once(
             candidates,
             knobs.path_reliability,
             mission_scale=engine.mission_scale_conviction,
+            settings=settings,
         )
         try:
             from growth_supercharge import enabled as supercharge_on, get_brain, rank_boost
@@ -1319,14 +1380,30 @@ def run_once(
                 or entry_press
             )
         )
-        elite = select_conviction_ties(
-            ranked,
-            max_opens=per_tick,
-            min_conviction=mission_floor,
-            apex_preferred=settings.winner_apex_preferred and not entry_press,
-            elite_only=settings.winner_elite_only,
-            allow_elite_fallback=allow_apex_fallback,
-        )
+        try:
+            from winner_intel import apply_correlation_ranking, select_tiered_opens
+
+            ranked = apply_correlation_ranking(ranked)
+            if getattr(settings, "tiered_slot_policy", True) and quality_first:
+                elite = select_tiered_opens(ranked, max_opens=per_tick, min_conviction=mission_floor)
+            else:
+                elite = select_conviction_ties(
+                    ranked,
+                    max_opens=per_tick,
+                    min_conviction=mission_floor,
+                    apex_preferred=settings.winner_apex_preferred and not entry_press,
+                    elite_only=settings.winner_elite_only,
+                    allow_elite_fallback=allow_apex_fallback,
+                )
+        except Exception:
+            elite = select_conviction_ties(
+                ranked,
+                max_opens=per_tick,
+                min_conviction=mission_floor,
+                apex_preferred=settings.winner_apex_preferred and not entry_press,
+                elite_only=settings.winner_elite_only,
+                allow_elite_fallback=allow_apex_fallback,
+            )
     if (
         not use_confluence_core
         and not elite
@@ -1438,25 +1515,24 @@ def run_once(
         free_margin = ex.fetch_free_equity_usdt()
         if free_margin < engine.doctrine.min_free_margin_usdt:
             break
-        margin_frac = margin_fraction_for_conviction(
-            setup.conviction,
-            setup.confidence,
+        from intelligent_sizing import intelligent_margin_fraction
+
+        margin_frac = intelligent_margin_fraction(
+            conviction=setup.conviction,
+            confidence=setup.confidence,
             base_pct=knobs.margin_deploy_base_pct,
             max_pct=knobs.margin_deploy_max_pct,
             action_intensity=knobs.action_intensity,
             tie_count=tie_n,
             loss_streak=engine._consecutive_losses,
+            equity=equity,
+            free_margin=free_margin,
+            open_count=len(open_positions),
+            curve_phase=knobs.curve_phase,
+            curve_verticality=knobs.curve_verticality,
+            winner_tier=getattr(setup.decision, "winner_tier", "") or "",
+            settings=settings,
         )
-        if equity < settings.micro_equity_threshold:
-            margin_frac = max(margin_frac, min(0.85, settings.micro_max_margin_frac * 3.0))
-        elif equity >= settings.small_account_threshold:
-            margin_frac = min(
-                0.28,
-                settings.margin_use_fraction * 0.38,
-                margin_frac * 1.4,
-            )
-        elif equity >= 25.0:
-            margin_frac = min(0.22, margin_frac * 1.2)
         try:
             if try_open(
                 ex,
@@ -1476,6 +1552,9 @@ def run_once(
                 conviction=setup.conviction,
                 margin_fraction=margin_frac,
                 cooldown_seconds=cd_sec,
+                winner_tier=getattr(setup.decision, "winner_tier", "") or "",
+                curve_phase=knobs.curve_phase,
+                curve_verticality=knobs.curve_verticality,
             ):
                 opened += 1
                 if not tpsl_pace and cd_sec > 0:

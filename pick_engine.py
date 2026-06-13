@@ -23,6 +23,24 @@ log = logging.getLogger(__name__)
 MOMENTUM_VOTES = frozenset({"macd", "adx_trend", "volume", "structure", "ema_1m"})
 ANCHOR_VOTES = frozenset({"htf_5m", "ml", "adx_trend", "structure", "ema_5m", "vwap"})
 
+REGIME_MAX_CHASE = {
+    "trending": 0.008,
+    "climbing": 0.010,
+    "ranging": 0.003,
+    "choppy": 0.002,
+    "mixed": 0.005,
+    "volatile": 0.004,
+}
+
+REGIME_MIN_PICK = {
+    "trending": 0.52,
+    "climbing": 0.55,
+    "ranging": 0.62,
+    "choppy": 0.65,
+    "mixed": 0.55,
+    "volatile": 0.60,
+}
+
 
 @dataclass(frozen=True)
 class MLContext:
@@ -247,6 +265,89 @@ def evaluate_pick_for_symbol(
     if opp_ratio > hard_opp:
         return PickVerdict(False, winner_score, f"opposition {opp_ratio:.0%} overwhelming")
 
+    # Volatility gate — skip extreme ATR / wide spread
+    atr_pct = getattr(cf, "atr_pct", 0.0)
+    spread_pct = getattr(cf, "spread_pct", 0.0)
+    max_atr = getattr(settings, "max_atr_pct", 0.025)
+    max_spread = getattr(settings, "max_spread_pct", 0.0015)
+    if atr_pct > max_atr:
+        return PickVerdict(False, winner_score, f"vol gate ATR {atr_pct:.1%}")
+    if spread_pct > max_spread:
+        return PickVerdict(False, winner_score, f"vol gate spread {spread_pct:.3%}")
+
+    # Session hour gate
+    try:
+        from winner_intel import session_hour_blocked
+
+        blocked, reason = session_hour_blocked(settings.state_dir)
+        if blocked and winner_tier not in ("elite", "apex"):
+            return PickVerdict(False, winner_score, f"session block {reason}")
+    except Exception:
+        pass
+
+    # Pullback wait — reject chase unless elite/apex + ML tailwind
+    from forward_pick import ml_direction_edge
+
+    ml_edge = ml_direction_edge(ml_ctx, side)
+    vd = cf.vwap_distance_pct
+    chase = abs(vd)
+    max_chase = REGIME_MAX_CHASE.get(cf.regime, 0.005)
+    if chase > max_chase:
+        bypass = winner_tier in ("elite", "apex") and ml_edge > 0.12
+        if not bypass:
+            return PickVerdict(
+                False,
+                winner_score,
+                f"chase {chase:.2%} > {max_chase:.2%} — wait pullback",
+            )
+
+    # 1H HTF structure confirmation
+    htf_1h = getattr(cf, "htf_1h_aligned", getattr(cf, "htf_15m_aligned", cf.htf_aligned))
+    if not htf_1h and winner_tier not in ("elite", "apex"):
+        if ml_edge < 0.10:
+            return PickVerdict(
+                False,
+                winner_score,
+                f"1h HTF misaligned — need ML edge (have {ml_edge:.2f})",
+            )
+
+    # 15m HTF structure confirmation
+    htf_15m = getattr(cf, "htf_15m_aligned", cf.htf_aligned)
+    if not htf_15m and winner_tier not in ("elite", "apex"):
+        if ml_edge < 0.08:
+            return PickVerdict(
+                False,
+                winner_score,
+                f"15m HTF misaligned — need ML edge (have {ml_edge:.2f})",
+            )
+
+    # Quality chop block
+    quality_mode = False
+    try:
+        from quality_pick import quality_pick_active
+
+        quality_mode = quality_pick_active(settings)
+    except Exception:
+        pass
+    chop = getattr(cf, "chop_index", 0.5)
+    path_eff = getattr(cf, "path_efficiency", 0.5)
+    is_choppy_setup = getattr(cf, "is_choppy", False) or (
+        chop >= 0.50 and path_eff < 0.30
+    )
+    if quality_mode and is_choppy_setup:
+        if winner_tier not in ("elite", "apex"):
+            return PickVerdict(
+                False,
+                winner_score,
+                f"quality chop block chop={chop:.0%} path={path_eff:.0%}",
+            )
+        if ml_edge < 0.10:
+            return PickVerdict(
+                False,
+                winner_score,
+                f"quality chop — need ML edge (have {ml_edge:.2f})",
+            )
+
     from runner_momentum import runner_priority_active
 
     runner_priority = runner_priority_active(settings)
@@ -299,13 +400,29 @@ def evaluate_pick_for_symbol(
     w_short = getattr(settings, "pick_short_horizon_weight", 0.55)
     w_short = max(0.35, min(0.65, w_short))
     fused = w_short * fast + (1.0 - w_short) * trend
-    tier_boost = 0.06 if winner_tier == "elite" else 0.02
-    pick = min(1.0, winner_score * 0.32 + fused * 0.68 + tier_boost)
+    tier_boost = 0.08 if winner_tier == "apex" else (0.05 if winner_tier == "elite" else 0.02)
+    pick = min(1.0, winner_score * 0.28 + fused * 0.72 + tier_boost)
+
+    from forward_pick import forward_pick_adjustments
+
+    fwd_boost, floor_cut = forward_pick_adjustments(
+        state_dir=settings.state_dir,
+        symbol=symbol,
+        side=side,
+        ml_ctx=ml_ctx,
+        fast_win=fast,
+        winner_tier=winner_tier,
+    )
+    pick = min(1.0, pick + fwd_boost)
 
     if sym_wr is not None and sym_wr >= 0.55:
         pick = min(1.0, pick + 0.04)
 
-    min_pick = getattr(settings, "pick_min_score", 0.62)
+    from winner_intel import regime_floor_adjustment
+
+    base_regime_floor = REGIME_MIN_PICK.get(cf.regime, 0.55)
+    regime_floor = regime_floor_adjustment(settings.state_dir, cf.regime, base_regime_floor)
+    min_pick = max(getattr(settings, "pick_min_score", 0.62), regime_floor)
     from quality_pick import quality_pick_active
 
     if getattr(settings, "llm_overseer_mode", False):
@@ -335,8 +452,9 @@ def evaluate_pick_for_symbol(
     except Exception:
         starved = False
     never_loosen = quality_mode or getattr(settings, "entries_never_pause", False)
+    ml_forward_strong = fwd_boost >= 0.06 or floor_cut >= 0.04
+    wr, _pf = (0.5, 1.0)
     if never_loosen:
-        wr, _pf = (0.5, 1.0)
         try:
             from quality_pick import live_performance
 
@@ -348,9 +466,38 @@ def evaluate_pick_for_symbol(
         elif wr < 0.48:
             min_pick = max(min_pick, 0.55)
         if winner_tier not in ("elite", "apex"):
-            min_pick = max(min_pick, 0.52)
+            if not (starved and ml_forward_strong):
+                min_pick = max(min_pick, 0.52)
+        if starved and ml_forward_strong:
+            starved_cap = 0.46 if hourly_3r_active(settings) else 0.50
+            min_pick = min(min_pick, starved_cap)
     elif starved:
         min_pick = min(min_pick, 0.42 if hourly_3r_active(settings) else 0.48)
+    min_pick = max(0.48, min_pick - floor_cut)
+
+    if never_loosen and ml_ctx.ready and ml_edge < -0.06:
+        return PickVerdict(
+            False,
+            pick,
+            f"ML headwind edge={ml_edge:.2f}",
+            fast_win=fast,
+        )
+    if never_loosen and wr < 0.45:
+        if not ml_ctx.ready or ml_edge < 0.05:
+            return PickVerdict(
+                False,
+                pick,
+                f"weak live WR — need ML tailwind (edge={ml_edge:.2f})",
+                fast_win=fast,
+            )
+        if fast < 0.48:
+            return PickVerdict(
+                False,
+                pick,
+                f"weak live WR — fast_win {fast:.2f} < 0.48",
+                fast_win=fast,
+            )
+
     if pick < min_pick:
         return PickVerdict(
             False,
@@ -367,8 +514,35 @@ def evaluate_pick_for_symbol(
                 f"long OOS weak p={ml_ctx.long_precision:.0%} ml edge insufficient",
                 fast_win=fast,
             )
+    # 1m candle-close confirmation
+    try:
+        from winner_intel import candle_close_confirmed
+
+        ohlcv_probe = getattr(settings, "_entry_ohlcv_1m", None)
+        ok_candle, why_candle = candle_close_confirmed(
+            ohlcv_probe,
+            side.value,
+            fast_ema=decision.fast_ema,
+        )
+        if not ok_candle and winner_tier not in ("elite", "apex"):
+            bypass = ml_edge > 0.10
+            if not bypass:
+                return PickVerdict(False, winner_score, f"candle gate {why_candle}", fast_win=fast)
+    except Exception:
+        pass
+
+    if ml_ctx.ready and side == Signal.SHORT and ml_ctx.short_precision < 0.42:
+        if ml_ctx.p_short < ml_ctx.p_long + 0.14:
+            return PickVerdict(
+                False,
+                pick,
+                f"short OOS weak p={ml_ctx.short_precision:.0%} ml edge insufficient",
+                fast_win=fast,
+            )
 
     reason = f"fused={fused:.2f} fast={fast:.2f} trend={trend:.2f} " + "+".join((tags + trend_tags)[:4])
+    if fwd_boost > 0 or floor_cut > 0:
+        reason += f" fwd=+{fwd_boost:.2f} floor_cut={floor_cut:.2f}"
     log.info(
         "PICK %s %s score=%.2f fast=%.2f tier=%s | %s",
         symbol,

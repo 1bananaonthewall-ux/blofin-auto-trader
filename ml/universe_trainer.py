@@ -88,6 +88,53 @@ class ContinuousMlTrainer:
             encoding="utf-8",
         )
 
+    def _maybe_fit_calibration(self) -> None:
+        """Fit Platt calibrators from recent labeled trade outcomes."""
+        try:
+            from ml.calibration import fit_platt, save_calibrator
+
+            path = self.settings.state_dir / "trade_outcomes.jsonl"
+            if not path.is_file():
+                return
+            rows: list[dict] = []
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[-800:]:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("event") != "outcome" or row.get("outcome") == "neutral":
+                    continue
+                rows.append(row)
+            if len(rows) < 40:
+                return
+            long_p, long_y, short_p, short_y = [], [], [], []
+            for row in rows:
+                side = str(row.get("side") or "").lower()
+                win = 1.0 if row.get("outcome") == "win" or int(row.get("win", 0)) == 1 else 0.0
+                conf = float(row.get("pick_score") or row.get("signal_score") or 50.0)
+                if conf > 1.0:
+                    conf = conf / 100.0
+                conf = max(0.05, min(0.95, conf))
+                if side == "long":
+                    long_p.append(conf)
+                    long_y.append(win)
+                elif side == "short":
+                    short_p.append(conf)
+                    short_y.append(win)
+            if len(long_p) >= 12:
+                la, lb = fit_platt(np.array(long_p), np.array(long_y))
+            else:
+                la, lb = 1.0, 0.0
+            if len(short_p) >= 12:
+                sa, sb = fit_platt(np.array(short_p), np.array(short_y))
+            else:
+                sa, sb = 1.0, 0.0
+            save_calibrator(self.settings.state_dir, la, lb, sa, sb)
+        except Exception as exc:
+            log.debug("calibration skip: %s", exc)
+
     def refresh_universe(self) -> int:
         cap = training_symbol_cap(self.settings)
         self._markets = load_training_markets(self.ex, cap=cap)
@@ -157,6 +204,8 @@ class ContinuousMlTrainer:
         min_new = int(self.settings.ml_outcome_refit_min_new)
         if n < 30:
             min_new = max(1, min(min_new, 2))
+        elif n < 80:
+            min_new = max(1, min(min_new, 3))
         delta = n - self._last_outcome_labels
         if delta >= min_new and n > 0:
             log.info(
@@ -378,6 +427,7 @@ class ContinuousMlTrainer:
                         self.settings.state_dir / "signal_model_meta.json",
                     )
                     self._last_refit_ts = time.time()
+                    self._maybe_fit_calibration()
                     self._save_state()
                     log.info(
                         "ML forward refit (%s) feedback=%d samples=%d val_acc=%.1f%% deployed=%s",
@@ -434,6 +484,7 @@ class ContinuousMlTrainer:
                 self.settings.state_dir / "signal_model_meta.json",
             )
             self._last_refit_ts = time.time()
+            self._maybe_fit_calibration()
             self._shards_since_refit = 0
             self._save_state()
             fb_n = len(y_fb) if len(y_fb) > 0 else 0

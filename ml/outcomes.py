@@ -378,6 +378,10 @@ class TradeOutcomeTracker:
         chop_index: float | None = None,
         run_label: str = "",
         pick_score: float | None = None,
+        p_long: float | None = None,
+        p_short: float | None = None,
+        ml_edge: float | None = None,
+        regime: str = "",
         curve_phase: str = "",
         margin_mode: str = "isolated",
     ) -> None:
@@ -400,6 +404,10 @@ class TradeOutcomeTracker:
             "chop_index": round(float(chop_index), 4) if chop_index is not None else None,
             "run_label": run_label or "",
             "pick_score": round(float(pick_score), 4) if pick_score is not None else None,
+            "p_long": round(float(p_long), 4) if p_long is not None else None,
+            "p_short": round(float(p_short), 4) if p_short is not None else None,
+            "ml_edge": round(float(ml_edge), 4) if ml_edge is not None else None,
+            "regime": regime or "",
             "curve_phase": curve_phase or "",
             "margin_mode": normalize_margin_mode(margin_mode),
         }

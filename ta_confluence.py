@@ -68,6 +68,11 @@ class ConfluenceResult:
     chop_index: float = 0.5
     is_runner: bool = False
     is_choppy: bool = False
+    atr_pct: float = 0.0
+    spread_pct: float = 0.0
+    htf_15m_aligned: bool = False
+    htf_1h_aligned: bool = False
+    book_spread_pct: float = 0.0
     votes: list[TAVote] = field(default_factory=list)
 
 
@@ -153,6 +158,28 @@ def _htf_vote(closes_5m: list[float]) -> TAVote:
         return _vote("htf_5m", Signal.SHORT, 0.85, 1.4, "5m bear")
     return _vote("htf_5m", Signal.FLAT, 0.0, 1.4)
 
+def _htf_15m_vote(closes_15m: list[float]) -> TAVote:
+    """15m structure vote — slower anchor for entry confirmation."""
+    if len(closes_15m) < 25:
+        return _vote("htf_15m", Signal.FLAT, 0.0, 1.4, "no 15m data")
+    bias = _htf_bias(closes_15m)
+    if bias == "long":
+        return _vote("htf_15m", Signal.LONG, 0.82, 1.4, "15m uptrend")
+    if bias == "short":
+        return _vote("htf_15m", Signal.SHORT, 0.82, 1.4, "15m downtrend")
+    return _vote("htf_15m", Signal.FLAT, 0.0, 1.4, "15m flat")
+
+
+def _htf_1h_vote(closes_1h: list[float]) -> TAVote:
+    if len(closes_1h) < 25:
+        return _vote("htf_1h", Signal.FLAT, 0.0, 1.5, "no 1h data")
+    bias = _htf_bias(closes_1h)
+    if bias == "long":
+        return _vote("htf_1h", Signal.LONG, 0.85, 1.5, "1h uptrend")
+    if bias == "short":
+        return _vote("htf_1h", Signal.SHORT, 0.85, 1.5, "1h downtrend")
+    return _vote("htf_1h", Signal.FLAT, 0.0, 1.5, "1h flat")
+
 
 def _adx_vote(ohlcv_1m: list[list[float]], closes: list[float]) -> TAVote:
     adx_v = adx(ohlcv_1m, 14) or 0
@@ -232,6 +259,9 @@ def run_all_analyses(
     ohlcv_1m: list[list[float]],
     ohlcv_5m: list[list[float]],
     *,
+    ohlcv_15m: list[list[float]] | None = None,
+    ohlcv_1h: list[list[float]] | None = None,
+    book_spread_pct: float = 0.0,
     funding_rate: float | None = None,
     ml_decision: StrategyDecision | None = None,
     min_confluence_score: float | None = None,
@@ -277,6 +307,8 @@ def run_all_analyses(
         _bb_vote(closes),
         _vwap_vote(ohlcv_1m),
         _htf_vote(closes_5m),
+        _htf_15m_vote([row[4] for row in ohlcv_15m] if ohlcv_15m else []),
+        _htf_1h_vote([row[4] for row in ohlcv_1h] if ohlcv_1h else []),
         _adx_vote(ohlcv_1m, closes),
         _structure_vote(ohlcv_1m),
         _volume_vote(volumes),
@@ -342,6 +374,12 @@ def run_all_analyses(
     max_take = scalp["max_take_pct"] if scalp else 0.18
     min_rr = float(scalp.get("min_rr", 1.35)) if scalp else 1.35
     three_r = bool(scalp.get("three_r_mode")) if scalp else False
+
+    atr_pct_val = (atr_v / close) if atr_v and close > 0 else 0.0
+    last = ohlcv_1m[-1]
+    hi = float(last[2]) if len(last) > 2 else close
+    lo = float(last[3]) if len(last) > 3 else close
+    spread_pct_val = ((hi - lo) / close) if close > 0 else 0.0
 
     if atr_v is None or close <= 0:
         stop_pct, take_pct = (0.012, 0.036) if three_r else ((0.012, 0.024) if scalp else (0.015, 0.03))
